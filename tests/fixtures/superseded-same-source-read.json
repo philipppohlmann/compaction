@@ -1,0 +1,89 @@
+{
+  "id": "trace_superseded_same_source_read",
+  "title": "Superseded same-source read (input-compaction category 1 fixture)",
+  "artifactVersion": "agent-trace-v1",
+  "source": "manual",
+  "createdAt": "2026-06-30T00:00:00.000Z",
+  "generatedAt": "2026-06-30T00:00:00.000Z",
+  "model": "test-model",
+  "messages": [
+    {
+      "id": "m1",
+      "role": "system",
+      "content": "You are a coding agent. Keep changes minimal and never expose secrets.",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m2",
+      "role": "user",
+      "content": "Update config.yaml retries from 1 to 5 and confirm the change. The fix is only correct if you can show the OLD value (retries: 1) was replaced by the NEW value (retries: 5).",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m3",
+      "role": "assistant",
+      "content": "I will read config.yaml first.",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m4",
+      "role": "assistant",
+      "toolName": "Read",
+      "content": "{\"file_path\":\"/repo/config.yaml\"}",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m5",
+      "role": "tool",
+      "toolName": "Read",
+      "content": "# config.yaml (read #1)\nretries: 1\ntimeout_ms: 1000\nfeature_flags:\n[config-v1] line 0: key_0=value_0 attempt=1 status=200 note=config-entry-0-config-v1\n[config-v1] line 1: key_1=value_1 attempt=1 status=201 note=config-entry-1-config-v1\n[config-v1] line 2: key_2=value_2 attempt=1 status=202 note=config-entry-2-config-v1\n[config-v1] line 3: key_3=value_3 attempt=1 status=200 note=config-entry-3-config-v1\n[config-v1] line 4: key_4=value_4 attempt=1 status=201 note=config-entry-4-config-v1\n[config-v1] line 5: key_5=value_5 attempt=1 status=202 note=config-entry-5-config-v1\n[config-v1] line 6: key_6=value_6 attempt=1 status=200 note=config-entry-6-config-v1\n[config-v1] line 7: key_7=value_7 attempt=1 status=201 note=config-entry-7-config-v1\n[config-v1] line 8: key_8=value_8 attempt=1 status=202 note=config-entry-8-config-v1\n[config-v1] line 9: key_9=value_9 attempt=1 status=200 note=config-entry-9-config-v1\n[config-v1] line 10: key_10=value_10 attempt=1 status=201 note=config-entry-10-config-v1\n[config-v1] line 11: key_11=value_11 attempt=1 status=202 note=config-entry-11-config-v1\n[config-v1] line 12: key_12=value_12 attempt=1 status=200 note=config-entry-12-config-v1\n[config-v1] line 13: key_13=value_13 attempt=1 status=201 note=config-entry-13-config-v1\n[config-v1] line 14: key_14=value_14 attempt=1 status=202 note=config-entry-14-config-v1\n[config-v1] line 15: key_15=value_15 attempt=1 status=200 note=config-entry-15-config-v1\n[config-v1] line 16: key_16=value_16 attempt=1 status=201 note=config-entry-16-config-v1\n[config-v1] line 17: key_17=value_17 attempt=1 status=202 note=config-entry-17-config-v1\n[config-v1] line 18: key_18=value_18 attempt=1 status=200 note=config-entry-18-config-v1\n[config-v1] line 19: key_19=value_19 attempt=1 status=201 note=config-entry-19-config-v1\n[config-v1] line 20: key_20=value_20 attempt=1 status=202 note=config-entry-20-config-v1\n[config-v1] line 21: key_21=value_21 attempt=1 status=200 note=config-entry-21-config-v1\n[config-v1] line 22: key_22=value_22 attempt=1 status=201 note=config-entry-22-config-v1\n[config-v1] line 23: key_23=value_23 attempt=1 status=202 note=config-entry-23-config-v1\n[config-v1] line 24: key_24=value_24 attempt=1 status=200 note=config-entry-24-config-v1",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m6",
+      "role": "assistant",
+      "content": "The current config has retries: 1. I will edit it to retries: 5.",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m7",
+      "role": "assistant",
+      "toolName": "Edit",
+      "content": "Tool call: edit /repo/config.yaml retries 1 -> 5",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m8",
+      "role": "tool",
+      "toolName": "Edit",
+      "content": "Applied edit to /repo/config.yaml: retries 1 -> 5; timeout_ms 1000 -> 5000.",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m9",
+      "role": "assistant",
+      "content": "I will re-read config.yaml to confirm the change.",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m10",
+      "role": "assistant",
+      "toolName": "Read",
+      "content": "{\"file_path\":\"/repo/config.yaml\"}",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m11",
+      "role": "tool",
+      "toolName": "Read",
+      "content": "# config.yaml (read #2, after edit)\nretries: 5\ntimeout_ms: 5000\nfeature_flags:\n[config-v2] line 0: key_0=value_0 attempt=2 status=200 note=config-entry-0-config-v2\n[config-v2] line 1: key_1=value_1 attempt=2 status=201 note=config-entry-1-config-v2\n[config-v2] line 2: key_2=value_2 attempt=2 status=202 note=config-entry-2-config-v2\n[config-v2] line 3: key_3=value_3 attempt=2 status=200 note=config-entry-3-config-v2\n[config-v2] line 4: key_4=value_4 attempt=2 status=201 note=config-entry-4-config-v2\n[config-v2] line 5: key_5=value_5 attempt=2 status=202 note=config-entry-5-config-v2\n[config-v2] line 6: key_6=value_6 attempt=2 status=200 note=config-entry-6-config-v2\n[config-v2] line 7: key_7=value_7 attempt=2 status=201 note=config-entry-7-config-v2\n[config-v2] line 8: key_8=value_8 attempt=2 status=202 note=config-entry-8-config-v2\n[config-v2] line 9: key_9=value_9 attempt=2 status=200 note=config-entry-9-config-v2\n[config-v2] line 10: key_10=value_10 attempt=2 status=201 note=config-entry-10-config-v2\n[config-v2] line 11: key_11=value_11 attempt=2 status=202 note=config-entry-11-config-v2\n[config-v2] line 12: key_12=value_12 attempt=2 status=200 note=config-entry-12-config-v2\n[config-v2] line 13: key_13=value_13 attempt=2 status=201 note=config-entry-13-config-v2\n[config-v2] line 14: key_14=value_14 attempt=2 status=202 note=config-entry-14-config-v2\n[config-v2] line 15: key_15=value_15 attempt=2 status=200 note=config-entry-15-config-v2\n[config-v2] line 16: key_16=value_16 attempt=2 status=201 note=config-entry-16-config-v2\n[config-v2] line 17: key_17=value_17 attempt=2 status=202 note=config-entry-17-config-v2\n[config-v2] line 18: key_18=value_18 attempt=2 status=200 note=config-entry-18-config-v2\n[config-v2] line 19: key_19=value_19 attempt=2 status=201 note=config-entry-19-config-v2\n[config-v2] line 20: key_20=value_20 attempt=2 status=202 note=config-entry-20-config-v2\n[config-v2] line 21: key_21=value_21 attempt=2 status=200 note=config-entry-21-config-v2\n[config-v2] line 22: key_22=value_22 attempt=2 status=201 note=config-entry-22-config-v2\n[config-v2] line 23: key_23=value_23 attempt=2 status=202 note=config-entry-23-config-v2\n[config-v2] line 24: key_24=value_24 attempt=2 status=200 note=config-entry-24-config-v2",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    },
+    {
+      "id": "m12",
+      "role": "assistant",
+      "content": "Confirmed: config.yaml now shows retries: 5 and timeout_ms: 5000. The OLD value (retries: 1) was replaced by the NEW value (retries: 5).",
+      "timestamp": "2026-06-30T00:00:00.000Z"
+    }
+  ]
+}

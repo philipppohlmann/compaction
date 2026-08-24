@@ -1,0 +1,86 @@
+{
+  "id": "trace_demo_support_repeated_logs_001",
+  "title": "Support agent repeated CRM handoff logs",
+  "createdAt": "2026-05-28T16:03:00.000Z",
+  "model": "placeholder-agent-model",
+  "messages": [
+    {
+      "id": "msg_001",
+      "role": "system",
+      "timestamp": "2026-05-28T16:03:00.000Z",
+      "content": "You are a support automation agent reviewing synthetic operational logs. Keep customer data out of the answer and prefer safe local evidence."
+    },
+    {
+      "id": "msg_002",
+      "role": "user",
+      "timestamp": "2026-05-28T16:03:05.000Z",
+      "content": "A demo support ticket did not attach a CRM note after drafting a refund-status reply. Review the worker logs and summarize the safe next action."
+    },
+    {
+      "id": "msg_003",
+      "role": "assistant",
+      "timestamp": "2026-05-28T16:03:10.000Z",
+      "content": "I will inspect the support-worker logs and look for repeated handoff errors or idempotency behavior."
+    },
+    {
+      "id": "msg_004",
+      "role": "tool",
+      "toolName": "logs",
+      "timestamp": "2026-05-28T16:03:20.000Z",
+      "content": "kubectl logs deployment/support-worker --since=15m --namespace=demo-support\n\n2026-05-28T16:03:12.045Z INFO  request_id=req_demo_1001 queue=tickets action=poll count=25\n2026-05-28T16:03:12.312Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 channel=email event=message.received\n2026-05-28T16:03:12.318Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 classifier=intent value=refund_status confidence=0.91\n2026-05-28T16:03:12.321Z WARN  request_id=req_demo_1002 ticket_id=tkt_demo_4812 template=refund_status_v3 event=template.cache_miss\n2026-05-28T16:03:12.612Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 template=refund_status_v3 event=template.loaded source=local-fixture\n2026-05-28T16:03:13.010Z ERROR request_id=req_demo_1002 ticket_id=tkt_demo_4812 handoff=crm_sandbox status=409 error=duplicate_external_note\n2026-05-28T16:03:13.011Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 retry=scheduled delayMs=250 reason=idempotency_conflict\n2026-05-28T16:03:13.267Z ERROR request_id=req_demo_1002 ticket_id=tkt_demo_4812 handoff=crm_sandbox status=409 error=duplicate_external_note\n2026-05-28T16:03:13.268Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 retry=scheduled delayMs=500 reason=idempotency_conflict\n2026-05-28T16:03:13.771Z ERROR request_id=req_demo_1002 ticket_id=tkt_demo_4812 handoff=crm_sandbox status=409 error=duplicate_external_note\n2026-05-28T16:03:13.772Z WARN  request_id=req_demo_1002 ticket_id=tkt_demo_4812 action=skip_duplicate_note outcome=ticket_reply_queued\n2026-05-28T16:03:14.020Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 reply=draft_created locale=en-US policy=safe_refund_status\n2026-05-28T16:03:14.177Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 queue=tickets event=message.completed durationMs=1865\n\nSynthetic safety notes:\n- All ticket ids, request ids, templates, namespaces, and host names are fabricated.\n- The log does not contain customer names, emails, order numbers, secrets, or production endpoints.\n- The important retained fact is that CRM note handoff returns repeated 409 duplicate_external_note responses, while the worker still queues a safe refund-status reply.",
+      "metadata": {
+        "synthetic": true,
+        "safe": true
+      }
+    },
+    {
+      "id": "msg_005",
+      "role": "assistant",
+      "timestamp": "2026-05-28T16:03:45.000Z",
+      "content": "The log shows the CRM sandbox rejected duplicate note writes with HTTP 409, then the worker safely queued the reply."
+    },
+    {
+      "id": "msg_006",
+      "role": "tool",
+      "toolName": "logs",
+      "timestamp": "2026-05-28T16:04:11.000Z",
+      "content": "kubectl logs deployment/support-worker --since=15m --namespace=demo-support\n\n2026-05-28T16:03:12.045Z INFO  request_id=req_demo_1001 queue=tickets action=poll count=25\n2026-05-28T16:03:12.312Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 channel=email event=message.received\n2026-05-28T16:03:12.318Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 classifier=intent value=refund_status confidence=0.91\n2026-05-28T16:03:12.321Z WARN  request_id=req_demo_1002 ticket_id=tkt_demo_4812 template=refund_status_v3 event=template.cache_miss\n2026-05-28T16:03:12.612Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 template=refund_status_v3 event=template.loaded source=local-fixture\n2026-05-28T16:03:13.010Z ERROR request_id=req_demo_1002 ticket_id=tkt_demo_4812 handoff=crm_sandbox status=409 error=duplicate_external_note\n2026-05-28T16:03:13.011Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 retry=scheduled delayMs=250 reason=idempotency_conflict\n2026-05-28T16:03:13.267Z ERROR request_id=req_demo_1002 ticket_id=tkt_demo_4812 handoff=crm_sandbox status=409 error=duplicate_external_note\n2026-05-28T16:03:13.268Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 retry=scheduled delayMs=500 reason=idempotency_conflict\n2026-05-28T16:03:13.771Z ERROR request_id=req_demo_1002 ticket_id=tkt_demo_4812 handoff=crm_sandbox status=409 error=duplicate_external_note\n2026-05-28T16:03:13.772Z WARN  request_id=req_demo_1002 ticket_id=tkt_demo_4812 action=skip_duplicate_note outcome=ticket_reply_queued\n2026-05-28T16:03:14.020Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 reply=draft_created locale=en-US policy=safe_refund_status\n2026-05-28T16:03:14.177Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 queue=tickets event=message.completed durationMs=1865\n\nSynthetic safety notes:\n- All ticket ids, request ids, templates, namespaces, and host names are fabricated.\n- The log does not contain customer names, emails, order numbers, secrets, or production endpoints.\n- The important retained fact is that CRM note handoff returns repeated 409 duplicate_external_note responses, while the worker still queues a safe refund-status reply.",
+      "metadata": {
+        "synthetic": true,
+        "safe": true,
+        "duplicateOf": "msg_004"
+      }
+    },
+    {
+      "id": "msg_007",
+      "role": "tool",
+      "toolName": "logs",
+      "timestamp": "2026-05-28T16:04:39.000Z",
+      "content": "kubectl logs deployment/support-worker --since=15m --namespace=demo-support\n\n2026-05-28T16:03:12.045Z INFO  request_id=req_demo_1001 queue=tickets action=poll count=25\n2026-05-28T16:03:12.312Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 channel=email event=message.received\n2026-05-28T16:03:12.318Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 classifier=intent value=refund_status confidence=0.91\n2026-05-28T16:03:12.321Z WARN  request_id=req_demo_1002 ticket_id=tkt_demo_4812 template=refund_status_v3 event=template.cache_miss\n2026-05-28T16:03:12.612Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 template=refund_status_v3 event=template.loaded source=local-fixture\n2026-05-28T16:03:13.010Z ERROR request_id=req_demo_1002 ticket_id=tkt_demo_4812 handoff=crm_sandbox status=409 error=duplicate_external_note\n2026-05-28T16:03:13.011Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 retry=scheduled delayMs=250 reason=idempotency_conflict\n2026-05-28T16:03:13.267Z ERROR request_id=req_demo_1002 ticket_id=tkt_demo_4812 handoff=crm_sandbox status=409 error=duplicate_external_note\n2026-05-28T16:03:13.268Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 retry=scheduled delayMs=500 reason=idempotency_conflict\n2026-05-28T16:03:13.771Z ERROR request_id=req_demo_1002 ticket_id=tkt_demo_4812 handoff=crm_sandbox status=409 error=duplicate_external_note\n2026-05-28T16:03:13.772Z WARN  request_id=req_demo_1002 ticket_id=tkt_demo_4812 action=skip_duplicate_note outcome=ticket_reply_queued\n2026-05-28T16:03:14.020Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 reply=draft_created locale=en-US policy=safe_refund_status\n2026-05-28T16:03:14.177Z INFO  request_id=req_demo_1002 ticket_id=tkt_demo_4812 queue=tickets event=message.completed durationMs=1865\n\nSynthetic safety notes:\n- All ticket ids, request ids, templates, namespaces, and host names are fabricated.\n- The log does not contain customer names, emails, order numbers, secrets, or production endpoints.\n- The important retained fact is that CRM note handoff returns repeated 409 duplicate_external_note responses, while the worker still queues a safe refund-status reply.",
+      "metadata": {
+        "synthetic": true,
+        "safe": true,
+        "duplicateOf": "msg_004"
+      }
+    },
+    {
+      "id": "msg_008",
+      "role": "assistant",
+      "timestamp": "2026-05-28T16:05:00.000Z",
+      "content": "The repeated log output is stale. Retain one copy and preserve the facts: duplicate_external_note 409s occurred, but ticket_reply_queued completed."
+    },
+    {
+      "id": "msg_009",
+      "role": "tool",
+      "toolName": "logs",
+      "timestamp": "2026-05-28T16:05:20.000Z",
+      "content": "support-worker health check\nqueue=tickets lag=0\nlast_processed=tkt_demo_4812\nstatus=healthy\nno pending retries for request_id=req_demo_1002"
+    },
+    {
+      "id": "msg_010",
+      "role": "assistant",
+      "timestamp": "2026-05-28T16:05:44.000Z",
+      "content": "Recommend no customer-facing retry. The synthetic worker already queued the refund-status reply after recognizing duplicate CRM notes; engineering can later tune idempotency logging."
+    }
+  ]
+}

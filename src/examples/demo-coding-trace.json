@@ -1,0 +1,93 @@
+{
+  "id": "trace_demo_coding_repeated_tests_001",
+  "title": "Coding agent repeated checkout test output",
+  "createdAt": "2026-05-28T09:14:00.000Z",
+  "model": "placeholder-agent-model",
+  "messages": [
+    {
+      "id": "msg_001",
+      "role": "system",
+      "timestamp": "2026-05-28T09:14:00.000Z",
+      "content": "You are a coding agent working in a local synthetic storefront repository. Keep changes minimal, cite test evidence, and never expose secrets."
+    },
+    {
+      "id": "msg_002",
+      "role": "user",
+      "timestamp": "2026-05-28T09:14:05.000Z",
+      "content": "The checkout retry test is flaky after a transient payment-intent error. Diagnose the issue and propose the smallest safe fix."
+    },
+    {
+      "id": "msg_003",
+      "role": "assistant",
+      "timestamp": "2026-05-28T09:14:12.000Z",
+      "content": "I will inspect the focused test output first, then compare it with the checkout session polling logic."
+    },
+    {
+      "id": "msg_004",
+      "role": "tool",
+      "toolName": "test",
+      "timestamp": "2026-05-28T09:14:35.000Z",
+      "content": "npm test -- --runInBand tests/checkout.retry.test.ts\n\n> storefront@0.0.0 test\n> vitest run --runInBand tests/checkout.retry.test.ts\n\n RUN  v2.1.1 /workspace/synthetic-storefront\n\n ❯ tests/checkout.retry.test.ts (6 tests | 1 failed) 1842ms\n   ✓ validates empty cart before checkout 32ms\n   ✓ renders saved shipping address 41ms\n   ✓ rejects expired promo code 29ms\n   ✓ retries tax quote once after a 503 118ms\n   × preserves checkout session after retrying payment intent 1004ms\n   ✓ records audit event for retry decision 51ms\n\n AssertionError: expected \"PAYMENT_RETRYING\" to equal \"PAYMENT_READY\"\n   at tests/checkout.retry.test.ts:87:31\n\nSynthetic diagnostic notes:\n- worker: local-sim-02\n- seed: 44019\n- checkout session id: demo_session_0007\n- payment intent id: pi_demo_safe_0007\n- observed state sequence: CART_READY -> TAX_QUOTED -> PAYMENT_RETRYING -> PAYMENT_READY\n- failure occurred before the final state poll completed\n- no customer email, card number, token, or production URL is present in this synthetic trace\n\nConsole output:\n[checkout] cart loaded for fixture account fixture_acct_small_business\n[checkout] tax quote accepted after retry attempt=1 status=200\n[checkout] payment intent retry scheduled reason=transient_503 attempt=1\n[checkout] session state PAYMENT_RETRYING ageMs=251\n[checkout] session state PAYMENT_RETRYING ageMs=502\n[checkout] expected PAYMENT_READY before assertion timeoutMs=1000\n\nTest Files  1 failed (1)\nTests  1 failed | 5 passed (6)\nStart at  09:14:22\nDuration  2.41s (transform 183ms, setup 74ms, collect 209ms, tests 1.84s, environment 0ms, prepare 62ms)",
+      "metadata": {
+        "synthetic": true,
+        "safe": true
+      }
+    },
+    {
+      "id": "msg_005",
+      "role": "assistant",
+      "timestamp": "2026-05-28T09:15:02.000Z",
+      "content": "The failure points to an assertion racing the final PAYMENT_READY poll after the retry state."
+    },
+    {
+      "id": "msg_006",
+      "role": "tool",
+      "toolName": "test",
+      "timestamp": "2026-05-28T09:15:40.000Z",
+      "content": "npm test -- --runInBand tests/checkout.retry.test.ts\n\n> storefront@0.0.0 test\n> vitest run --runInBand tests/checkout.retry.test.ts\n\n RUN  v2.1.1 /workspace/synthetic-storefront\n\n ❯ tests/checkout.retry.test.ts (6 tests | 1 failed) 1842ms\n   ✓ validates empty cart before checkout 32ms\n   ✓ renders saved shipping address 41ms\n   ✓ rejects expired promo code 29ms\n   ✓ retries tax quote once after a 503 118ms\n   × preserves checkout session after retrying payment intent 1004ms\n   ✓ records audit event for retry decision 51ms\n\n AssertionError: expected \"PAYMENT_RETRYING\" to equal \"PAYMENT_READY\"\n   at tests/checkout.retry.test.ts:87:31\n\nSynthetic diagnostic notes:\n- worker: local-sim-02\n- seed: 44019\n- checkout session id: demo_session_0007\n- payment intent id: pi_demo_safe_0007\n- observed state sequence: CART_READY -> TAX_QUOTED -> PAYMENT_RETRYING -> PAYMENT_READY\n- failure occurred before the final state poll completed\n- no customer email, card number, token, or production URL is present in this synthetic trace\n\nConsole output:\n[checkout] cart loaded for fixture account fixture_acct_small_business\n[checkout] tax quote accepted after retry attempt=1 status=200\n[checkout] payment intent retry scheduled reason=transient_503 attempt=1\n[checkout] session state PAYMENT_RETRYING ageMs=251\n[checkout] session state PAYMENT_RETRYING ageMs=502\n[checkout] expected PAYMENT_READY before assertion timeoutMs=1000\n\nTest Files  1 failed (1)\nTests  1 failed | 5 passed (6)\nStart at  09:14:22\nDuration  2.41s (transform 183ms, setup 74ms, collect 209ms, tests 1.84s, environment 0ms, prepare 62ms)",
+      "metadata": {
+        "synthetic": true,
+        "safe": true,
+        "duplicateOf": "msg_004"
+      }
+    },
+    {
+      "id": "msg_007",
+      "role": "assistant",
+      "timestamp": "2026-05-28T09:16:05.000Z",
+      "content": "The repeated test output is stale now: it confirms the same PAYMENT_RETRYING race and can be retained once in a state capsule."
+    },
+    {
+      "id": "msg_008",
+      "role": "tool",
+      "toolName": "test",
+      "timestamp": "2026-05-28T09:16:48.000Z",
+      "content": "npm test -- --runInBand tests/checkout.retry.test.ts\n\n> storefront@0.0.0 test\n> vitest run --runInBand tests/checkout.retry.test.ts\n\n RUN  v2.1.1 /workspace/synthetic-storefront\n\n ❯ tests/checkout.retry.test.ts (6 tests | 1 failed) 1842ms\n   ✓ validates empty cart before checkout 32ms\n   ✓ renders saved shipping address 41ms\n   ✓ rejects expired promo code 29ms\n   ✓ retries tax quote once after a 503 118ms\n   × preserves checkout session after retrying payment intent 1004ms\n   ✓ records audit event for retry decision 51ms\n\n AssertionError: expected \"PAYMENT_RETRYING\" to equal \"PAYMENT_READY\"\n   at tests/checkout.retry.test.ts:87:31\n\nSynthetic diagnostic notes:\n- worker: local-sim-02\n- seed: 44019\n- checkout session id: demo_session_0007\n- payment intent id: pi_demo_safe_0007\n- observed state sequence: CART_READY -> TAX_QUOTED -> PAYMENT_RETRYING -> PAYMENT_READY\n- failure occurred before the final state poll completed\n- no customer email, card number, token, or production URL is present in this synthetic trace\n\nConsole output:\n[checkout] cart loaded for fixture account fixture_acct_small_business\n[checkout] tax quote accepted after retry attempt=1 status=200\n[checkout] payment intent retry scheduled reason=transient_503 attempt=1\n[checkout] session state PAYMENT_RETRYING ageMs=251\n[checkout] session state PAYMENT_RETRYING ageMs=502\n[checkout] expected PAYMENT_READY before assertion timeoutMs=1000\n\nTest Files  1 failed (1)\nTests  1 failed | 5 passed (6)\nStart at  09:14:22\nDuration  2.41s (transform 183ms, setup 74ms, collect 209ms, tests 1.84s, environment 0ms, prepare 62ms)",
+      "metadata": {
+        "synthetic": true,
+        "safe": true,
+        "duplicateOf": "msg_004"
+      }
+    },
+    {
+      "id": "msg_009",
+      "role": "tool",
+      "toolName": "edit_file",
+      "timestamp": "2026-05-28T09:18:10.000Z",
+      "content": "Updated checkout retry assertion to poll session state until PAYMENT_READY or a deterministic timeout before checking the final state."
+    },
+    {
+      "id": "msg_010",
+      "role": "tool",
+      "toolName": "test",
+      "timestamp": "2026-05-28T09:19:00.000Z",
+      "content": "npm test -- --runInBand tests/checkout.retry.test.ts\n\n6 passed (2.06s)"
+    },
+    {
+      "id": "msg_011",
+      "role": "assistant",
+      "timestamp": "2026-05-28T09:19:20.000Z",
+      "content": "I found a polling race after transient payment retry, added a deterministic wait for PAYMENT_READY, and verified the focused synthetic test passes."
+    }
+  ]
+}

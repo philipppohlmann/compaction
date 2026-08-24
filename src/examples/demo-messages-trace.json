@@ -1,0 +1,14 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Please summarize the deterministic demo trace."
+    },
+    {
+      "id": "assistant_demo_response",
+      "role": "assistant",
+      "content": "I will inspect the local demo trace and report deterministic findings.",
+      "timestamp": "2026-01-01T00:00:05.000Z"
+    }
+  ]
+}

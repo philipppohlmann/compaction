@@ -1,0 +1,105 @@
+{
+  "note": "Residual metadata-only lost-id impostor: compactedMessageIds is empty AND there are NO state capsules, yet a compacted message still carries metadata.compaction.rawSourcePointer. createSafetyReport early-returns the no_compaction_applied report (ids + capsules both empty) and computes source_pointer_count by filtering metadata BY the empty compactedMessageIds, so its derived counts see no evidence. The eval harness must instead scan the raw bundle for the metadata.compaction marker and fail CLOSED. Expect recoverability=failed (FAIL-CLOSED) and a non-zero CLI exit. This must NOT be a silent not_computed/exit 0.",
+  "expected_recoverability": "failed",
+  "expected_real_captured": false,
+  "originalTrace": {
+    "id": "trace_eval_fixture_010",
+    "title": "Eval fixture: metadata-only lost-id impostor (no capsule)",
+    "artifactVersion": "trace-compactor-v0",
+    "source": "manual",
+    "createdAt": "2026-06-15T10:00:00.000Z",
+    "generatedAt": "2026-06-15T10:00:00.000Z",
+    "model": "placeholder-agent-model",
+    "messages": [
+      {
+        "id": "m1",
+        "role": "system",
+        "timestamp": "2026-06-15T10:00:00.000Z",
+        "content": "You are a coding agent. Keep changes minimal."
+      },
+      {
+        "id": "m2",
+        "role": "user",
+        "timestamp": "2026-06-15T10:00:01.000Z",
+        "content": "Run the dependency report twice and compare."
+      },
+      {
+        "id": "m3",
+        "role": "tool",
+        "toolName": "deps",
+        "timestamp": "2026-06-15T10:00:02.000Z",
+        "content": "synthetic-build dependency resolution report\n  module-000@1.0.0  resolved integrity sha512-SYNTHETIC0\n  module-001@1.1.0  resolved integrity sha512-SYNTHETIC1\n  module-002@1.2.0  resolved integrity sha512-SYNTHETIC2\nDONE: synthetic repeated tool output (no real content)."
+      },
+      {
+        "id": "m4",
+        "role": "assistant",
+        "timestamp": "2026-06-15T10:00:03.000Z",
+        "content": "First report captured. Running again to confirm stability."
+      },
+      {
+        "id": "m6",
+        "role": "assistant",
+        "timestamp": "2026-06-15T10:00:05.000Z",
+        "content": "Both reports are identical; the dependency set is stable."
+      }
+    ]
+  },
+  "compactedMessages": [
+    {
+      "id": "m1",
+      "role": "system",
+      "timestamp": "2026-06-15T10:00:00.000Z",
+      "content": "You are a coding agent. Keep changes minimal."
+    },
+    {
+      "id": "m2",
+      "role": "user",
+      "timestamp": "2026-06-15T10:00:01.000Z",
+      "content": "Run the dependency report twice and compare."
+    },
+    {
+      "id": "m3",
+      "role": "tool",
+      "toolName": "deps",
+      "timestamp": "2026-06-15T10:00:02.000Z",
+      "content": "synthetic-build dependency resolution report\n  module-000@1.0.0  resolved integrity sha512-SYNTHETIC0\n  module-001@1.1.0  resolved integrity sha512-SYNTHETIC1\n  module-002@1.2.0  resolved integrity sha512-SYNTHETIC2\nDONE: synthetic repeated tool output (no real content)."
+    },
+    {
+      "id": "m4",
+      "role": "assistant",
+      "timestamp": "2026-06-15T10:00:03.000Z",
+      "content": "First report captured. Running again to confirm stability."
+    },
+    {
+      "id": "m5",
+      "role": "tool",
+      "toolName": "deps",
+      "timestamp": "2026-06-15T10:00:04.000Z",
+      "content": "[state capsule: stale_tool_output_to_state_capsule]\nRepeated deps output was compacted before this model call.\nRaw source pointer: trace=trace_eval_fixture_010 message=m3 index=2.\nThe original payload is retained locally at that pointer for audit and replay.",
+      "metadata": {
+        "compaction": {
+          "policyName": "stale_tool_output_to_state_capsule",
+          "capsuleId": "state_capsule_1",
+          "rawSourcePointer": {
+            "traceId": "trace_eval_fixture_010",
+            "messageId": "m3",
+            "messageIndex": 2,
+            "contentSha256": "b2f59b5f30a66387547ff36f89add4a0d250df08c96ef808fedf05abbe230a2b"
+          },
+          "compactedMessageId": "m5",
+          "replacementMode": "whole_message"
+        }
+      }
+    },
+    {
+      "id": "m6",
+      "role": "assistant",
+      "timestamp": "2026-06-15T10:00:05.000Z",
+      "content": "Both reports are identical; the dependency set is stable."
+    }
+  ],
+  "stateCapsules": [],
+  "compactedMessageIds": [],
+  "tokensSaved": 367,
+  "policyName": "stale_tool_output_to_state_capsule"
+}

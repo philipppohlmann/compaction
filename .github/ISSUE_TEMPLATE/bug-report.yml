@@ -1,0 +1,29 @@
+name: Bug report
+description: Report a reproducible problem in the local CLI or documented open-core behavior
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include secrets, prompts, customer data, or real traces. Use a synthetic fixture or a redacted reproduction.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and the expected behavior.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide safe, minimal steps or a synthetic fixture.
+    validations:
+      required: true

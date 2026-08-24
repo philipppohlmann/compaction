@@ -1,0 +1,145 @@
+{
+  "note": "Valid exact recoverability: real pipeline output, every compacted span pointer-resolvable + hash-matching. Expect recoverability=passed, evidence=fixture, real_captured=false.",
+  "expected_recoverability": "passed",
+  "expected_real_captured": false,
+  "originalTrace": {
+    "id": "trace_eval_fixture_001",
+    "title": "Eval fixture: repeated tool output",
+    "artifactVersion": "trace-compactor-v0",
+    "source": "manual",
+    "createdAt": "2026-06-15T10:00:00.000Z",
+    "generatedAt": "2026-06-15T10:00:00.000Z",
+    "model": "placeholder-agent-model",
+    "messages": [
+      {
+        "id": "m1",
+        "role": "system",
+        "timestamp": "2026-06-15T10:00:00.000Z",
+        "content": "You are a coding agent. Keep changes minimal."
+      },
+      {
+        "id": "m2",
+        "role": "user",
+        "timestamp": "2026-06-15T10:00:01.000Z",
+        "content": "Run the dependency report twice and compare."
+      },
+      {
+        "id": "m3",
+        "role": "tool",
+        "toolName": "deps",
+        "timestamp": "2026-06-15T10:00:02.000Z",
+        "content": "synthetic-build dependency resolution report\n  module-000@1.0.0  resolved integrity sha512-SYNTHETIC0\n  module-001@1.1.0  resolved integrity sha512-SYNTHETIC1\n  module-002@1.2.0  resolved integrity sha512-SYNTHETIC2\n  module-003@1.3.0  resolved integrity sha512-SYNTHETIC3\n  module-004@1.4.0  resolved integrity sha512-SYNTHETIC4\n  module-005@1.5.0  resolved integrity sha512-SYNTHETIC5\n  module-006@1.6.0  resolved integrity sha512-SYNTHETIC6\n  module-007@1.7.0  resolved integrity sha512-SYNTHETIC7\n  module-008@1.8.0  resolved integrity sha512-SYNTHETIC8\n  module-009@1.9.0  resolved integrity sha512-SYNTHETIC9\n  module-010@1.10.0  resolved integrity sha512-SYNTHETIC10\n  module-011@1.11.0  resolved integrity sha512-SYNTHETIC11\n  module-012@1.12.0  resolved integrity sha512-SYNTHETIC12\n  module-013@1.13.0  resolved integrity sha512-SYNTHETIC13\n  module-014@1.14.0  resolved integrity sha512-SYNTHETIC14\n  module-015@1.15.0  resolved integrity sha512-SYNTHETIC15\n  module-016@1.16.0  resolved integrity sha512-SYNTHETIC16\n  module-017@1.17.0  resolved integrity sha512-SYNTHETIC17\n  module-018@1.18.0  resolved integrity sha512-SYNTHETIC18\n  module-019@1.19.0  resolved integrity sha512-SYNTHETIC19\n  module-020@1.20.0  resolved integrity sha512-SYNTHETIC20\n  module-021@1.21.0  resolved integrity sha512-SYNTHETIC21\n  module-022@1.22.0  resolved integrity sha512-SYNTHETIC22\n  module-023@1.23.0  resolved integrity sha512-SYNTHETIC23\n  module-024@1.24.0  resolved integrity sha512-SYNTHETIC24\n  module-025@1.25.0  resolved integrity sha512-SYNTHETIC25\n  module-026@1.26.0  resolved integrity sha512-SYNTHETIC26\n  module-027@1.27.0  resolved integrity sha512-SYNTHETIC27\n  module-028@1.28.0  resolved integrity sha512-SYNTHETIC28\n  module-029@1.29.0  resolved integrity sha512-SYNTHETIC29\nDONE: synthetic repeated tool output (no real content)."
+      },
+      {
+        "id": "m4",
+        "role": "assistant",
+        "timestamp": "2026-06-15T10:00:03.000Z",
+        "content": "First report captured. Running again to confirm stability."
+      },
+      {
+        "id": "m5",
+        "role": "tool",
+        "toolName": "deps",
+        "timestamp": "2026-06-15T10:00:04.000Z",
+        "content": "synthetic-build dependency resolution report\n  module-000@1.0.0  resolved integrity sha512-SYNTHETIC0\n  module-001@1.1.0  resolved integrity sha512-SYNTHETIC1\n  module-002@1.2.0  resolved integrity sha512-SYNTHETIC2\n  module-003@1.3.0  resolved integrity sha512-SYNTHETIC3\n  module-004@1.4.0  resolved integrity sha512-SYNTHETIC4\n  module-005@1.5.0  resolved integrity sha512-SYNTHETIC5\n  module-006@1.6.0  resolved integrity sha512-SYNTHETIC6\n  module-007@1.7.0  resolved integrity sha512-SYNTHETIC7\n  module-008@1.8.0  resolved integrity sha512-SYNTHETIC8\n  module-009@1.9.0  resolved integrity sha512-SYNTHETIC9\n  module-010@1.10.0  resolved integrity sha512-SYNTHETIC10\n  module-011@1.11.0  resolved integrity sha512-SYNTHETIC11\n  module-012@1.12.0  resolved integrity sha512-SYNTHETIC12\n  module-013@1.13.0  resolved integrity sha512-SYNTHETIC13\n  module-014@1.14.0  resolved integrity sha512-SYNTHETIC14\n  module-015@1.15.0  resolved integrity sha512-SYNTHETIC15\n  module-016@1.16.0  resolved integrity sha512-SYNTHETIC16\n  module-017@1.17.0  resolved integrity sha512-SYNTHETIC17\n  module-018@1.18.0  resolved integrity sha512-SYNTHETIC18\n  module-019@1.19.0  resolved integrity sha512-SYNTHETIC19\n  module-020@1.20.0  resolved integrity sha512-SYNTHETIC20\n  module-021@1.21.0  resolved integrity sha512-SYNTHETIC21\n  module-022@1.22.0  resolved integrity sha512-SYNTHETIC22\n  module-023@1.23.0  resolved integrity sha512-SYNTHETIC23\n  module-024@1.24.0  resolved integrity sha512-SYNTHETIC24\n  module-025@1.25.0  resolved integrity sha512-SYNTHETIC25\n  module-026@1.26.0  resolved integrity sha512-SYNTHETIC26\n  module-027@1.27.0  resolved integrity sha512-SYNTHETIC27\n  module-028@1.28.0  resolved integrity sha512-SYNTHETIC28\n  module-029@1.29.0  resolved integrity sha512-SYNTHETIC29\nDONE: synthetic repeated tool output (no real content)."
+      },
+      {
+        "id": "m6",
+        "role": "assistant",
+        "timestamp": "2026-06-15T10:00:05.000Z",
+        "content": "Both reports are identical; the dependency set is stable."
+      }
+    ]
+  },
+  "compactedMessages": [
+    {
+      "id": "m1",
+      "role": "system",
+      "timestamp": "2026-06-15T10:00:00.000Z",
+      "content": "You are a coding agent. Keep changes minimal."
+    },
+    {
+      "id": "m2",
+      "role": "user",
+      "timestamp": "2026-06-15T10:00:01.000Z",
+      "content": "Run the dependency report twice and compare."
+    },
+    {
+      "id": "m3",
+      "role": "tool",
+      "toolName": "deps",
+      "timestamp": "2026-06-15T10:00:02.000Z",
+      "content": "synthetic-build dependency resolution report\n  module-000@1.0.0  resolved integrity sha512-SYNTHETIC0\n  module-001@1.1.0  resolved integrity sha512-SYNTHETIC1\n  module-002@1.2.0  resolved integrity sha512-SYNTHETIC2\n  module-003@1.3.0  resolved integrity sha512-SYNTHETIC3\n  module-004@1.4.0  resolved integrity sha512-SYNTHETIC4\n  module-005@1.5.0  resolved integrity sha512-SYNTHETIC5\n  module-006@1.6.0  resolved integrity sha512-SYNTHETIC6\n  module-007@1.7.0  resolved integrity sha512-SYNTHETIC7\n  module-008@1.8.0  resolved integrity sha512-SYNTHETIC8\n  module-009@1.9.0  resolved integrity sha512-SYNTHETIC9\n  module-010@1.10.0  resolved integrity sha512-SYNTHETIC10\n  module-011@1.11.0  resolved integrity sha512-SYNTHETIC11\n  module-012@1.12.0  resolved integrity sha512-SYNTHETIC12\n  module-013@1.13.0  resolved integrity sha512-SYNTHETIC13\n  module-014@1.14.0  resolved integrity sha512-SYNTHETIC14\n  module-015@1.15.0  resolved integrity sha512-SYNTHETIC15\n  module-016@1.16.0  resolved integrity sha512-SYNTHETIC16\n  module-017@1.17.0  resolved integrity sha512-SYNTHETIC17\n  module-018@1.18.0  resolved integrity sha512-SYNTHETIC18\n  module-019@1.19.0  resolved integrity sha512-SYNTHETIC19\n  module-020@1.20.0  resolved integrity sha512-SYNTHETIC20\n  module-021@1.21.0  resolved integrity sha512-SYNTHETIC21\n  module-022@1.22.0  resolved integrity sha512-SYNTHETIC22\n  module-023@1.23.0  resolved integrity sha512-SYNTHETIC23\n  module-024@1.24.0  resolved integrity sha512-SYNTHETIC24\n  module-025@1.25.0  resolved integrity sha512-SYNTHETIC25\n  module-026@1.26.0  resolved integrity sha512-SYNTHETIC26\n  module-027@1.27.0  resolved integrity sha512-SYNTHETIC27\n  module-028@1.28.0  resolved integrity sha512-SYNTHETIC28\n  module-029@1.29.0  resolved integrity sha512-SYNTHETIC29\nDONE: synthetic repeated tool output (no real content)."
+    },
+    {
+      "id": "m4",
+      "role": "assistant",
+      "timestamp": "2026-06-15T10:00:03.000Z",
+      "content": "First report captured. Running again to confirm stability."
+    },
+    {
+      "id": "m5",
+      "role": "tool",
+      "toolName": "deps",
+      "timestamp": "2026-06-15T10:00:04.000Z",
+      "content": "[state capsule: stale_tool_output_to_state_capsule]\nRepeated deps output was compacted before this model call.\nRaw source pointer: trace=trace_eval_fixture_001 message=m3 index=2 sha256=eb70349ef6ccd8d1e07b28b99661743bcc351cc0ab3b880bdfe786cf677a2dec.\nThe original payload is retained locally at that pointer for audit and replay.\nEstimated raw duplicate input tokens replaced: 463.",
+      "metadata": {
+        "compaction": {
+          "policyName": "stale_tool_output_to_state_capsule",
+          "capsuleId": "state_capsule_1",
+          "rawSourcePointer": {
+            "traceId": "trace_eval_fixture_001",
+            "messageId": "m3",
+            "messageIndex": 2,
+            "contentSha256": "eb70349ef6ccd8d1e07b28b99661743bcc351cc0ab3b880bdfe786cf677a2dec"
+          },
+          "compactedMessageId": "m5",
+          "replacementMode": "whole_message"
+        }
+      }
+    },
+    {
+      "id": "m6",
+      "role": "assistant",
+      "timestamp": "2026-06-15T10:00:05.000Z",
+      "content": "Both reports are identical; the dependency set is stable."
+    }
+  ],
+  "stateCapsules": [
+    {
+      "id": "state_capsule_1",
+      "policyName": "stale_tool_output_to_state_capsule",
+      "traceId": "trace_eval_fixture_001",
+      "sourcePointer": {
+        "traceId": "trace_eval_fixture_001",
+        "messageId": "m3",
+        "messageIndex": 2,
+        "contentSha256": "eb70349ef6ccd8d1e07b28b99661743bcc351cc0ab3b880bdfe786cf677a2dec"
+      },
+      "compactedMessageIds": [
+        "m5"
+      ],
+      "replacementMode": "whole_message",
+      "sourceExcerptPreview": "synthetic-build dependency resolution report module-000@1.0.0 resolved integrity sha512-SYNTHETIC0 module-001@1.1.0 resolved integrity sha512-SYNTHETIC1 modu...",
+      "originalPayloadTokenCount": 463,
+      "text": "[state capsule: stale_tool_output_to_state_capsule]\nRepeated deps output was compacted before this model call.\nRaw source pointer: trace=trace_eval_fixture_001 message=m3 index=2 sha256=eb70349ef6ccd8d1e07b28b99661743bcc351cc0ab3b880bdfe786cf677a2dec.\nThe original payload is retained locally at that pointer for audit and replay.\nEstimated raw duplicate input tokens replaced: 463.",
+      "retainedFacts": [
+        "User goal: Run the dependency report twice and compare.",
+        "Latest assistant summary: Both reports are identical; the dependency set is stable.",
+        "Repeated output preserved by pointer: Repeated deps tool output. Keep m3 and compact m5."
+      ],
+      "openQuestions": [],
+      "safetyNotes": [
+        "State capsule was generated from local trace content only; no model provider was called.",
+        "Review source pointers before relying on compacted context for critical decisions.",
+        "Raw repeated output remains available at trace trace_eval_fixture_001 message m3.",
+        "Only duplicate tool output message m5 was replaced with a state capsule."
+      ]
+    }
+  ],
+  "compactedMessageIds": [
+    "m5"
+  ],
+  "tokensSaved": 367,
+  "policyName": "stale_tool_output_to_state_capsule"
+}

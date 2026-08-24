@@ -1,0 +1,132 @@
+{
+  "note": "Malformed lost-id no-op impostor: the bundle DID compact (a state capsule + compacted-message metadata are present) but the top-level compactedMessageIds was lost/emptied, so compacted_message_count reads 0. This must NOT be treated as a genuine no-op. Expect recoverability=failed (FAIL-CLOSED) and a non-zero CLI exit.",
+  "expected_recoverability": "failed",
+  "expected_real_captured": false,
+  "originalTrace": {
+    "id": "trace_eval_fixture_001",
+    "title": "Eval fixture: lost-id no-op impostor",
+    "artifactVersion": "trace-compactor-v0",
+    "source": "manual",
+    "createdAt": "2026-06-15T10:00:00.000Z",
+    "generatedAt": "2026-06-15T10:00:00.000Z",
+    "model": "placeholder-agent-model",
+    "messages": [
+      {
+        "id": "m1",
+        "role": "system",
+        "timestamp": "2026-06-15T10:00:00.000Z",
+        "content": "You are a coding agent. Keep changes minimal."
+      },
+      {
+        "id": "m2",
+        "role": "user",
+        "timestamp": "2026-06-15T10:00:01.000Z",
+        "content": "Run the dependency report twice and compare."
+      },
+      {
+        "id": "m3",
+        "role": "tool",
+        "toolName": "deps",
+        "timestamp": "2026-06-15T10:00:02.000Z",
+        "content": "synthetic-build dependency resolution report\n  module-000@1.0.0  resolved integrity sha512-SYNTHETIC0\n  module-001@1.1.0  resolved integrity sha512-SYNTHETIC1\n  module-002@1.2.0  resolved integrity sha512-SYNTHETIC2\nDONE: synthetic repeated tool output (no real content)."
+      },
+      {
+        "id": "m4",
+        "role": "assistant",
+        "timestamp": "2026-06-15T10:00:03.000Z",
+        "content": "First report captured. Running again to confirm stability."
+      },
+      {
+        "id": "m6",
+        "role": "assistant",
+        "timestamp": "2026-06-15T10:00:05.000Z",
+        "content": "Both reports are identical; the dependency set is stable."
+      }
+    ]
+  },
+  "compactedMessages": [
+    {
+      "id": "m1",
+      "role": "system",
+      "timestamp": "2026-06-15T10:00:00.000Z",
+      "content": "You are a coding agent. Keep changes minimal."
+    },
+    {
+      "id": "m2",
+      "role": "user",
+      "timestamp": "2026-06-15T10:00:01.000Z",
+      "content": "Run the dependency report twice and compare."
+    },
+    {
+      "id": "m3",
+      "role": "tool",
+      "toolName": "deps",
+      "timestamp": "2026-06-15T10:00:02.000Z",
+      "content": "synthetic-build dependency resolution report\n  module-000@1.0.0  resolved integrity sha512-SYNTHETIC0\n  module-001@1.1.0  resolved integrity sha512-SYNTHETIC1\n  module-002@1.2.0  resolved integrity sha512-SYNTHETIC2\nDONE: synthetic repeated tool output (no real content)."
+    },
+    {
+      "id": "m4",
+      "role": "assistant",
+      "timestamp": "2026-06-15T10:00:03.000Z",
+      "content": "First report captured. Running again to confirm stability."
+    },
+    {
+      "id": "m5",
+      "role": "tool",
+      "toolName": "deps",
+      "timestamp": "2026-06-15T10:00:04.000Z",
+      "content": "[state capsule: stale_tool_output_to_state_capsule]\nRepeated deps output was compacted before this model call.\nRaw source pointer: trace=trace_eval_fixture_001 message=m3 index=2.\nThe original payload is retained locally at that pointer for audit and replay.",
+      "metadata": {
+        "compaction": {
+          "policyName": "stale_tool_output_to_state_capsule",
+          "capsuleId": "state_capsule_1",
+          "rawSourcePointer": {
+            "traceId": "trace_eval_fixture_001",
+            "messageId": "m3",
+            "messageIndex": 2,
+            "contentSha256": "eb70349ef6ccd8d1e07b28b99661743bcc351cc0ab3b880bdfe786cf677a2dec"
+          },
+          "compactedMessageId": "m5",
+          "replacementMode": "whole_message"
+        }
+      }
+    },
+    {
+      "id": "m6",
+      "role": "assistant",
+      "timestamp": "2026-06-15T10:00:05.000Z",
+      "content": "Both reports are identical; the dependency set is stable."
+    }
+  ],
+  "stateCapsules": [
+    {
+      "id": "state_capsule_1",
+      "policyName": "stale_tool_output_to_state_capsule",
+      "traceId": "trace_eval_fixture_001",
+      "sourcePointer": {
+        "traceId": "trace_eval_fixture_001",
+        "messageId": "m3",
+        "messageIndex": 2,
+        "contentSha256": "eb70349ef6ccd8d1e07b28b99661743bcc351cc0ab3b880bdfe786cf677a2dec"
+      },
+      "compactedMessageIds": [
+        "m5"
+      ],
+      "replacementMode": "whole_message",
+      "sourceExcerptPreview": "synthetic-build dependency resolution report module-000@1.0.0 resolved integrity sha512-SYNTHETIC0...",
+      "originalPayloadTokenCount": 463,
+      "text": "[state capsule: stale_tool_output_to_state_capsule]\nRepeated deps output was compacted before this model call.",
+      "retainedFacts": [
+        "User goal: Run the dependency report twice and compare.",
+        "Latest assistant summary: Both reports are identical; the dependency set is stable."
+      ],
+      "openQuestions": [],
+      "safetyNotes": [
+        "State capsule was generated from local trace content only; no model provider was called."
+      ]
+    }
+  ],
+  "compactedMessageIds": [],
+  "tokensSaved": 367,
+  "policyName": "stale_tool_output_to_state_capsule"
+}

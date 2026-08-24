@@ -1,0 +1,58 @@
+{
+  "note": "No-op trace: nothing was compacted, so there is no recoverability evidence to check. Expect recoverability=not_computed (FAIL-CLOSED — never asserted as passed).",
+  "expected_recoverability": "not_computed",
+  "expected_real_captured": false,
+  "originalTrace": {
+    "id": "trace_eval_fixture_noop",
+    "title": "Eval fixture: no-op (nothing to compact)",
+    "artifactVersion": "trace-compactor-v0",
+    "source": "manual",
+    "createdAt": "2026-06-15T10:00:00.000Z",
+    "generatedAt": "2026-06-15T10:00:00.000Z",
+    "model": "placeholder-agent-model",
+    "messages": [
+      {
+        "id": "n1",
+        "role": "system",
+        "timestamp": "2026-06-15T10:00:00.000Z",
+        "content": "You are a coding agent."
+      },
+      {
+        "id": "n2",
+        "role": "user",
+        "timestamp": "2026-06-15T10:00:01.000Z",
+        "content": "What is 2 + 2?"
+      },
+      {
+        "id": "n3",
+        "role": "assistant",
+        "timestamp": "2026-06-15T10:00:02.000Z",
+        "content": "4."
+      }
+    ]
+  },
+  "compactedMessages": [
+    {
+      "id": "n1",
+      "role": "system",
+      "timestamp": "2026-06-15T10:00:00.000Z",
+      "content": "You are a coding agent."
+    },
+    {
+      "id": "n2",
+      "role": "user",
+      "timestamp": "2026-06-15T10:00:01.000Z",
+      "content": "What is 2 + 2?"
+    },
+    {
+      "id": "n3",
+      "role": "assistant",
+      "timestamp": "2026-06-15T10:00:02.000Z",
+      "content": "4."
+    }
+  ],
+  "stateCapsules": [],
+  "compactedMessageIds": [],
+  "tokensSaved": 0,
+  "policyName": "stale_tool_output_to_state_capsule"
+}

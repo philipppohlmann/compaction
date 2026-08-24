@@ -1,0 +1,118 @@
+{
+  "name": "@compaction/cli",
+  "version": "0.6.5",
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Install once and route Claude Code, Codex, or Cursor through a local, byte-safe Gateway \u2014 measure token & cache usage with content-free receipts and shape responses before generation for shorter output. Local-first, no account required, no prompt or code telemetry. Adaptive input compaction needs a free account and the separately delivered engine.",
+  "homepage": "https://compaction.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/papo-2020/compaction.git"
+  },
+  "bugs": {
+    "url": "https://github.com/papo-2020/compaction/issues",
+    "email": "hello@compaction.dev"
+  },
+  "type": "module",
+  "main": "dist/cli/index.js",
+  "bin": {
+    "compaction": "dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "!dist/engine/**",
+    "!dist/examples/**",
+    "!dist/cli/onboarding-prototype/**",
+    "!dist/**/*.js.map",
+    "!dist/core/adapter-audit.*",
+    "!dist/core/pilot-audit.*",
+    "!dist/core/integrations.*",
+    "!dist/core/compactor.*",
+    "!dist/core/state-capsule.*",
+    "!dist/core/compaction-artifacts.*",
+    "!dist/core/policy-middleware.*",
+    "!dist/core/context-store-eval.*",
+    "!dist/core/context-store-eval-cases.*",
+    "!dist/core/context-store-sufficiency.*",
+    "!dist/core/gateway/apply-policy.*",
+    "!dist/core/gateway/apply-composition.*",
+    "!dist/core/billing-delta/**",
+    "!dist/cli/commands/billing-delta.*",
+    "!dist/cli/commands/dev-lease.*",
+    "!dist/core/entitlement/dev-lease-signing.*",
+    "!dist/core/engine-install/dev-signing.*",
+    "!dist/cli/commands/dev-engine.*",
+    "!dist/cli/internal.*",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "tsx src/cli/index.ts",
+    "build": "tsc",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build",
+    "smoke:package": "node scripts/package-smoke.mjs",
+    "boundary:engine": "node scripts/engine-boundary-check.mjs",
+    "preflight:push": "node scripts/assert-on-branch.mjs",
+    "verify": "npm run typecheck && npm test && npm run smoke:package",
+    "analyze:demo": "npm run analyze:demo:login && npm run analyze:demo:coding && npm run analyze:demo:support && npm run analyze:demo:rag",
+    "compact:demo": "npm run compact:demo:login && npm run compact:demo:coding && npm run compact:demo:support && npm run compact:demo:rag",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "analyze:demo:login": "tsx src/cli/index.ts analyze src/examples/demo-trace.json",
+    "compact:demo:login": "tsx src/cli/index.ts compact src/examples/demo-trace.json --out .compaction/runs/demo-login-test",
+    "analyze:demo:coding": "tsx src/cli/index.ts analyze src/examples/demo-coding-trace.json",
+    "compact:demo:coding": "tsx src/cli/index.ts compact src/examples/demo-coding-trace.json --out .compaction/runs/demo-coding",
+    "analyze:demo:support": "tsx src/cli/index.ts analyze src/examples/demo-support-trace.json",
+    "compact:demo:support": "tsx src/cli/index.ts compact src/examples/demo-support-trace.json --out .compaction/runs/demo-support",
+    "analyze:demo:rag": "tsx src/cli/index.ts analyze src/examples/demo-rag-trace.json",
+    "compact:demo:rag": "tsx src/cli/index.ts compact src/examples/demo-rag-trace.json --out .compaction/runs/demo-rag",
+    "run:demo": "npm run dev -- run -- node src/examples/repeated-output-command.js",
+    "summary": "npm run dev -- summary",
+    "recommend:demo": "tsx src/cli/index.ts recommend src/examples/demo-trace.json",
+    "apply:demo": "tsx src/cli/index.ts apply src/examples/demo-trace.json --policy stale_tool_output_to_state_capsule --require-safety-pass",
+    "audit:demo": "tsx src/cli/index.ts audit",
+    "import:demo": "tsx src/cli/index.ts import src/examples/demo-messages-trace.json --source messages --out .compaction/imports/demo-messages",
+    "codex:demo": "tsx src/cli/index.ts import src/examples/codex-exec-demo.jsonl --source codex-exec-jsonl --out .compaction/imports/codex-demo && tsx src/cli/index.ts analyze .compaction/imports/codex-demo/captured-trace.json && tsx src/cli/index.ts recommend .compaction/imports/codex-demo/captured-trace.json && tsx src/cli/index.ts compact .compaction/imports/codex-demo/captured-trace.json --out .compaction/imports/codex-demo/compacted",
+    "pilot:demo": "tsx src/cli/index.ts audit --traces src/examples --source unknown",
+    "adapter:demo": "tsx src/cli/index.ts adapter validate src/examples/demo-messages-trace.json --source messages",
+    "adapter:audit:demo": "tsx src/cli/index.ts audit --adapter codex-exec-jsonl --traces src/examples/codex-exec-fixtures",
+    "capture:openai-agents:demo": "tsx src/cli/index.ts capture openai-agents --out .compaction/captures/openai-agents -- node src/examples/openai-agents-capture-demo.js",
+    "optimize:openai-agents:demo": "tsx src/cli/index.ts optimize openai-agents --out .compaction/optimizations/openai-agents",
+    "approve:demo": "npm run optimize:openai-agents:demo && tsx src/cli/index.ts approve $(node -e \"const fs=require('fs'); const path='.compaction/optimizations/openai-agents'; const dirs=fs.readdirSync(path,{withFileTypes:true}).filter(d=>d.isDirectory()).map(d=>d.name).sort(); process.stdout.write(dirs.at(-1));\") --require-safety-pass",
+    "spend:demo": "npm run optimize:openai-agents:demo && tsx src/cli/index.ts spend $(node -e 'const fs=require(\"fs\"); const path=\".compaction/optimizations/openai-agents\"; const dirs=fs.readdirSync(path,{withFileTypes:true}).filter(d=>d.isDirectory()).map(d=>d.name).sort(); process.stdout.write(path+\"/\"+dirs.at(-1)+\"/optimization-summary.json\");')",
+    "review:demo": "npm run optimize:openai-agents:demo && tsx src/cli/index.ts review $(node -e 'const fs=require(\"fs\"); const path=\".compaction/optimizations/openai-agents\"; const dirs=fs.readdirSync(path,{withFileTypes:true}).filter(d=>d.isDirectory()).map(d=>d.name).sort(); process.stdout.write(path+\"/\"+dirs.at(-1)+\"/optimization-summary.json\");') --require-safety-pass",
+    "integrations:demo": "tsx src/cli/index.ts integrations run openai-agents --out .compaction/integrations -- node src/examples/openai-agents-real-workflow.js",
+    "pretest": "npm run build",
+    "clean": "rm -rf dist",
+    "prebuild": "rm -rf dist"
+  },
+  "keywords": [
+    "ai",
+    "agents",
+    "cli",
+    "compaction",
+    "traces"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "commander": "^12.1.0",
+    "ink": "^5.2.1",
+    "react": "^18.3.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.31",
+    "ink-testing-library": "^4.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.8"
+  }
+}

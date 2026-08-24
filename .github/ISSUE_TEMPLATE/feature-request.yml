@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose an improvement to the local-first CLI or open-core surface
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the user problem first. Do not include secrets or real customer traces.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the smallest useful change and any safety or evidence implications.
+    validations:
+      required: true

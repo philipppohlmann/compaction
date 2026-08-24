@@ -1,0 +1,221 @@
+{
+  "schema_version": "1.0.0",
+  "updated": "2026-07-01",
+  "description": "Navigation registry for Compaction evals. Implementation remains under src/ and tests/.",
+  "eval_gates": {
+    "context_preservation": {
+      "question": "Was compacted input context recoverable and task-safe per deterministic checks?",
+      "used_for": "input_token_reduction_claims"
+    },
+    "short_but_sufficient": {
+      "question": "Does shaped output still satisfy all required task-outcome criteria?",
+      "used_for": "output_token_reduction_claims"
+    }
+  },
+  "evals": [
+    {
+      "id": "deterministic-recoverability",
+      "name": "Deterministic recoverability eval",
+      "proves": [
+        "byte_hash_source_pointer_recoverability"
+      ],
+      "does_not_prove": [
+        "semantic_preservation",
+        "commitment_meaning_preservation",
+        "billing_confirmed_savings",
+        "output_token_reduction"
+      ],
+      "implementation": [
+        "hybrid-engine (delivered separately)"
+      ],
+      "cli_commands": [
+        "compact --eval",
+        "eval"
+      ],
+      "tests": [
+        "tests/core/eval-harness.test.ts",
+        "tests/core/eval-cli.test.ts",
+        "tests/cli/compact-eval-one-command-cli.test.ts",
+        "tests/core/strong-eval-integration.test.ts"
+      ],
+      "fixtures": [
+        "tests/fixtures/eval/"
+      ],
+      "status": "shipped"
+    },
+    {
+      "id": "commitment-recoverability-check",
+      "name": "Commitment recoverability check (strong eval)",
+      "proves": [
+        "extracted_commitments_retained_or_recoverable"
+      ],
+      "does_not_prove": [
+        "semantic_commitment_preservation"
+      ],
+      "implementation": [
+        "hybrid-engine (delivered separately)"
+      ],
+      "cli_commands": [
+        "compact --eval"
+      ],
+      "tests": [
+        "tests/core/commitment-preservation.test.ts",
+        "tests/core/strong-eval-integration.test.ts"
+      ],
+      "status": "shipped"
+    },
+    {
+      "id": "fixture-task-check",
+      "name": "Fixture-based task-check (strong eval)",
+      "proves": [
+        "task_anchors_recoverable_supported_workflows"
+      ],
+      "does_not_prove": [
+        "model_replay",
+        "real_agent_reexecution"
+      ],
+      "implementation": [
+        "hybrid-engine (delivered separately)"
+      ],
+      "cli_commands": [
+        "compact --eval"
+      ],
+      "tests": [
+        "tests/core/strong-eval-integration.test.ts"
+      ],
+      "status": "shipped_fixture_scoped"
+    },
+    {
+      "id": "input-compaction-gate",
+      "name": "Input compaction A/B + context-preservation gate",
+      "eval_gate": "context_preservation",
+      "proves": [
+        "provider_reported_input_ab_n3_se",
+        "context_preservation_eval_pass"
+      ],
+      "does_not_prove": [
+        "output_sufficiency",
+        "cross_provider_generalization",
+        "billing_confirmed_savings"
+      ],
+      "implementation": [
+        "src/core/input-compaction-ab.ts"
+      ],
+      "cli_commands": [
+        "input-compaction-ab init",
+        "input-compaction-ab add",
+        "input-compaction-ab status"
+      ],
+      "tests": [
+        "tests/core/input-compaction-ab.test.ts",
+        "tests/core/input-compaction-verification.test.ts",
+        "tests/core/superseded-same-source-read.test.ts"
+      ],
+      "status": "shipped"
+    },
+    {
+      "id": "output-sufficiency-gate",
+      "name": "Output shaping A/B + short-but-sufficient gate",
+      "eval_gate": "short_but_sufficient",
+      "proves": [
+        "provider_reported_output_ab_n3_se",
+        "output_sufficiency_eval_pass"
+      ],
+      "does_not_prove": [
+        "input_context_preservation",
+        "single_headline_percent_all_models"
+      ],
+      "implementation": [
+        "src/core/output-shaping-ab.ts",
+        "src/core/output-shaping.ts",
+        "src/core/output-shaping-attach.ts"
+      ],
+      "cli_commands": [
+        "output-shaping",
+        "output-shaping-ab init",
+        "output-shaping-ab add",
+        "output-shaping-ab status",
+        "capture codex --output-shaping",
+        "capture cursor --output-shaping"
+      ],
+      "tests": [
+        "tests/engine/output-sufficiency-eval.test.ts",
+        "tests/core/output-shaping-verification.test.ts",
+        "tests/core/output-shaping-ab.test.ts",
+        "tests/core/output-shaping.test.ts",
+        "tests/core/output-shaping-attach.test.ts"
+      ],
+      "status": "shipped"
+    },
+    {
+      "id": "context-store-eval",
+      "name": "Context store retrieval eval (V0.4 internal)",
+      "proves": [
+        "recall_source_coverage_continuation_fixtures"
+      ],
+      "does_not_prove": [
+        "public_sufficiency_verdict",
+        "large_memory_corpus_claim"
+      ],
+      "implementation": [
+        "src/core/context-store-eval.ts",
+        "src/core/context-store-eval-cases.ts",
+        "src/core/context-store-sufficiency.ts"
+      ],
+      "cli_commands": [
+        "context add",
+        "context get"
+      ],
+      "tests": [
+        "tests/core/context-store-eval.test.ts",
+        "tests/core/context-store-eval-edge.test.ts",
+        "tests/core/context-store-eval-richer.test.ts",
+        "tests/core/context-store-sufficiency.test.ts"
+      ],
+      "status": "shipped_internal"
+    },
+    {
+      "id": "overclaim-guard",
+      "name": "First-value overclaim regression guard",
+      "proves": [
+        "cli_copy_within_evidence_ladder"
+      ],
+      "implementation": [
+        "hybrid-engine (delivered separately)"
+      ],
+      "tests": [
+        "tests/security/no-overclaim-first-value.test.ts"
+      ],
+      "docs": [
+        "README.md"
+      ],
+      "status": "shipped"
+    }
+  ],
+  "gaps": [
+    {
+      "id": "cc-input-real-session-n3",
+      "description": "Claude Code provider-reported input A/B on >=3 independent non-sensitive real sessions",
+      "blocked_by": "non_sensitive_real_session_data"
+    },
+    {
+      "id": "output-distribution-breadth",
+      "description": "More prompt families and second model for generalizable output reduction distribution"
+    },
+    {
+      "id": "cursor-provider-usage",
+      "description": "Provider-reported token fields from Cursor",
+      "blocked_by": "vendor_usage_api"
+    },
+    {
+      "id": "semantic-preservation",
+      "description": "Semantic/meaning preservation eval",
+      "status": "future_not_evaluated"
+    },
+    {
+      "id": "billing-confirmed",
+      "description": "Billing-confirmed savings figure meeting N>=3/arm and delta-of-means criterion",
+      "status": "future_no_repo_figure"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.compaction/
+.env
+.DS_Store
+*.tgz
+# Vercel local project-link artifacts (never commit; contains project/org ids)
+.vercel/
+
+# Agent worktrees (transient; never commit)
+.claude/worktrees/
+
+# Local wrangler state
+.wrangler/

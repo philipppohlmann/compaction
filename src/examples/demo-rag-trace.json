@@ -1,0 +1,86 @@
+{
+  "id": "trace_demo_rag_repeated_retrieval_001",
+  "title": "RAG agent repeated damaged-item retrieval output",
+  "createdAt": "2026-05-29T11:22:00.000Z",
+  "model": "placeholder-agent-model",
+  "messages": [
+    {
+      "id": "msg_001",
+      "role": "system",
+      "timestamp": "2026-05-29T11:22:00.000Z",
+      "content": "You are a retrieval-augmented support agent using a synthetic knowledge base. Cite retained demo documents and avoid private data."
+    },
+    {
+      "id": "msg_002",
+      "role": "user",
+      "timestamp": "2026-05-29T11:22:05.000Z",
+      "content": "Draft a safe answer for a synthetic customer whose package was marked damaged in transit and who asks whether a refund is available."
+    },
+    {
+      "id": "msg_003",
+      "role": "assistant",
+      "timestamp": "2026-05-29T11:22:10.000Z",
+      "content": "I will retrieve the demo policy documents for damaged items, refund windows, and escalation criteria."
+    },
+    {
+      "id": "msg_004",
+      "role": "tool",
+      "toolName": "retriever.search",
+      "timestamp": "2026-05-29T11:22:16.000Z",
+      "content": "retriever.search(query=\"refund window damaged item\", top_k=5, corpus=\"demo_knowledge_base\")\n\n1. doc_id=kb_demo_returns_014 score=0.918 title=\"Returns and refunds for damaged items\"\n   snippet=\"Customers may request a refund or replacement for damaged items within 30 days of delivery. Ask for photos only when the damage is not already verified by carrier scan.\"\n   source=synthetic_help_center updated=2026-04-17\n\n2. doc_id=kb_demo_returns_021 score=0.884 title=\"Carrier-confirmed damage workflow\"\n   snippet=\"When carrier scan status is DAMAGED_IN_TRANSIT, support agents can offer refund, replacement, or store credit without asking the customer to repeat evidence already in the shipment record.\"\n   source=synthetic_help_center updated=2026-04-18\n\n3. doc_id=kb_demo_policy_009 score=0.842 title=\"Refund method timing\"\n   snippet=\"Refunds to the original payment method are initiated immediately after approval and usually appear in 5 to 7 business days depending on the issuing bank.\"\n   source=synthetic_policy_manual updated=2026-03-22\n\n4. doc_id=kb_demo_macro_032 score=0.805 title=\"Macro: damaged item apology\"\n   snippet=\"Acknowledge the issue, avoid blaming the carrier, summarize the resolution choice, and provide timing. Do not include private account data in the reply.\"\n   source=synthetic_macro_library updated=2026-05-02\n\n5. doc_id=kb_demo_escalation_006 score=0.762 title=\"When to escalate damaged delivery cases\"\n   snippet=\"Escalate only when the order value exceeds the synthetic demo threshold, the address is disputed, or the customer requests a manager review.\"\n   source=synthetic_policy_manual updated=2026-02-10\n\nRetriever diagnostics:\n- embedding_model=local-demo-embedding-v1\n- latencyMs=42\n- cache=hit\n- corpus_version=demo-kb-2026-05-01\n- no real customer content, private documents, API keys, or provider identifiers are included.",
+      "metadata": {
+        "synthetic": true,
+        "safe": true
+      }
+    },
+    {
+      "id": "msg_005",
+      "role": "assistant",
+      "timestamp": "2026-05-29T11:22:40.000Z",
+      "content": "The retrieved docs indicate a 30-day damaged-item refund or replacement path when carrier damage is already confirmed."
+    },
+    {
+      "id": "msg_006",
+      "role": "tool",
+      "toolName": "retriever.search",
+      "timestamp": "2026-05-29T11:23:02.000Z",
+      "content": "retriever.search(query=\"refund window damaged item\", top_k=5, corpus=\"demo_knowledge_base\")\n\n1. doc_id=kb_demo_returns_014 score=0.918 title=\"Returns and refunds for damaged items\"\n   snippet=\"Customers may request a refund or replacement for damaged items within 30 days of delivery. Ask for photos only when the damage is not already verified by carrier scan.\"\n   source=synthetic_help_center updated=2026-04-17\n\n2. doc_id=kb_demo_returns_021 score=0.884 title=\"Carrier-confirmed damage workflow\"\n   snippet=\"When carrier scan status is DAMAGED_IN_TRANSIT, support agents can offer refund, replacement, or store credit without asking the customer to repeat evidence already in the shipment record.\"\n   source=synthetic_help_center updated=2026-04-18\n\n3. doc_id=kb_demo_policy_009 score=0.842 title=\"Refund method timing\"\n   snippet=\"Refunds to the original payment method are initiated immediately after approval and usually appear in 5 to 7 business days depending on the issuing bank.\"\n   source=synthetic_policy_manual updated=2026-03-22\n\n4. doc_id=kb_demo_macro_032 score=0.805 title=\"Macro: damaged item apology\"\n   snippet=\"Acknowledge the issue, avoid blaming the carrier, summarize the resolution choice, and provide timing. Do not include private account data in the reply.\"\n   source=synthetic_macro_library updated=2026-05-02\n\n5. doc_id=kb_demo_escalation_006 score=0.762 title=\"When to escalate damaged delivery cases\"\n   snippet=\"Escalate only when the order value exceeds the synthetic demo threshold, the address is disputed, or the customer requests a manager review.\"\n   source=synthetic_policy_manual updated=2026-02-10\n\nRetriever diagnostics:\n- embedding_model=local-demo-embedding-v1\n- latencyMs=42\n- cache=hit\n- corpus_version=demo-kb-2026-05-01\n- no real customer content, private documents, API keys, or provider identifiers are included.",
+      "metadata": {
+        "synthetic": true,
+        "safe": true,
+        "duplicateOf": "msg_004"
+      }
+    },
+    {
+      "id": "msg_007",
+      "role": "assistant",
+      "timestamp": "2026-05-29T11:23:24.000Z",
+      "content": "The second retrieval is identical, so its useful facts can move to a state capsule instead of staying as repeated context."
+    },
+    {
+      "id": "msg_008",
+      "role": "tool",
+      "toolName": "retriever.search",
+      "timestamp": "2026-05-29T11:23:45.000Z",
+      "content": "retriever.search(query=\"refund window damaged item\", top_k=5, corpus=\"demo_knowledge_base\")\n\n1. doc_id=kb_demo_returns_014 score=0.918 title=\"Returns and refunds for damaged items\"\n   snippet=\"Customers may request a refund or replacement for damaged items within 30 days of delivery. Ask for photos only when the damage is not already verified by carrier scan.\"\n   source=synthetic_help_center updated=2026-04-17\n\n2. doc_id=kb_demo_returns_021 score=0.884 title=\"Carrier-confirmed damage workflow\"\n   snippet=\"When carrier scan status is DAMAGED_IN_TRANSIT, support agents can offer refund, replacement, or store credit without asking the customer to repeat evidence already in the shipment record.\"\n   source=synthetic_help_center updated=2026-04-18\n\n3. doc_id=kb_demo_policy_009 score=0.842 title=\"Refund method timing\"\n   snippet=\"Refunds to the original payment method are initiated immediately after approval and usually appear in 5 to 7 business days depending on the issuing bank.\"\n   source=synthetic_policy_manual updated=2026-03-22\n\n4. doc_id=kb_demo_macro_032 score=0.805 title=\"Macro: damaged item apology\"\n   snippet=\"Acknowledge the issue, avoid blaming the carrier, summarize the resolution choice, and provide timing. Do not include private account data in the reply.\"\n   source=synthetic_macro_library updated=2026-05-02\n\n5. doc_id=kb_demo_escalation_006 score=0.762 title=\"When to escalate damaged delivery cases\"\n   snippet=\"Escalate only when the order value exceeds the synthetic demo threshold, the address is disputed, or the customer requests a manager review.\"\n   source=synthetic_policy_manual updated=2026-02-10\n\nRetriever diagnostics:\n- embedding_model=local-demo-embedding-v1\n- latencyMs=42\n- cache=hit\n- corpus_version=demo-kb-2026-05-01\n- no real customer content, private documents, API keys, or provider identifiers are included.",
+      "metadata": {
+        "synthetic": true,
+        "safe": true,
+        "duplicateOf": "msg_004"
+      }
+    },
+    {
+      "id": "msg_009",
+      "role": "tool",
+      "toolName": "test",
+      "timestamp": "2026-05-29T11:24:10.000Z",
+      "content": "draft_response_check\nstatus=passed\nchecks=grounded_in_demo_docs,no_private_data,no_unapproved_escalation\nreferenced_docs=kb_demo_returns_014,kb_demo_returns_021,kb_demo_policy_009"
+    },
+    {
+      "id": "msg_010",
+      "role": "assistant",
+      "timestamp": "2026-05-29T11:24:30.000Z",
+      "content": "A safe draft can offer refund or replacement, explain 5 to 7 business day refund timing, and avoid requesting duplicate evidence because carrier damage is already confirmed."
+    }
+  ]
+}
