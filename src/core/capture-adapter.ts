@@ -70,7 +70,7 @@ export interface CaptureProvenance {
    * Non-sensitive per-run distinctness fingerprint (a one-way SHA-256 DIGEST over the
    * canonical normalized trace content, NEVER raw messages/prompts/tool-output).
    *
-   * Lets future dogfood records cite a verifiable per-run distinctness proof so that
+   * Lets a record cite a verifiable per-run distinctness proof so that
    * genuinely-different captured sessions are distinguishable from re-captures of the
    * same session (preventing real_captured N over-counting). When an adapter cannot
    * produce a fingerprint, this is omitted and distinctness must be reported as

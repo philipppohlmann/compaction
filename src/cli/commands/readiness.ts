@@ -685,8 +685,8 @@ export function renderReadinessReport(r: ReadinessReport): string {
   // "read-only" on that run would have the report contradict the very warning that gated it.
   lines.push(
     r.tools.codex.shapingTrustProbed === true
-      ? "compaction status - dogfood readiness (local, content-free; --check-codex started Codex, which writes its own state)"
-      : "compaction status - dogfood readiness (local, read-only, content-free)"
+      ? "compaction status - readiness (local, content-free; --check-codex started Codex, which writes its own state)"
+      : "compaction status - readiness (local, read-only, content-free)"
   );
   lines.push("");
   lines.push("Tools");

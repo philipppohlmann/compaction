@@ -3,8 +3,8 @@
  *
  * Spawns the private native engine as a supervised child process and speaks the versioned framed
  * protocol (`protocol.ts`) over its stdin/stdout. It is the seam that routes the gateway
- * apply path through; this PR introduces it alongside — it does NOT replace — the existing
- * `lcm-apply-boundary.ts` seam.
+ * apply path through, and sits alongside the existing `lcm-apply-boundary.ts` seam rather than
+ * replacing it.
  *
  * Fail-open by construction: engine absent / unverified install / spawn failure / crash /
  * per-request timeout / protocol-version mismatch / malformed frame / bad response all resolve to

@@ -8,7 +8,7 @@
  *  - The device token is written ONLY to the 0600 credentials file; `maskToken` is the only form
  *    ever printed. The locally-generated private key is never printed in any form.
  *  - Logging in does NOT enable full apply by itself: entitlement checks and the narrow per-tool
- *    apply authorization stay separate and land in later PRs.
+ *    apply authorization are separate steps.
  *  - Dev-phase identity: accounts created through this flow are asserted-email accounts against a
  *    locally-run control plane.
  */

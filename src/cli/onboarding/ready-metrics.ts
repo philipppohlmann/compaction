@@ -123,8 +123,8 @@ const READY_PER_TURN_CODEX_LINES = [
   "  Codex: no input reduction and no cost figure from this setup - it installs hooks, not a Gateway route.",
   "  The Gateway route (a separate, explicit `compaction gateway run -- codex …`) is what adds an input before→after line.",
   // NOT "guaranteed either way". `compaction watch` reads Gateway receipts and shim-captured runs; an
-  // INTERACTIVE codex session produces neither, so a blanket guarantee would move this PR's own defect
-  // (a surface that stays empty for the workflow you just set up) one screen later.
+  // INTERACTIVE codex session produces neither, so a blanket guarantee would move the defect this
+  // block exists to avoid (a surface that stays empty for the workflow you just set up) one screen later.
   "  `compaction watch` shows Gateway-routed Codex turns; interactive sessions are not measured."
 ] as const;
 

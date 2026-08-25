@@ -50,11 +50,11 @@ export interface EngineIpcAuthorization {
 }
 
 /**
- * Opaque/signed entitlement placeholder. In this PR it is a passthrough token the supervisor may
- * forward; the engine treats it as opaque. It never contains a credential or a network endpoint.
+ * Opaque/signed entitlement placeholder: a passthrough token the supervisor may forward, which the
+ * engine treats as opaque. It never contains a credential or a network endpoint.
  */
 export interface EngineIpcEntitlement {
-  /** Opaque token (signed placeholder; real signing/verification is a later PR). */
+  /** Opaque token (signed placeholder; signing and verification are not implemented at this seam). */
   token: string;
 }
 

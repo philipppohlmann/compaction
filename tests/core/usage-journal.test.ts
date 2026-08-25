@@ -35,7 +35,7 @@ import { generateDeviceKeyPair } from "../../src/core/auth/device-flow.js";
  * The ceiling for appends whose subject is NOT the allowance (chaining, dedupe, signatures): an
  * allowance far above anything these events debit, so the required re-check passes and the test
  * observes the behaviour it is actually about. There is no ceiling-free append — `ceiling` is
- * required by the type, which is the point of the PR that made it so.
+ * required by the type, which is the point of making it required.
  */
 const HEADROOM = { ceiling: { allowanceTokens: 1_000_000 } };
 

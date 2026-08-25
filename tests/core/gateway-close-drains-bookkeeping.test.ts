@@ -191,7 +191,7 @@ describe("gateway close() drains pending bookkeeping writes", () => {
     // Structural, NOT a stopwatch: at the moment the client already holds its COMPLETE response the
     // write has not finished and nothing is on disk. A wall-clock bound ("the response returned in
     // under N ms") would prove the same thing less reliably — it flakes on a loaded CI worker, which
-    // is precisely the failure mode this PR exists to remove.
+    // is precisely the failure mode this test exists to rule out.
     expect(appendHook.finished).toBe(0);
     expect(existsSync(join(h.cwd, RECEIPTS))).toBe(false);
 

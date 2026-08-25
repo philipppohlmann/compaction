@@ -1359,8 +1359,8 @@ export async function runCommunityActivation(
       };
     }
     // A GATE IS PENDING, so the screen reports `basic` — and the PERSISTED posture must say the same
-    // thing. Leaving `full` on disk while rendering `basic` is the
-    // exact split this PR keeps closing: the commonest case is a user who picked the recommended
+    // thing. Leaving `full` on disk while rendering `basic` is the split this guards against: the
+    // commonest case is a user who picked the recommended
     // "Output only" mode and then activated Community, whose own choice would be silently overwritten
     // by a valid lease. `effectiveOpenTier()` would resolve `full`, gateway traffic would enter the
     // full-apply path only to exit at the optimization-mode gate, and the promised basic posture would

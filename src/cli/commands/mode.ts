@@ -334,7 +334,7 @@ async function handleFullMode(env: NodeJS.ProcessEnv = process.env): Promise<voi
     );
     if (outcome.leaseTrust === "dev-lease-root") {
       console.log(
-        chalk.yellow("  This lease is DEV-SIGNED — not a production entitlement (local dogfood only).")
+        chalk.yellow("  This lease is DEV-SIGNED — not a production entitlement (local development only).")
       );
     }
     // SCOPE THE PROMISE. The entitlement is real and subscription-routed turns apply normally,

@@ -2,8 +2,8 @@
  * Native-engine apply seam (PUBLIC) — the thin boundary function the gateway apply path can call to
  * consult the supervised native engine, with safe degradation baked in.
  *
- * This is the seam the gateway apply path is routed through. It does
- * NOT replace the existing `lcm-apply-boundary.ts` path this PR — both coexist during migration.
+ * This is the seam the gateway apply path is routed through. It does not replace the existing
+ * `lcm-apply-boundary.ts` path; both coexist.
  *
  * Degradation order: when the engine is unavailable/degraded, or when
  * it returns a refusal/no-op/error, this seam yields a `forward-original` decision — the caller

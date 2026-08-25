@@ -10,7 +10,7 @@ import {
 } from "./model.js";
 import { FRAME_MAX, PrototypeWordmark, useTerminalSize } from "./Wordmark.js";
 
-// Internal UX dogfood only. Every discovery, install, verification, readiness, activity,
+// Internal UX prototype only. Every discovery, install, verification, readiness, activity,
 // and metric shown here is fixed simulated state-not observed, provider-reported, billed,
 // or production behavior. This component must remain unreachable from the production CLI.
 type Screen = "target" | "limited" | "mode" | "review" | "installing" | "ready" | "installed";

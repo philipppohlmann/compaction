@@ -8,7 +8,7 @@
  *  - `compaction lease status`: print the CONTENT-FREE local verdict (fixed labels only — never a
  *    lease id, account, email, or token figure). Reads local disk only; no network.
  *  - `compaction lease install-dev-root <path>`: install an explicit DEV lease-signing root for
- *    local dogfood. Anything it verifies is labeled DEV-SIGNED — not a production entitlement.
+ *    local development. Anything it verifies is labeled DEV-SIGNED — not a production entitlement.
  *
  * HARD RAILS:
  *  - The lease reader/verifier is engine-free, account-free, network-free (Open-path-safe). This
@@ -264,7 +264,7 @@ async function runAcquire(opts: { apiUrl?: string }, env: NodeJS.ProcessEnv = pr
     console.log(
       chalk.dim(
         "  The stored lease did not verify locally. In production the pinned lease root is not minted yet; " +
-          "for local dogfood install a dev root with `compaction lease install-dev-root <path>`."
+          "for local development install a dev root with `compaction lease install-dev-root <path>`."
       )
     );
   } else if (d.next) {
@@ -319,7 +319,7 @@ export function registerLeaseCommand(program: Command): void {
 
   lease
     .command("install-dev-root <pubKeyPath>")
-    .description("Install an explicit DEV lease-signing root for local dogfood (verified leases are labeled DEV-SIGNED).")
+    .description("Install an explicit DEV lease-signing root for local development (verified leases are labeled DEV-SIGNED).")
     .action((pubKeyPath: string) => {
       runInstallDevRoot(pubKeyPath, process.env);
     });

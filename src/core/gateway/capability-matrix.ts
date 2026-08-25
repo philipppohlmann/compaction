@@ -187,7 +187,7 @@ export const LIVE_VERIFIED_REASON =
 
 /** The single honest reason `liveVerified` is false for a not-yet-verified provider/row. */
 export const LIVE_UNVERIFIED_REASON =
-  "adapters are fixture-tested (usage/cache fields normalized + unit-tested), not proven against live provider traffic this cycle; a later dogfood flips exactly the paths it proves.";
+  "adapters are fixture-tested (usage/cache fields normalized + unit-tested), not proven against live provider traffic; a later live verification flips exactly the paths it proves.";
 
 /**
  * The capability fields that must carry a reason in `reasons` when false. `gatewayRoutable` is handled
