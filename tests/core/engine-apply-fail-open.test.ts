@@ -28,6 +28,10 @@ afterEach(async () => {
 
 async function harness() {
   const cwd = mkdtempSync(join(tmpdir(), "engine-fail-open-"));
+  // The DEVICE store, deliberately NOT under `cwd`: the gateway reads the authorization from the
+  // device environment alone, so a fixture that wrote it into the working directory would now be
+  // asserting the very thing that must not work (repository content granting apply).
+  const deviceDir = mkdtempSync(join(tmpdir(), "engine-fail-open-device-"));
   let received = "";
   const upstream = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -47,7 +51,7 @@ async function harness() {
       preference: "auto-when-gates-pass",
       gates_required: [...AUTO_APPLY_ELIGIBILITY_GATES]
     },
-    join(cwd, ".compaction")
+    deviceDir
   );
 
   const gateway = createGatewayServer({
@@ -56,7 +60,8 @@ async function harness() {
     mode: "record",
     workflow: "codex",
     optimizationMode: "cache-plus-context",
-    cwd
+    cwd,
+    entitlementEnv: { COMPACTION_CONFIG_DIR: deviceDir }
   });
   await new Promise<void>((resolve) => gateway.listen(0, "127.0.0.1", resolve));
   const gatewayPort = (gateway.address() as { port: number }).port;

@@ -127,8 +127,14 @@ export function registerOutputShapingAbCommand(program: Command): void {
         inputTokens: sidecar.inputTokens,
         providerReported: sidecar.providerReported === true,
         tokenSource: sidecar.tokenSource,
+        ...(sidecar.provider ? { provider: sidecar.provider } : {}),
+        ...(sidecar.model ? { model: sidecar.model } : {}),
         ...(arm === "treatment" && sidecar.outputShaping
-          ? { policyFamily: sidecar.outputShaping.policyFamily, policyNames: sidecar.outputShaping.policyNames }
+          ? {
+              policyFamily: sidecar.outputShaping.policyFamily,
+              policyNames: sidecar.outputShaping.policyNames,
+              policyVersion: sidecar.outputShaping.policyVersion
+            }
           : {}),
         ...(arm === "treatment" ? { evalMarkersPreserved: evalOutcome ?? null } : {}),
         ...(options.truncated ? { truncated: true } : {}),

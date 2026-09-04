@@ -58,9 +58,9 @@ function describeVerdict(
     case "lease-valid": {
       const devSigned = verdict.trust === "dev-lease-root";
       const line = devSigned ? "valid (DEV-SIGNED — not a production entitlement)" : "valid";
-      // A SPENT METERED BALANCE IS NOT AN INVALID LEASE. The device is entitled either way, and
-      // subscription-route full apply consumes no allowance and keeps running — so the honest report
-      // is a valid lease plus a SCOPED pause, not a withheld entitlement. Naming the reset DATE comes
+      // A SPENT METERED BALANCE IS NOT AN INVALID LEASE. The device is entitled either way, and the
+      // output shaping the allowance never bought keeps running — so the honest report is a valid
+      // lease plus a BOUNDED pause, not a withheld entitlement. Naming the reset DATE comes
       // from the lease's PERIOD, never from `expires_at` (renewed within a period, so it would promise
       // the allowance back early). No figure, no price, no purchase path: the ceiling refuses, it
       // never auto-purchases.
@@ -73,7 +73,7 @@ function describeVerdict(
           // that owns the words. What it adds over the sentence it replaced is the DESTINATION: this
           // command tells a user their allowance is spent, and previously stopped there.
           notice: [
-            ...upgradeNoticeLines({ reason: "exhausted", scope: "api-key-route", env, ...(resetsOn !== undefined ? { resetsOn } : {}) }),
+            ...upgradeNoticeLines({ reason: "exhausted", scope: "all-routes", env, ...(resetsOn !== undefined ? { resetsOn } : {}) }),
             "",
             "Nothing is purchased automatically."
           ]
@@ -118,8 +118,8 @@ async function printStatus(env: NodeJS.ProcessEnv = process.env): Promise<void> 
   // A LEASE CAN BE VALID, ITS GRANT NON-ZERO, AND EVERY TURN STILL PAUSED. `meteredBalanceExhausted`
   // above is a property of the SIGNED GRANT (`allowance_tokens <= 0`) — it says nothing about how much
   // of that grant has since been SPENT, and nothing at all about `insufficient`, which is a property of
-  // one turn measured against what was left. Measured on real journeys: a device that had spent its
-  // whole 75,777-token grant, and a device pausing every turn at 40,000 remaining, both printed a bare
+  // one turn measured against what was left. A device that spent its whole grant, and a device
+  // pausing on turns larger than its remainder, both previously printed a bare
   // green `valid` here. So when the newest recorded turn was paused, say so — with the same words and
   // the same destination the other surfaces use.
   //
@@ -132,7 +132,7 @@ async function printStatus(env: NodeJS.ProcessEnv = process.env): Promise<void> 
     if (pause) {
       const notice = upgradeNoticeLines({
         reason: pause.reason,
-        scope: pause.scope ?? "api-key-route",
+        scope: pause.scope ?? "all-routes",
         env,
         ...(pause.resets_on !== undefined ? { resetsOn: pause.resets_on } : {})
       });

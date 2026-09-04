@@ -20,8 +20,17 @@ import {
 import {
   DEFAULT_OUTPUT_SHAPING_RATE,
   calibrationStorePath,
-  updateCalibrationFromAbSummary
 } from "../../src/core/output-shaping-calibration-store.js";
+import {
+  TEST_OUTPUT_POLICY_VERSION,
+  seedOutputCalibration
+} from "../helpers/output-calibration-fixture.js";
+
+const QUERY = {
+  policyVersion: TEST_OUTPUT_POLICY_VERSION,
+  provider: "anthropic",
+  model: "claude-opus-5"
+} as const;
 
 function providerRun(arm: "control" | "treatment", outputTokens: number, evalPass = true): OutputShapingAbRun {
   return {
@@ -169,58 +178,74 @@ describe("estimatePerTurnOutputSaved - labeled local estimate for the per-turn l
 });
 
 describe("loadCalibrationReduction - fail-open read from the LEARNING calibration store", () => {
-  it("a MISSING store falls back to the shipped prior, with zeroed denominators", async () => {
-    // Changed contract: a fresh install now carries a starting rate, so
-    // the per-turn line shows a reduction from turn one instead of a bare count. The denominators stay
-    // ZERO and confidence stays `unavailable`, because no experiment backs it -- only `reductionPct`
-    // is consumed by the line, and dressing the empty aggregate up as this device's means would lie.
+  it("a MISSING store is UNAVAILABLE - the shipped prior is not this device's measurement", async () => {
+    // A device with no folded experiment has measured nothing, and `measured` is the strongest evidence
+    // label this type carries. It used to return the shipped prior under that label with zeroed
+    // denominators, which put a 47% rate one hop away from a rendered `777→412 (−47%)` on turn one of a
+    // fresh install. The reason string is the honest replacement, and it names the prior rather than
+    // pretending no rate exists anywhere.
     const dir = mkdtempSync(join(tmpdir(), "cal-missing-"));
     try {
       const r = await loadCalibrationReduction({ COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv);
-      expect(r.availability).toBe("measured");
-      if (r.availability !== "measured") return;
-      expect(r.reductionPct).toBeCloseTo(DEFAULT_OUTPUT_SHAPING_RATE * 100, 5);
-      expect(r.sampleCount).toBe(0);
-      expect(r.nControl).toBe(0);
-      expect(r.confidence, "no experiment backs the prior, and it says so").toBe("unavailable");
+      expect(r.availability).toBe("unavailable");
+      if (r.availability !== "unavailable") return;
+      expect(r.reason).toMatch(/applicability metadata/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("a MALFORMED store falls back to the prior too (fail-open, never throws)", async () => {
+  it("a MISSING store yields NO per-turn saving to render (fail-open, no fabricated arrow)", async () => {
+    // The property the reason string above only describes: nothing downstream can draw an arrow.
+    // Split from the reason assertion deliberately - a string pin failing first would leave this
+    // silently unexercised.
+    const dir = mkdtempSync(join(tmpdir(), "cal-missing-est-"));
+    try {
+      const r = await loadCalibrationReduction({ COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv);
+      const est = estimatePerTurnOutputSaved(r, 512);
+      expect(est.calibrated).toBe(false);
+      expect(est.tokensSaved).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a MALFORMED store is unavailable too (fail-open, never throws)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cal-bad-"));
     try {
       writeFileSync(calibrationStorePath({ COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv), "{not json");
       const r = await loadCalibrationReduction({ COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv);
-      expect(r.availability).toBe("measured");
-      if (r.availability !== "measured") return;
-      expect(r.reductionPct).toBeCloseTo(DEFAULT_OUTPUT_SHAPING_RATE * 100, 5);
-      expect(r.sampleCount, "a corrupt file is not a measurement").toBe(0);
+      expect(r.availability, "a corrupt file is not a measurement").toBe("unavailable");
+      expect(estimatePerTurnOutputSaved(r, 512).calibrated).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("threads BASIS: the prior carries `default-prior`, a folded A/B carries `measured`", async () => {
+  it("keeps the generic prior internal and outside exact calibration resolution", async () => {
+    expect(DEFAULT_OUTPUT_SHAPING_RATE).toBe(0.47);
+    const dir = mkdtempSync(join(tmpdir(), "cal-prior-kept-"));
+    try {
+      const r = await loadCalibrationReduction({ COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv, QUERY);
+      expect(r.availability).toBe("unavailable");
+      expect(estimatePerTurnOutputSaved(r, 512).tokensSaved).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("threads BASIS: a folded A/B carries `measured`, and the prior never reaches the line at all", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cal-basis-"));
     const env = { COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv;
     try {
-      // Fresh install: the shipped prior, explicitly labelled as a default prior so the per-turn line can
-      // render `est. · default prior` and never read as this device's own measurement (G7 provenance).
-      const prior = await loadCalibrationReduction(env);
-      expect(prior.availability).toBe("measured");
-      if (prior.availability !== "measured") return;
-      expect(prior.basis).toBe("default-prior");
-      // The estimate carries the provenance forward to the formatter (same magnitude, labelled honestly).
-      const priorEst = estimatePerTurnOutputSaved(prior, 512);
-      expect(priorEst.calibrated).toBe(true);
-      expect(priorEst.basis).toBe("default-prior");
+      // Fresh install: no measurement, so no reduction and nothing to label.
+      const prior = await loadCalibrationReduction(env, QUERY);
+      expect(prior.availability).toBe("unavailable");
+      expect(estimatePerTurnOutputSaved(prior, 512).calibrated).toBe(false);
 
-      // Fold a real device A/B: the prior is displaced and the basis becomes `measured` (→ `est.`).
-      const summary = summarizeOutputShapingAb(experimentWith([providerRun("control", 1000), providerRun("treatment", 600)]));
-      await updateCalibrationFromAbSummary(summary, env);
-      const measured = await loadCalibrationReduction(env);
+      // Fold a real device A/B: the device now HAS a measurement, and the basis says so (→ `est.`).
+      await seedOutputCalibration(env);
+      const measured = await loadCalibrationReduction(env, QUERY);
       expect(measured.availability).toBe("measured");
       if (measured.availability !== "measured") return;
       expect(measured.basis).toBe("measured");
@@ -230,18 +255,37 @@ describe("loadCalibrationReduction - fail-open read from the LEARNING calibratio
     }
   });
 
+  it("a DEFAULT-PRIOR reduction handed in directly still yields no saving", async () => {
+    // Defence in depth for callers that build a reduction themselves rather than reading the store.
+    // The shipped constant must be unreachable as a per-turn figure through EVERY path, not only the
+    // one that was traced.
+    const handMade = {
+      availability: "measured",
+      meanControlOutputTokens: 1000,
+      meanTreatmentOutputTokens: 530,
+      meanOutputTokenReduction: 470,
+      reductionPct: DEFAULT_OUTPUT_SHAPING_RATE * 100,
+      nControl: 0,
+      nTreatment: 0,
+      confidence: "unavailable",
+      sampleCount: 0,
+      basis: "default-prior"
+    } as const;
+    const est = estimatePerTurnOutputSaved(handMade, 512);
+    expect(est.calibrated).toBe(false);
+    expect(est.tokensSaved).toBeUndefined();
+  });
+
   it("measured once a real provider-reported A/B has been folded into the store", async () => {
     const dir = mkdtempSync(join(tmpdir(), "cal-ok-"));
     const env = { COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv;
     try {
-      // Before any A/B is folded in: the shipped prior, backed by zero experiments.
-      const before = await loadCalibrationReduction(env);
-      expect(before.availability).toBe("measured");
-      if (before.availability === "measured") expect(before.sampleCount).toBe(0);
+      // Before any A/B is folded in: nothing measured, nothing to report.
+      const before = await loadCalibrationReduction(env, QUERY);
+      expect(before.availability).toBe("unavailable");
       // Fold a real A/B (control 1000 → treatment 600 = 40% reduction) into the store.
-      const summary = summarizeOutputShapingAb(experimentWith([providerRun("control", 1000), providerRun("treatment", 600)]));
-      await updateCalibrationFromAbSummary(summary, env);
-      const r = await loadCalibrationReduction(env);
+      await seedOutputCalibration(env);
+      const r = await loadCalibrationReduction(env, QUERY);
       expect(r.availability).toBe("measured");
       if (r.availability !== "measured") return;
       // The device's OWN measurement, which replaces the prior entirely.

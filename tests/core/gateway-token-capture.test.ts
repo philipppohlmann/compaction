@@ -278,6 +278,9 @@ describe("gateway token capture — real server end-to-end (byte-safety, bounded
     expect(r.tokens.prompt_input).toBe(42);
     expect(r.tokens.output).toBe(9);
     expect(got.equals(upstream.sent)).toBe(true);
+    // The run-membership timestamp is the request's arrival, never later than the ledger append.
+    expect(typeof r.request_started_at).toBe("string");
+    expect(r.request_started_at! <= r.captured_at).toBe(true);
   });
 
   it("Non-streaming JSON between the head window and the tail window is captured (tail holds the whole body)", async () => {

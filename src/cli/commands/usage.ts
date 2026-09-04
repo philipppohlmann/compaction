@@ -15,9 +15,10 @@
  * nowhere else. The bare `compaction usage` above stays a pure local read.
  *
  * HONESTY: `optimized input tokens` is a LOCAL-ESTIMATE (`chars/4`) PRODUCT
- * ALLOWANCE unit for Community full-apply on the API-key route — NOT a provider-reported count, NOT
- * a provider bill, NOT a cost or savings figure, and this surface never presents it as one.
- * Subscription-route apply is never metered. At the ceiling the behavior is refuse/degrade, never an
+ * ALLOWANCE unit for Community full-apply — NOT a provider-reported count, NOT a provider bill, NOT a
+ * cost or savings figure, and this surface never presents it as one. It counts INPUT compaction on
+ * every upstream route (the allowance pays for the Hybrid Engine, not for the billing route); OUTPUT
+ * SHAPING is never metered anywhere. At the ceiling the behavior is refuse/degrade, never an
  * auto-purchase. Integrity here is a LOCAL check only: it detects edits, reordering, and removals
  * within the chain, but the device holds the signing key and a whole-file deletion or tail truncation
  * reads as a shorter valid chain — so it is tamper-EVIDENT locally, not tamper-proof. Uploading
@@ -81,12 +82,21 @@ async function printUsage(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const verdict = readLeaseVerdict(env);
   const periodId = verdict.periodId ?? currentPeriodId();
   const allowanceTokens = verdict.label === "lease-valid" ? verdict.allowanceTokens : undefined;
+  // THE DENOMINATOR, and deliberately not `allowanceTokens`. That figure is the lease's REMAINDER —
+  // already net of the consumption the service has recorded — so printing `remaining of allowance`
+  // compared this period's remainder against itself and read as a full tank on a half-spent period.
+  // The period TOTAL is a fact only the server holds (its consumption sum is account-scoped, so this
+  // device cannot recover the total by adding its own journal back), and it arrives signed in a v2
+  // lease. A v1 lease carries none, so the line below says what is left and names no total rather
+  // than substituting a number that is not one. THE SAME PAIR the per-turn countdown renders.
+  const periodTotalTokens = verdict.label === "lease-valid" ? verdict.periodAllowanceTokens : undefined;
 
   /**
    * THE SIGNED ZERO OUTRANKS THE JOURNAL — for what this command SAYS, and nothing else.
    *
    * The issuer signs `allowance_tokens` already net of the consumption the SERVICE has recorded, so a
-   * signed zero proves no API-key allowance remains for this period whatever the local journal holds,
+   * signed zero proves no optimized-input allowance remains for this period whatever the local journal
+   * holds (on every supported route — naming one was true only while metering was api-key-only),
    * and even when it holds nothing readable. Reporting "cannot be determined" in that state withheld a
    * fact the server had stated definitively — and this is the surface a user opens precisely when they
    * are at the ceiling. Every other surface (`resolveOpenTier`, `lease status`, `mode full`) already
@@ -100,6 +110,10 @@ async function printUsage(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const signedZeroAllowance = verdict.label === "lease-valid" && verdict.meteredBalanceExhausted === true;
 
   const { entries, skipped } = await readUsageJournal(env);
+  // IN THE ACTIVE UNIT (the function's default), never meter-blind. A period that lived through a
+  // meter change holds entries in two incomparable quantities, and adding them would put a number on
+  // this surface that describes nothing — and would then make `alreadyRecorded` below report the
+  // other unit's history as service-confirmed reconciliation.
   const consumed = sumOptimizedInputTokensForPeriod(entries, periodId);
 
   // How much of this period's local total the SERVICE has already recorded. Derived from the local
@@ -161,9 +175,15 @@ async function printUsage(env: NodeJS.ProcessEnv = process.env): Promise<void> {
     // non-negative.)
     const remaining = signedZeroAllowance ? 0 : Math.max(0, allowanceTokens - unreconciled);
     const exhausted = signedZeroAllowance || allowanceTokens - unreconciled <= 0;
+    // Coherence-gated for the same reason the per-turn countdown is: a total below what is left, or a
+    // zero total, describes a lease the server could not have signed, and `1.2M of 1M` would be worse
+    // than no denominator at all.
+    const totalClause =
+      periodTotalTokens !== undefined && periodTotalTokens > 0 && remaining <= periodTotalTokens
+        ? ` ${chalk.dim(`of ${periodTotalTokens.toLocaleString("en-US")} this period`)}`
+        : "";
     console.log(
-      `  Allowance remaining: ${(exhausted ? chalk.yellow : chalk.green)(remaining.toLocaleString("en-US"))} ` +
-        chalk.dim(`of ${allowanceTokens.toLocaleString("en-US")}`)
+      `  Allowance remaining: ${(exhausted ? chalk.yellow : chalk.green)(remaining.toLocaleString("en-US"))}${totalClause}`
     );
     if (exhausted) {
       // THE SAME WORDS THE PER-TURN LINE AND `status` / `watch` / `lease status` USE, from the one
@@ -171,12 +191,12 @@ async function printUsage(env: NodeJS.ProcessEnv = process.env): Promise<void> {
       // but its own phrasing and, critically, with no destination: a user who read "paused" on the
       // surface built to explain their allowance had nowhere to go from it.
       //
-      // SCOPED `api-key-route`: `optimized-input-v1` is debited on the metered route only, so this is
-      // the one figure on this surface a subscription-routed turn is not measured against.
+      // SCOPED `all-routes`: the optimized-input allowance is debited on every upstream route a confirmed
+      // Hybrid input apply rides, so every turn on this device is measured against this figure.
       const resetsOn = periodEndUtc(periodId);
       const notice = upgradeNoticeLines({
         reason: "exhausted",
-        scope: "api-key-route",
+        scope: "all-routes",
         ...(resetsOn !== undefined ? { resetsOn } : {})
       });
       for (const line of notice) console.log(line === "" ? "" : chalk.dim(`  ${line}`));
@@ -186,7 +206,7 @@ async function printUsage(env: NodeJS.ProcessEnv = process.env): Promise<void> {
     } else {
       // A HEALTHY-LOOKING REMAINDER IS NOT A HEALTHY ALLOWANCE. The line above answers "how much is
       // left"; it cannot answer "is that enough", because enough is a property of a TURN. Measured:
-      // 40,000 remaining against 75,777-token turns printed a comfortable green number to a user
+      // a positive remainder printed a comfortable green number to a user whose turns were too large
       // whose every turn was in fact being paused, with nothing on this surface saying so and nowhere
       // to go. So when the newest recorded turn was paused for exactly that reason, say it here.
       //
@@ -196,7 +216,7 @@ async function printUsage(env: NodeJS.ProcessEnv = process.env): Promise<void> {
       if (pause?.reason === "insufficient") {
         const notice = upgradeNoticeLines({
           reason: "insufficient",
-          scope: pause.scope ?? "api-key-route",
+          scope: pause.scope ?? "all-routes",
           ...(pause.resets_on !== undefined ? { resetsOn: pause.resets_on } : {})
         });
         console.log(chalk.dim("  Your most recent turn was larger than this remainder covers:"));
@@ -212,9 +232,11 @@ async function printUsage(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   // never learn that the broken journal ALSO blocks metered apply, on its own, into the next period
   // once the allowance renews. Two independent refusals, both worth stating.
   //
-  // SCOPED: the gateway consults this journal on the METERED route only, so an unverifiable
-  // journal refuses metered apply and leaves subscription-routed apply — which is never debited and
-  // never summed here — running. An unqualified "full apply refuses" would be false for it.
+  // SCOPED TO INPUT, NOT TO A ROUTE. The gateway consults this journal before every metered INPUT
+  // apply, on whichever route carries the turn, so an unverifiable journal refuses input compaction
+  // everywhere. What it leaves running is OUTPUT SHAPING, which is never debited and never summed
+  // here. Naming a route in this sentence was true only while metering was api-key-only; saying
+  // "full apply refuses" without the input/output split would be false for shaping.
   if (allowanceTokens !== undefined && !trustworthy) {
     // Beside a definitive exhausted line this would otherwise read as a restatement of it, so it says
     // which of the two it is. The distinction is the actionable part: the allowance comes back on the
@@ -222,8 +244,8 @@ async function printUsage(env: NodeJS.ProcessEnv = process.env): Promise<void> {
     const independent = signedZeroAllowance ? "Independently of the allowance: " : "";
     console.log(
       chalk.dim(
-        `  ${independent}API-key routed full apply refuses/degrades while the journal does not verify ` +
-          "(fail-closed; no auto-purchase)."
+        `  ${independent}Input compaction refuses/degrades on every route while the journal does not ` +
+          "verify (fail-closed; no auto-purchase). Output shaping keeps running."
       )
     );
   }

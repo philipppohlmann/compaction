@@ -37,9 +37,46 @@ const EXPECTED_CANONICAL =
   '"period_id":"2026-07","allowance_tokens":2000000,"issued_at":"2026-07-01T00:00:00.000Z",' +
   '"expires_at":"2026-07-02T00:00:00.000Z","lease_sequence":3,"route_scope":"all"}';
 
+// v2 = the same ten keys, with `period_allowance_tokens` APPENDED last. Written out in full rather
+// than derived from EXPECTED_CANONICAL, so an accidental reorder cannot be masked by a shared prefix.
+const FIXTURE_V2: LeasePayload = { ...FIXTURE, schema_version: 2, period_allowance_tokens: 50_000_000 };
+const EXPECTED_CANONICAL_V2 =
+  "compaction-lease-v1\n" +
+  '{"schema_version":2,"lease_id":"11111111-1111-1111-1111-111111111111","account_id":"acct-1",' +
+  '"device_public_key_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",' +
+  '"period_id":"2026-07","allowance_tokens":2000000,"issued_at":"2026-07-01T00:00:00.000Z",' +
+  '"expires_at":"2026-07-02T00:00:00.000Z","lease_sequence":3,"route_scope":"all",' +
+  '"period_allowance_tokens":50000000}';
+
 describe("lease wire contract (frozen)", () => {
   it("canonicalLeaseBytes produces the exact frozen bytes (domain tag + fixed key order)", () => {
     expect(canonicalLeaseBytes(FIXTURE).toString("utf8")).toBe(EXPECTED_CANONICAL);
+  });
+
+  it("v2 appends period_allowance_tokens and changes nothing before it", () => {
+    expect(canonicalLeaseBytes(FIXTURE_V2).toString("utf8")).toBe(EXPECTED_CANONICAL_V2);
+  });
+
+  it("v1 bytes are UNCHANGED by v2 existing - every lease already signed still verifies", () => {
+    // The whole reason the field is appended and version-gated. If `canonicalLeaseBytes` ever
+    // serialized it unconditionally, this fails and so would every stored v1 lease on every device.
+    const bytes = canonicalLeaseBytes(FIXTURE).toString("utf8");
+    expect(bytes).not.toContain("period_allowance_tokens");
+    expect(bytes.length).toBe(EXPECTED_CANONICAL.length);
+  });
+
+  it("a v1 payload carrying a total, or a v2 payload missing one, is refused", () => {
+    // A v1 lease with a total would be claiming its signature covers bytes it does not cover; a v2
+    // lease without one would render a countdown with no denominator.
+    const v1WithTotal = { ...FIXTURE, period_allowance_tokens: 1 };
+    const v2NoTotal: Record<string, unknown> = { ...FIXTURE_V2 };
+    delete v2NoTotal.period_allowance_tokens;
+    expect(parseSignedLease({ lease: v1WithTotal, signature: "sig" })).toBeUndefined();
+    expect(parseSignedLease({ lease: v2NoTotal, signature: "sig" })).toBeUndefined();
+    expect(parseSignedLease({ lease: { ...FIXTURE_V2, schema_version: 3 }, signature: "sig" })).toBeUndefined();
+    // Both supported versions round-trip.
+    expect(parseSignedLease({ lease: FIXTURE, signature: "sig" })?.lease.period_allowance_tokens).toBeUndefined();
+    expect(parseSignedLease({ lease: FIXTURE_V2, signature: "sig" })?.lease.period_allowance_tokens).toBe(50_000_000);
   });
 
   it("publicKeyHash matches a plain SHA-256 hex of the key string (server parity)", () => {

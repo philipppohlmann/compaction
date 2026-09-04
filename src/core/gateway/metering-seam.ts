@@ -49,7 +49,7 @@ export const METERING_ABSENT_REASON = "usage-metering-unavailable";
  */
 export const METERING_ABSENT_MESSAGE =
   "Usage metering is not part of this build - no allowance figures are available on this device, " +
-  "and metered (API-key route) full apply does not run. Requests are forwarded unchanged; nothing is blocked.";
+  "and metered full apply does not run on any route. Requests are forwarded unchanged; nothing is blocked.";
 
 /**
  * Plain-English gloss for an allowance-read decline, for the one log line that reports it.
@@ -79,6 +79,8 @@ export type ApplyDebitResult =
       entryHash: string;
       optimizedInputTokens: number;
       meterVersion: string;
+      /** Allowance left for the period after this debit, measured under the journal append lock. */
+      remainingTokens: number;
       /** True when the debit was already recorded (dedupe) — still a success for the caller. */
       duplicate?: boolean;
     }
@@ -91,9 +93,11 @@ export interface ApplyDebitContext {
   provider: string;
   periodId: string;
   allowanceTokens: number;
-  receiptId: string;
+  /** The RECOVERY id of the retained original this debit belongs to (never a gateway receipt id). */
+  recoveryId: string;
   meterVersion?: string;
   meteredOptimizedInputTokens?: number;
+  estimatedInputTokensBefore?: number;
   estimatedInputTokensAfter?: number;
   engineEventId?: string;
   /** The pre-mutation request body (ONLY used for the documented fallback count; never stored). */

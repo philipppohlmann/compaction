@@ -4,8 +4,8 @@
  * The versioned switch that governs whether the native Codex/Cursor output-shaping HOOKS emit anything.
  * Injecting an output-shaping instruction through a tool's native hook is a BEFORE-CALL injection of
  * model-visible context (it changes what the model sees before it generates). The shaping instruction
- * is content-free and its safe-to-shape scope was validated on a real Claude A/B (64-71% output cut with
- * quality held), so this activation posture is AUTO-APPLY (default-ON) with an explicit KILL-SWITCH.
+ * is content-free and its safe-to-shape scope passed the applicable output-sufficiency gate, so this
+ * activation posture is AUTO-APPLY (default-ON) with an explicit KILL-SWITCH.
  *
  * AUTO-APPLY DISCIPLINE: shaping-via-hook ships ON. It is active whenever the hook config is installed,
  * UNLESS the deployment sets the kill-switch `COMPACTION_SHAPING_HOOKS=0|false|off|no` OR the user has run
@@ -18,9 +18,8 @@
  *   2. The runtime is content-free and fail-open: malformed stdin or any error → HOLD (emit nothing).
  *
  * Claim boundary: turning this on injects a content-free shaping instruction; it makes NO claim that
- * output tokens were reduced on Codex/Cursor. The 64-71% figure is CLAUDE-measured; the Codex/Cursor-native
- * effect is UNMEASURED (a separate E2E fast-follow). Output tokens, not bill. Nothing here surfaces a
- * savings figure.
+ * output tokens were reduced on Codex/Cursor. Their native effect remains unmeasured here. Output
+ * tokens, not bill. Nothing here surfaces a savings figure.
  */
 
 import { isShapingStopped } from "./subscription-shaping-state.js";

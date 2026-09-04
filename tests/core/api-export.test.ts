@@ -12,7 +12,7 @@ import { summarizeCacheProof } from "../../src/core/gateway/cache-proof.js";
 import { computeCapabilityMatrix } from "../../src/core/gateway/capability-matrix.js";
 import { liveVerificationsForMatrix, writeVerification } from "../../src/core/gateway/verification-store.js";
 import { appendActivityEvent, ACTIVITY_EVENT_ALLOWED_KEYS, readActivityEvents, DEFAULT_ACTIVITY_DIRECTORY } from "../../src/core/activity-store.js";
-import { buildMeasureOnlyActivityEvent } from "../../src/core/activity-event.js";
+import { buildMeasureOnlyActivityEvent, computeActivityEventId, type ActivityEvent } from "../../src/core/activity-event.js";
 import type { StandardCrossSurfaceEvent } from "../../src/core/cross-surface-event.js";
 import { deriveProofScopes } from "../../src/core/gateway/proof-scope.js";
 import { buildPlanLifetimeImpactsFromActivity } from "../../src/core/plan-lifetime.js";
@@ -75,7 +75,7 @@ function seedActivity(dir: string, overrides: Partial<StandardCrossSurfaceEvent>
     },
     input_before: 800,
     cost_source: "unavailable",
-    cost_unavailable_reason: "Cursor emits no usage or cost data",
+    cost_unavailable_reason: "Compaction does not ingest Cursor's conditional result.usage; no cost data is available",
     claim_scope: "run-scoped",
     ...overrides
   };
@@ -143,6 +143,50 @@ describe("buildApiExport - reuse (no divergence from the CLI surfaces)", () => {
       expect(rec.plan_lifetime_impact).toBe("unavailable"); // no counts → unavailable, honest reason.
       expect(rec.reason && rec.reason.length).toBeGreaterThan(0);
     }
+  });
+
+  it("exports only the latest compatible cumulative Claude Stop snapshot", async () => {
+    const dir = tmp();
+    const snapshot = (input: number, output: number, recordedAt: string, final = false): ActivityEvent => {
+      const base: ActivityEvent = {
+        surface: "claude_code",
+        provider: "anthropic",
+        workflow_id: "claude-stop",
+        session_id: `claude-session-${"a".repeat(32)}`,
+        run_id: `claude-stop-${"b".repeat(32)}`,
+        input_before: input,
+        output_after: output,
+        ...(final ? {} : { model_label: "claude-opus-5" }),
+        token_source: {
+          input: { source: final ? "local-estimate" : "provider-reported" },
+          output: { source: "provider-reported" }
+        },
+        ...(final ? { apply_posture: "full" as const } : { policy_used: "output-shaping.v1.test", apply_posture: "basic" as const }),
+        claim_scope: "run-scoped",
+        evidence_level: "exact correlated gateway run",
+        approval_status: "not-required",
+        recovery: { original_retained: false },
+        sync_status: "local-only",
+        activity_kind: "claude-stop",
+        recorded_at: recordedAt,
+        run_started_at: "2026-07-09T00:00:00.000Z",
+        measurement_source: "gateway-run"
+      };
+      return { ...base, activity_event_id: computeActivityEventId(base) };
+    };
+    await appendActivityEvent(
+      snapshot(100, 20, "2026-07-09T00:01:00.000Z"),
+      join(dir, DEFAULT_ACTIVITY_DIRECTORY)
+    );
+    await appendActivityEvent(
+      snapshot(180, 35, "2026-07-09T00:02:00.000Z", true),
+      join(dir, DEFAULT_ACTIVITY_DIRECTORY)
+    );
+
+    const doc = await buildApiExport(dir, { now: () => "2026-07-09T12:00:00.000Z" });
+    expect(doc.activity).toHaveLength(1);
+    expect(doc.activity[0]?.input_before).toBe(180);
+    expect(doc.activity[0]?.output_after).toBe(35);
   });
 });
 

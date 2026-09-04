@@ -37,11 +37,17 @@ import {
   receiptCeiling,
   isRealApply,
   isReceiptLineEnabled,
+  outputShapingActiveForTurn,
   receiptLineFromGatewayReceipt,
   receiptProvenOpenLabel
 } from "./receipt-line.js";
 // The per-turn output arrow's calibrated rate (local, content-free; absent ⇒ a plain output count).
-import { estimatePerTurnOutputSaved, loadCalibrationReduction } from "../output-shaping-savings.js";
+import {
+  estimatePerTurnOutputSaved,
+  loadCalibrationReduction,
+  type PerTurnEstimatedSaved
+} from "../output-shaping-savings.js";
+import { outputCalibrationQuery } from "../output-shaping-calibration-store.js";
 import { adapterForUpstream, openAiBreakdownFromNormalizedUsage, type ProviderAdapter } from "./provider-adapter.js";
 import type { OpenAiUsageBreakdown } from "./openai-usage.js";
 import { resolveApplyActivation, type ApplyActivation } from "./apply-activation.js";
@@ -62,9 +68,17 @@ import { saveOriginalForRecovery, discardRecoveryRecord, GATEWAY_RECOVERY_DIR } 
 // `OPEN_BASIC_OUTPUT_POLICY` is imported rather than re-spelled: the recovery record and the receipt
 // must name the SAME policy, and two literals is how they drift apart.
 import { buildApplyReceipt, OPEN_BASIC_OUTPUT_POLICY } from "./apply-receipt.js";
+import {
+  gatewaySessionCorrelation
+} from "./session-correlation.js";
 // OPEN `basic` gateway shaping: the engine-free public planner, its
 // double-shaping guard, and the SAME activation switch the tool-hook path reads.
-import { planPublicBasicOutputShaping, bodyAlreadyCarriesOutputShaping } from "./output-shaping-policy.js";
+import {
+  planPublicBasicOutputShaping,
+  bodyAlreadyCarriesOutputShaping,
+  outputShapingActiveOnRequest,
+  outputShapingPolicyVersionOnRequest
+} from "./output-shaping-policy.js";
 import { isShapingHooksActivated } from "../output-shaping-hook-activation.js";
 import { effectiveOpenTier, readOptimizationMode, resolveOpenTier } from "../onboarding-preferences.js";
 import type { OptimizationModePreference } from "../onboarding-preferences.js";
@@ -73,7 +87,12 @@ import { periodEndUtc } from "../entitlement/lease.js";
 import type { AllowancePauseScope } from "../onboarding-preferences.js";
 import type { AllowancePauseReason } from "../upgrade-cta.js";
 import { commitApplyDebit, meteringDeclineExplanation, readMeteredAllowance } from "./metering-seam.js";
-import { METERED_ROUTE_TYPE, resolveMeteredOptimizedInput } from "../usage/usage-event.js";
+import {
+  ACTIVE_USAGE_METER_VERSION,
+  API_KEY_ROUTE_TYPE,
+  SUBSCRIPTION_ROUTE_TYPE,
+  resolveMeteredOptimizedInput
+} from "../usage/usage-event.js";
 import { isShapingStopped } from "../subscription-shaping-state.js";
 import type { OptimizationPlan } from "./optimization-planner.js";
 import {
@@ -174,10 +193,13 @@ export interface GatewayServerOptions {
   /** Test/embedding override; when absent the enum-only onboarding preference is read fresh. */
   optimizationMode?: OptimizationModePreference;
   /**
-   * Test/embedding override for the config-dir env used to resolve the entitlement lease
-   * (`COMPACTION_CONFIG_DIR`). When absent, `process.env` is used. Only ever consulted to read the
-   * signed lease + credentials FILES for the community-full-apply entitlement check — never for a
-   * network/account call.
+   * Test/embedding override for the config-dir env used to resolve this DEVICE's local state
+   * (`COMPACTION_CONFIG_DIR`). When absent, `process.env` is used. Only ever consulted to read local
+   * FILES — the signed lease + credentials for the community-full-apply entitlement check, the metering
+   * journal, and the stored auto-apply authorization — never for a network/account call. The
+   * authorization joined this set when the store moved off the working directory: a device's lease and
+   * its authorization must be read from one environment, or a test (or an embedder) can end up proving
+   * a request against two different devices.
    */
   entitlementEnv?: NodeJS.ProcessEnv;
   /** Test/observability hook fired after each receipt is built (before/independent of the file append). */
@@ -514,6 +536,16 @@ async function handleProxy(
   pendingBookkeeping: PendingBookkeeping
 ): Promise<void> {
   const endpoint = (req.url ?? "/").split("?")[0];
+  // WHEN THE REQUEST ARRIVED, stamped before anything is read or forwarded. The receipt's own
+  // `captured_at` is assigned only after the response has fully streamed and the usage window has been
+  // assembled (on a compressed response, after an asynchronous decompressor flush) — by which time the
+  // client has the response and its `Stop` hook may already have closed the run. Run membership keys on
+  // THIS instant, which is provably before any response and therefore before any `Stop` it triggers.
+  const requestStartedAt = new Date().toISOString();
+  // THE UPSTREAM BILLING ROUTE for this request, evidenced by what this request presented (see
+  // `upstreamRouteTypeFor`). Resolved once here and handed to both records that need it — the signed
+  // usage debit and the apply receipt — so the two can never be derived differently.
+  const upstreamRouteType = upstreamRouteTypeFor(options, req);
   // Route usage extraction through the provider adapter (default = OpenAI, so OpenAI behavior is
   // byte-identical). Content-free: the adapter only ever reads token counts + labels from the response.
   const adapter = adapterForUpstream(upstreamOrigin);
@@ -558,12 +590,22 @@ async function handleProxy(
   // plain record, original forwarded unchanged (fail-open, never blocks the workflow).
   let effectiveActivation = activation;
   let apply = await resolveApplyOutcomeFailOpen(activation, endpoint, req.method, requestBody, options, log);
+  // WHY LCM DID OR DID NOT CONTRIBUTE when the engine ran and applied NOTHING. The turn stays a plain
+  // record (original forwarded unchanged), but the outcome is a fact about it and rides the record
+  // receipt — the did-not-contribute turns are the ones the outcome exists to explain.
+  let declinedLcmOutcome: { kind: string; reason: string } | undefined;
+  let declinedOutputShapingState: "attached-this-pass" | "already-active" | "absent" | undefined;
+  let declinedOutputShapingPolicyVersion: string | undefined;
   const explicitPerCallMode = headerValue(req.headers["x-compaction-mode"]) !== undefined;
   if (!activation.requested && !explicitPerCallMode && req.method === "POST" && options.workflow) {
-    const stored = await resolveStoredAuthorizationApply(endpoint, requestBody, options, log, supervisor);
-    if (stored) {
+    const stored = await resolveStoredAuthorizationApply(endpoint, requestBody, options, log, supervisor, upstreamRouteType);
+    if (stored && "outcome" in stored) {
       effectiveActivation = stored.activation;
       apply = stored.outcome;
+    } else if (stored) {
+      declinedLcmOutcome = stored.lcmOutcome;
+      declinedOutputShapingState = stored.outputShapingState;
+      declinedOutputShapingPolicyVersion = stored.outputShapingPolicyVersion;
     }
   }
   // OPEN `basic` output shaping — the THIRD and last apply path.
@@ -582,6 +624,27 @@ async function handleProxy(
 
   let bodyToForward = requestBody;
   if (apply?.applied && apply.mutatedBody) bodyToForward = apply.mutatedBody;
+
+  // EXPLICIT-APPLY OUTPUT-SHAPING PROVENANCE. This route compacts input only; it does not attach
+  // output shaping itself. The policy may nevertheless already be active on the request because a
+  // tool hook attached it before the gateway saw the body. Measure that fact only after the FINAL
+  // forwarded bytes have been selected, because the deterministic mutation may reserialize them.
+  //
+  // This is intentionally positive-only and strict: the exact current policy must survive inside an
+  // instruction-level carrier. A marker in arbitrary body/user text proves nothing, and a miss leaves
+  // both fields unset rather than synthesizing `absent`. Dry-run, stored/full, Open-basic and record
+  // routes retain their existing provenance owners.
+  if (
+    apply &&
+    activation.mode === "apply" &&
+    (activation.activation === "explicit-mode" || activation.activation === "explicit-header")
+  ) {
+    const detectedPolicyVersion = outputShapingPolicyVersionOnRequest(bodyToForward.toString("utf8"));
+    if (detectedPolicyVersion) {
+      apply.outputShapingState = "already-active";
+      apply.outputShapingPolicyVersion = detectedPolicyVersion;
+    }
+  }
 
   const target = new URL((req.url ?? "/"), upstreamOrigin);
   const client = target.protocol === "http:" ? http : https;
@@ -653,6 +716,15 @@ async function handleProxy(
           // receipt is honestly `unavailable`, carrying the decompression reason instead of a fabricated zero.
           const responseTail = window.ok ? window.windowText : "";
           const usageUnavailableReason = window.ok ? undefined : window.reason;
+          // Computed ONCE per request: it reads the salt file and runs an HMAC, and this is the
+          // per-call hot path.
+          const correlationEnv = options.entitlementEnv ?? process.env;
+          const sessionCorrelation = gatewaySessionCorrelation({
+            workflow: options.workflow,
+            rawHeaders: req.rawHeaders,
+            bodyText: requestBody.toString("utf8"),
+            env: correlationEnv
+          });
           const shared = {
             adapter,
             endpoint,
@@ -660,6 +732,22 @@ async function handleProxy(
             responseTail,
             ...(usageUnavailableReason ? { usageUnavailableReason } : {}),
             requestModel: requestModel(requestBody), // content-free model label from the ORIGINAL body
+            // WHICH TOOL SESSION this call came from, read from the ORIGINAL body exactly as the model
+            // label is: one metadata field, no message content. Persisted as a device-local KEYED HASH,
+            // never the session id (see `session-correlation.ts`).
+            //
+            // IT MUST BE CAPTURED HERE, for BOTH modes. Only apply receipts retain a body; record
+            // receipts retain nothing, and record-mode is the large majority of traffic (measured in
+            // `session-correlation.ts`) — including the interleaved auxiliary calls a run aggregate
+            // has to account for. Recovered later, it would be unavailable for exactly the calls that
+            // matter.
+            ...(sessionCorrelation ? { sessionCorrelationId: sessionCorrelation } : {}),
+            // Stamped at the top of `handleProxy`, before anything was read or forwarded: the instant
+            // run membership keys on. `captured_at` below is assigned here, after the response has
+            // streamed and `usageTee.finish()` has resolved — too late for a `Stop` the client already
+            // fired.
+            requestStartedAt,
+            ...(declinedLcmOutcome ? { lcmOutcome: declinedLcmOutcome } : {}),
             ...(proofRunId ? { proofRunId } : {}),
             ...(proofVariant ? { proofVariant } : {})
           };
@@ -667,11 +755,16 @@ async function handleProxy(
           // `void`-returning, rejection-swallowing. It changes nothing about WHEN the write starts or
           // whether anything here waits for it — it only records the promise so `close()` can.
           if (effectiveActivation.requested && apply) {
-            pendingBookkeeping.track(recordApplyReceiptFor({ options, activation: effectiveActivation, apply, log, ...shared }));
+            pendingBookkeeping.track(recordApplyReceiptFor({ options, activation: effectiveActivation, apply, log, upstreamRouteType, ...shared }));
             // Every AUTOMATIC application is additionally recorded content-free in the local activity
             // store with the user-inspectable facts (authorizing preference, gates, recovery pointer,
             // recover/disable commands). Best-effort + detached: never touches request/response bytes.
-            if (apply.applied && apply.authorization && apply.recoveryId && apply.plan && options.workflow) {
+            // `plan` OR an output component: the shaping-only fallback (Community at its ceiling on an
+            // engine that cannot degrade itself) carries no input plan, and requiring one silently
+            // dropped exactly those turns from the activity store — the turns whose recovery record
+            // exists and whose recover/disable commands the user has nowhere else to read.
+            if (apply.applied && apply.authorization && apply.recoveryId && options.workflow &&
+                (apply.plan !== undefined || apply.appliedComponents?.includes("output-shaping") === true)) {
               pendingBookkeeping.track(recordAutoApplyActivity({
                 options,
                 workflow: options.workflow,
@@ -681,7 +774,38 @@ async function handleProxy(
               }));
             }
           } else {
-            pendingBookkeeping.track(recordReceipt({ options, log, ...shared }));
+            // RECORD-MODE OUTPUT-SHAPING PROVENANCE. A record turn mutates nothing, and until now it
+            // therefore recorded nothing about output shaping — so the single most common real
+            // configuration (Claude Code with the prompt hook installed, routed through the gateway)
+            // wrote a receipt with NO shaping state on EVERY call. The hook had attached the policy
+            // upstream, `resolveOpenBasicOutputShaping` correctly skipped to avoid a duplicate block,
+            // and the run aggregate then failed closed on every one of them: `shapedCallCount === 0`
+            // on a run that was shaped end to end, rendering as unoptimized.
+            //
+            // MEASURED ON THE BYTES ACTUALLY FORWARDED (`bodyToForward`), with the STRICT
+            // instruction-level predicate — NOT the broad `bodyAlreadyCarriesOutputShaping` guard that
+            // drove the skip. The guard's bias is to skip attaching (a false positive costs one
+            // unshaped turn); this field's bias must be to withhold evidence (a false positive puts a
+            // savings arrow on a turn nothing shaped). They are deliberately different questions.
+            //
+            // ADDITIVE ONLY: proven-active is recorded, and anything else is left UNSET rather than
+            // written as `absent`. The gateway performed no shaping measurement of its own here, and an
+            // explicit `absent` would strip `watch`'s legacy live fallback
+            // (`outputShapingActiveForTurn`) from turns whose hook shaped the USER message — the
+            // documented instruction-level false negative, which this change preserves rather than
+            // papers over. The engine path states `absent` positively because it did inspect the bytes.
+            const detectedPolicyVersion = outputShapingPolicyVersionOnRequest(bodyToForward.toString("utf8"));
+            const recordShapingState = declinedOutputShapingState ??
+              (detectedPolicyVersion ? ("already-active" as const) : undefined);
+            pendingBookkeeping.track(recordReceipt({
+              options,
+              log,
+              ...shared,
+              ...(recordShapingState ? { outputShapingState: recordShapingState } : {}),
+              ...(declinedOutputShapingPolicyVersion || detectedPolicyVersion
+                ? { outputShapingPolicyVersion: declinedOutputShapingPolicyVersion ?? detectedPolicyVersion }
+                : {})
+            }));
           }
           // LCM SHADOW (explicit opt-in, default OFF): starts only AFTER the upstream response has
           // fully arrived, on a DETACHED promise this handler never awaits, it cannot touch the
@@ -768,6 +892,42 @@ function headerValue(v: string | string[] | undefined): string | undefined {
 }
 
 /** The outcome of resolving apply for one request (null when apply/dry-run was not requested). */
+/**
+ * THE ONE PLACE the upstream billing route is derived. Two independent records need it — the signed
+ * usage debit (`route_type`, which the debit records and which decides nothing) and the apply receipt
+ * (`upstream_route_type`, which gates the per-turn line's list-price cost clause). Deriving it twice
+ * is how those two silently disagree, so both read this.
+ *
+ * DERIVED FROM WHAT THE CLIENT ACTUALLY PRESENTED, never from key contents and never from a default:
+ *
+ *  1. An explicit `--subscription` transport (`options.claudeSubscription`) already IS the declaration.
+ *  2. Otherwise, on the Claude Code route only, the request itself is the evidence. An Anthropic
+ *     API-key call authenticates with `x-api-key`; a saved-login / Claude Max session has no API key
+ *     to put there and authenticates with its own credential instead. So the PRESENCE of a non-empty
+ *     `x-api-key` header — the header NAME only, the value is never read, compared, hashed, logged or
+ *     retained — is direct evidence of the API-key route, and its absence is evidence against it.
+ *  3. Every other route (`codex`/`cursor`/OpenAI, an explicitly started gateway with no workflow
+ *     identity) keeps `api-key` exactly as before. Those transports have no subscription form here,
+ *     so there is nothing for this to decide and their behaviour is untouched.
+ *
+ * WHY THIS SHAPE. Before, the absence of a `--subscription` transport was read as proof of an API key,
+ * which is not something the gateway knew: `gateway ensure` — the path the `claude` PATH shim takes on
+ * every normal `claude` run — has no `--subscription` form at all, so a Claude Max session was recorded
+ * as `api-key` and priced with a per-token list price it is not billed at. The rule can only ever move
+ * a turn from `api-key` to `subscription`, and only when no API key was presented; it can never newly
+ * assert a billed route, so it can never fabricate a dollar claim. A per-token BEARER token
+ * (`ANTHROPIC_AUTH_TOKEN`) lands on `subscription` and simply loses the cost clause — a claim withheld,
+ * which is the safe direction, not a claim invented.
+ */
+function upstreamRouteTypeFor(
+  options: GatewayServerOptions,
+  req: Pick<http.IncomingMessage, "headers">
+): "api-key" | "subscription" {
+  if (options.claudeSubscription) return SUBSCRIPTION_ROUTE_TYPE;
+  if (options.provider !== "anthropic" || options.workflow !== "claude-code") return API_KEY_ROUTE_TYPE;
+  return headerValue(req.headers["x-api-key"]) !== undefined ? API_KEY_ROUTE_TYPE : SUBSCRIPTION_ROUTE_TYPE;
+}
+
 interface ApplyOutcome {
   plan?: DedupePlan;
   optimizationPlan?: OptimizationPlan;
@@ -775,6 +935,12 @@ interface ApplyOutcome {
   mutatedBody?: Buffer;
   recoveryId?: string;
   appliedComponents?: Array<"lcm-compaction" | "deterministic-compaction" | "output-shaping">;
+  /** Output-shaping provenance for the final forwarded request (see `GatewayReceipt.output_shaping_state`). */
+  outputShapingState?: "attached-this-pass" | "already-active" | "absent";
+  outputShapingPolicyVersion?: string;
+  outputShapingRegime?: "default-shapeable";
+  /** Fixed-vocabulary LCM outcome (content-free). See `lcm-outcome.ts`. */
+  lcmOutcome?: { kind: string; reason: string };
   composedInputEstimate?: { before: number; after: number };
   /** Present ONLY on a stored-authorization application: the authorizing preference + passed gates. */
   authorization?: { id: string; scopeLine: string; gatesPassed: string[] };
@@ -786,6 +952,13 @@ interface ApplyOutcome {
    * conversion path; absent on a healthy turn, which is what keeps the CTA off every Community line.
    */
   allowancePause?: GatewayReceipt["allowance_pause"];
+  /**
+   * Set ONLY when this turn actually DEBITED the allowance and the lease carried a signed period
+   * total: what was left afterwards, out of that total. Rides onto the receipt so the per-turn line
+   * can show the countdown without reading device state at render time. Absent on a paused turn (the
+   * pause clause owns that line) and on a shaping-only turn (nothing was debited to count down).
+   */
+  allowanceSnapshot?: GatewayReceipt["allowance_snapshot"];
 }
 
 
@@ -800,13 +973,14 @@ interface ApplyOutcome {
  * gateway's own inline line sidestepped that by passing no tier at all — and therefore said nothing
  * even when it had something true to say.
  *
- * The receipt knows. A turn this gateway actually shaped carries `request_mutated: true` and
- * `applied_components: ["output-shaping"]`, so `basic shaping` is a statement about THAT turn. A turn
- * it did not shape gets NO label: silence is the honest rendering, because the tool's own prompt hook
- * may have shaped the turn upstream where the gateway cannot see it, and stamping `apply off` would
- * assert "no model-visible mutation" without knowing it. That rule is `receiptProvenOpenLabel`, shared
- * with the surfaces that replay receipts (`watch`, `status`) so the same receipt cannot be labelled
- * two ways by two renderers.
+ * The receipt knows. A turn on which output shaping was ACTIVE carries `output_shaping_state` of
+ * `attached-this-pass` or `already-active` — the engine's measurement of the bytes it forwarded — so
+ * `basic shaping` is a statement about THAT turn. A turn with an explicit `absent`, and a legacy turn
+ * with no state at all, get NO label: silence is the honest rendering, because the tool's own prompt
+ * hook may have shaped the turn where this measurement cannot see it (it inspects instruction-level
+ * carriers only), and stamping `apply off` would assert "no model-visible mutation" without knowing
+ * it. That rule is `receiptProvenOpenLabel`, shared with the surfaces that replay receipts (`watch`,
+ * `status`) so the same receipt cannot be labelled two ways by two renderers.
  *
  * A REAL full apply takes the COMMUNITY BUILDER, exactly as `watch`, `statusline` and the Claude Code
  * Stop hook do. This path used to fall through to the unlabelled Open rendering instead, so one
@@ -823,10 +997,10 @@ interface ApplyOutcome {
  * before→after, so a record or Open receipt can never acquire a `full apply` label here.
  *
  * The output arrow rides the calibrated rate applied to THIS turn's own output, on BOTH branches. It is
- * requested only for a turn we KNOW was shaped — an Open turn this gateway shaped, or a full apply,
- * which shapes output as part of the same pipeline — so an uncalibrated device degrades to a plain
- * `output N` rather than a fabricated before. Best-effort: a calibration read failure loses the arrow,
- * never the line.
+ * requested only when `outputShapingActiveForTurn` proves the final request was shaped; a real input
+ * apply alone is not output evidence. Without applicable calibration, proven shaping
+ * renders `output N/A→N (N/A%, est.)`: no fabricated before, while preserving the proven shaping fact.
+ * Best-effort: a calibration read failure loses the numeric arrow, never the axis or the line.
  *
  * EXPORTED FOR TESTS. Reaching a real full-apply receipt through `createGatewayServer` needs the private
  * engine and a valid lease, so an end-to-end test could only ever exercise the Open branch — the one
@@ -840,7 +1014,8 @@ export async function perTurnLineFromReceipt(
 ): Promise<string | undefined> {
   const env = options.entitlementEnv ?? process.env;
   const realApply = isRealApply(receipt);
-  const shapedHere = receiptProvenOpenLabel(receipt) === "basic";
+  const shapingActive = outputShapingActiveForTurn(receipt, false);
+  const openLabel = receiptProvenOpenLabel(receipt);
   // Neither a full apply nor a turn we shaped: nothing this renderer can label truthfully.
   // THE CEILING THE GATEWAY ITSELF RECORDED. This renderer used to pass `undefined` for both allowance
   // parameters on every branch, so the one surface with FIRST-HAND knowledge of the refusal — the
@@ -848,14 +1023,32 @@ export async function perTurnLineFromReceipt(
   // pause is read off the receipt (the turn's own record), never from current device state, so a
   // replayed receipt cannot acquire today's ceiling and today's turn cannot lose its own.
   const ceiling = receiptCeiling(receipt, env);
-  if (!realApply && !shapedHere) return receiptLineFromGatewayReceipt(receipt, undefined, undefined, undefined, undefined, ceiling);
+  if (!realApply && !shapingActive) return receiptLineFromGatewayReceipt(receipt, undefined, undefined, undefined, ceiling);
 
-  let estimatedSaved: { calibrated: boolean; tokensSaved?: number } | undefined;
-  try {
-    const reduction = await loadCalibrationReduction(env);
-    estimatedSaved = estimatePerTurnOutputSaved(reduction, receipt.tokens?.output);
-  } catch {
-    estimatedSaved = undefined; // no rate → plain count, never a fabricated arrow
+  // THE ESTIMATOR'S OWN TYPE, not a re-declared subset. This was annotated
+  // `{ calibrated: boolean; tokensSaved?: number }`, which silently dropped `basis` — the field that
+  // decides whether a reconstructed before→after may be drawn at all. The value carried it at runtime,
+  // so the arrow was suppressed correctly, but the STATIC type said the provenance did not exist:
+  // rebuilding this literal by hand would have compiled clean and put the shipped prior back on the
+  // live gateway line. The provenance travels with the estimate or the guard downstream is decorative.
+  let estimatedSaved: PerTurnEstimatedSaved | undefined;
+  if (shapingActive) {
+    try {
+      const reduction = await loadCalibrationReduction(
+        env,
+        outputCalibrationQuery({
+          policyVersion: receipt.output_shaping_policy_version,
+          provider: receipt.provider,
+          model: receipt.model,
+          regime: receipt.output_shaping_regime
+        })
+      );
+      estimatedSaved = estimatePerTurnOutputSaved(reduction, receipt.tokens?.output);
+    } catch {
+      // Shaping was proven above. A failed calibration read cannot erase that fact; keep the axis and
+      // leave only its unavailable counterfactual slots unknown.
+      estimatedSaved = { calibrated: false, state: "unseeded" };
+    }
   }
 
   if (realApply) {
@@ -875,9 +1068,9 @@ export async function perTurnLineFromReceipt(
     } catch {
       /* fall through to the Open rendering: a tier read failure must not cost the line entirely */
     }
-    if (!shapedHere) return receiptLineFromGatewayReceipt(receipt, undefined, undefined, undefined, undefined, ceiling);
+    if (!shapingActive) return receiptLineFromGatewayReceipt(receipt, undefined, undefined, undefined, ceiling);
   }
-  return receiptLineFromGatewayReceipt(receipt, "basic", undefined, undefined, estimatedSaved, ceiling);
+  return receiptLineFromGatewayReceipt(receipt, openLabel, undefined, estimatedSaved, ceiling);
 }
 
 /**
@@ -979,13 +1172,32 @@ function resolveOpenBasicOutputShaping(
         applied: true,
         mutatedBody: Buffer.from(plan.mutatedBody, "utf8"),
         recoveryId,
-        appliedComponents: ["output-shaping"]
+        appliedComponents: ["output-shaping"],
+        // This path ATTACHED the policy itself, so provenance is settled without re-deriving it.
+        outputShapingState: "attached-this-pass",
+        ...(plan.policyVersion ? { outputShapingPolicyVersion: plan.policyVersion } : {}),
+        ...(plan.taskSignal === "default-shapeable" ? { outputShapingRegime: "default-shapeable" as const } : {})
       }
     };
   } catch {
     return null;
   }
 }
+
+/**
+ * What the stored-authorization path resolved to. `null` is the plain decline (nothing ran, or an
+ * early gate refused). `declined` is the engine having run the pipeline and applied nothing: the
+ * turn is still a plain record, but the engine's LCM outcome is a fact about it that the record
+ * receipt must carry.
+ */
+type StoredAuthorizationResolution =
+  | { activation: ApplyActivation; outcome: ApplyOutcome }
+  | {
+      declined: true;
+      lcmOutcome?: { kind: string; reason: string };
+      outputShapingState?: "attached-this-pass" | "already-active" | "absent";
+      outputShapingPolicyVersion?: string;
+    };
 
 /**
  * Resolve a STORED-AUTHORIZATION automatic apply for one request, or null (= stay record). Called
@@ -1005,8 +1217,9 @@ async function resolveStoredAuthorizationApply(
   originalBody: Buffer,
   options: GatewayServerOptions,
   log: (line: string) => void,
-  supervisor: EngineSupervisor
-): Promise<{ activation: ApplyActivation; outcome: ApplyOutcome } | null> {
+  supervisor: EngineSupervisor,
+  upstreamRouteType: "api-key" | "subscription"
+): Promise<StoredAuthorizationResolution | null> {
   try {
     // Apply is enabled for the tools that route recognized request shapes through the gateway.
     // Cursor participates via its OpenAI-compatible traffic (custom base URL); its reduction is shown
@@ -1026,7 +1239,11 @@ async function resolveStoredAuthorizationApply(
     // to Cache optimize takes effect on the next request and leaves model-visible bytes unchanged.
     if ((options.optimizationMode ?? readOptimizationMode()) !== "cache-plus-context") return null;
     const scope: ApplyRequestScope = { tool: options.workflow as string, ...(options.repo ? { repo: options.repo } : {}) };
-    const authorization = await findStoredAuthorization({ scope, cwd });
+    // DEVICE store only, resolved from the SAME env as the lease and the metering journal — one device
+    // environment, one answer. `cwd` still scopes this connection's retention/receipt paths below, but
+    // it must never decide whether an authorization EXISTS: a repository that ships a
+    // `.compaction/policy-preferences.json` would otherwise arm mutation for anyone who cloned it.
+    const authorization = await findStoredAuthorization({ scope, env: options.entitlementEnv ?? process.env });
     if (!authorization) return null; // no matching stored authorization → NO auto-apply, ever
 
     // PUBLIC GATE: decide WHETHER apply is allowed (auth/scope/endpoint). No algorithm runs here.
@@ -1047,12 +1264,11 @@ async function resolveStoredAuthorizationApply(
     // stored-apply eligibility gate list (that array is a stored-pref contract with non-empty
     // invariants); it is a distinct decline reason kept beside it.
     //
-    // ENTITLEMENT ONLY — DELIBERATELY ROUTE-BLIND, AND THAT IS NOW CORRECT. Whether the device
-    // is entitled is the same question on both routes, so this gate asks it once for both. The
-    // ALLOWANCE BALANCE is a different question with a different answer per route, and it is asked
-    // below, inside the metered-route branch. The reader used to fold a spent balance into this
-    // verdict, which made this route-blind check withdraw full apply from subscription traffic that
-    // consumes no allowance.
+    // ENTITLEMENT ONLY. Whether the device is entitled is one question; whether this period's
+    // allowance can pay for THIS turn's input compaction is another, asked below and answered against
+    // the journal rather than against the lease. The reader used to fold a spent balance into this
+    // verdict, which made this gate withdraw the whole capability — including the output shaping the
+    // allowance never bought and which must keep running on a spent period.
     const leaseVerdict = readLeaseVerdict(options.entitlementEnv ?? process.env);
     if (leaseVerdict.label !== "lease-valid") {
       log(
@@ -1078,37 +1294,24 @@ async function resolveStoredAuthorizationApply(
 
     const originalText = originalBody.toString("utf8");
 
-    // ROUTE: derived from the configured transport, NEVER from key contents. Only the api-key route is metered/debited; the subscription route runs full apply but
-    // consumes no allowance and writes no usage-journal entry.
-    const routeType = options.claudeSubscription ? "subscription" : METERED_ROUTE_TYPE;
+    // ROUTE: resolved once per request from what the client presented, NEVER from key contents (see
+    // `upstreamRouteTypeFor`). It is RECORDED on the debit and stamped on the engine frame; it does NOT
+    // decide whether this turn is metered. The Compaction allowance pays for USE OF THE HYBRID ENGINE,
+    // so a confirmed input apply consumes optimized-input allowance on the API-key route and on a
+    // Claude Code subscription session alike.
+    const routeType = upstreamRouteType;
     const meteringEnv = options.entitlementEnv ?? process.env;
     const allowanceTokens = leaseVerdict.allowanceTokens ?? 0;
     const periodId = leaseVerdict.periodId ?? "";
+    // The countdown's DENOMINATOR, straight off the signed lease. Undefined on a v1 lease (one signed
+    // before the total was part of the wire contract), and a device holds its last lease for up to a
+    // full TTL after upgrading — so the snapshot below is simply omitted rather than substituting
+    // `allowanceTokens`, which is already net of server-recorded consumption and would draw a full
+    // tank on a half-spent period.
+    const periodAllowanceTokens = leaseVerdict.periodAllowanceTokens;
+    // What this turn's debit left, out of the period total. Set at the ONE place a debit commits.
+    let allowanceSnapshot: GatewayReceipt["allowance_snapshot"];
 
-    // CEILING SNAPSHOT (client-authoritative until the usage service reconciles): the local
-    // hash-chained usage journal is the consumed-so-far tally. For the METERED route only, compute
-    // remaining = allowance − Σ(committed debits for this period). At/over the ceiling, DECLINE the
-    // apply (content-free degrade to forward-original) — NEVER auto-purchase, never meter past the
-    // allowance. The subscription route consumes no allowance, so it reads no tally and is not
-    // bounded by one.
-    //
-    // THE ONE ROUTE-AWARE BALANCE DECISION. Everything the allowance gates is inside this
-    // branch, which is the whole reason the entitlement gate above may stay route-blind: an
-    // ISSUER-exhausted lease (`allowance_tokens: 0`) now arrives here as a VALID entitlement carrying
-    // a zero snapshot, and this branch is what turns that zero into a metered refusal — while the
-    // subscription route skips it entirely and applies.
-    //
-    // NOT THE AUTHORITY FOR THE COMMIT (load-bearing): this value is a cheap EARLY-OUT and the
-    // number the engine receives as `locally_allocated_tokens_remaining`. It is read before an
-    // awaited engine dispatch, so every concurrent apply in flight observes the SAME remainder and
-    // none of them can see the others' debits. The binding test lives with the debit, inside the
-    // journal append lock (`appendUsageEvent`'s `ceiling`), where the tally is re-read fresh.
-    //
-    // INTEGRITY-GATED + FAIL-CLOSED: the tally is only trustworthy if the journal it sums verifies.
-    // A malformed line or a broken hash chain (e.g. a hand-edited token count) would otherwise LOWER
-    // the tally and silently replenish the allowance, so an unverifiable journal DECLINES the apply
-    // rather than being summed over its surviving lines.
-    let localRemainingTokens = allowanceTokens;
     // WHY input optimization did not run, when the reason was the allowance. Set at each of the three
     // places an allowance can refuse this turn (pre-dispatch exhausted, pre-dispatch overshoot, and the
     // under-lock concurrent ceiling), and carried to the receipt so the per-turn line can state the
@@ -1123,33 +1326,54 @@ async function resolveStoredAuthorizationApply(
         // whether this pause is still true; the period can, and it is the field the readers bind to.
         ...(periodId !== "" ? { period_id: periodId } : {}),
         ...(resetsOn !== undefined ? { resets_on: resetsOn } : {}),
-        // The metered api-key route is the only route this allowance governs; a subscription
-        // turn never reaches here, so the narrower scope is the true one and the surfaces that render
-        // it say what is unaffected instead of over-stating the pause.
-        scope: "api-key-route" as const
+        // EVERY ROUTE. The allowance governs Hybrid input optimization wherever the turn is
+        // forwarded, so no route is "unaffected" and the narrower `api-key-route` scope would now
+        // promise a subscription user an apply that will be paused. Persisted receipts written
+        // before this change may still carry the narrower label; the renderers still accept it.
+        scope: "all-routes" as const
       };
     };
-    if (routeType === METERED_ROUTE_TYPE) {
-      const consumption = await readMeteredAllowance(allowanceTokens, periodId, meteringEnv);
-      if (!consumption.ok) {
-        log(
-          `compaction gateway: stored authorization ${authorization.id} did not apply - ${consumption.reason} (${meteringDeclineExplanation(consumption.reason)}; fail-closed, original forwarded unchanged).`
-        );
-        return null;
-      }
-      localRemainingTokens = consumption.remaining;
-      if (localRemainingTokens <= 0) {
-        // EXHAUSTED IS AN INPUT CEILING, NOT AN OFF SWITCH. This used to return null, which forwarded
-        // a bare original and took OUTPUT SHAPING away along with the input compaction — dropping a
-        // Community user at their ceiling below the Open/base baseline that never cost allowance.
-        // Dispatch anyway with a zero remainder: the engine's own ceiling refuses the INPUT plan and
-        // emits the output-shaping-only treatment, metered at zero. No auto-purchase, no partial
-        // metering, and `compactedInput` below keeps the debit at zero.
-        log(
-          `compaction gateway: stored authorization ${authorization.id} - optimized-input allowance exhausted for this period; input optimization paused, output shaping continues (no auto-purchase).`
-        );
-        allowancePause = pauseFor("exhausted");
-      }
+    // CEILING SNAPSHOT (client-authoritative until the usage service reconciles): the local
+    // hash-chained usage journal is the consumed-so-far tally. Compute remaining = allowance minus
+    // the committed debits for this period. At/over the ceiling, PAUSE INPUT OPTIMIZATION
+    // (content-free degrade to the output-shaping-only treatment) - never auto-purchase, never meter
+    // past the allowance.
+    //
+    // ROUTE-BLIND, LIKE THE ENTITLEMENT GATE ABOVE. This used to run for the api-key route only,
+    // which let a subscription-routed Hybrid apply consume the engine and debit nothing. An
+    // ISSUER-exhausted lease (`allowance_tokens: 0`) arrives here as a VALID entitlement carrying a
+    // zero snapshot, and this is what turns that zero into a paused input plan - on every route.
+    //
+    // NOT THE AUTHORITY FOR THE COMMIT (load-bearing): this value is a cheap EARLY-OUT and the
+    // number the engine receives as `locally_allocated_tokens_remaining`. It is read before an
+    // awaited engine dispatch, so every concurrent apply in flight observes the SAME remainder and
+    // none of them can see the others' debits. The binding test lives with the debit, inside the
+    // journal append lock (`appendUsageEvent`'s `ceiling`), where the tally is re-read fresh.
+    //
+    // INTEGRITY-GATED + FAIL-CLOSED: the tally is only trustworthy if the journal it sums verifies.
+    // A malformed line or a broken hash chain (e.g. a hand-edited token count) would otherwise LOWER
+    // the tally and silently replenish the allowance, so an unverifiable journal DECLINES the apply
+    // rather than being summed over its surviving lines.
+
+    const consumption = await readMeteredAllowance(allowanceTokens, periodId, meteringEnv);
+    if (!consumption.ok) {
+      log(
+        `compaction gateway: stored authorization ${authorization.id} did not apply - ${consumption.reason} (${meteringDeclineExplanation(consumption.reason)}; fail-closed, original forwarded unchanged).`
+      );
+      return null;
+    }
+    const localRemainingTokens = consumption.remaining;
+    if (localRemainingTokens <= 0) {
+      // EXHAUSTED IS AN INPUT CEILING, NOT AN OFF SWITCH. This used to return null, which forwarded
+      // a bare original and took OUTPUT SHAPING away along with the input compaction — dropping a
+      // Community user at their ceiling below the Open/base baseline that never cost allowance.
+      // Dispatch anyway with a zero remainder: the engine's own ceiling refuses the INPUT plan and
+      // emits the output-shaping-only treatment, metered at zero. No auto-purchase, no partial
+      // metering, and `compactedInput` below keeps the debit at zero.
+      log(
+        `compaction gateway: stored authorization ${authorization.id} - optimized-input allowance exhausted for this period; input optimization paused, output shaping continues (no auto-purchase).`
+      );
+      allowancePause = pauseFor("exhausted");
     }
 
     // PRIVATE ENGINE (over the supervised local IPC): the optimization algorithm runs in the engine
@@ -1177,28 +1401,134 @@ async function resolveStoredAuthorizationApply(
       // ENTITLEMENT: a content-free opaque proof-of-entitlement (the verified lease's period; never
       // the lease id / account / signature — those never cross the IPC). The engine treats it opaque.
       entitlement: { token: `community-full-apply:${leaseVerdict.periodId ?? ""}` },
-      // QUOTA snapshot. For the METERED route this is the journal-adjusted remainder (allowance −
-      // committed debits this period). The engine ENFORCES it for an api-key request carrying a real
-      // `period_id` — it refuses when the pre-mutation metered count would exceed the remainder
-      // (defense in depth behind this client-side check).
-      //
-      // The non-debitable SUBSCRIPTION route hands the engine NO ALLOWANCE WINDOW AT ALL (the
-      // protocol's `period_id: ""`, the same frame the supervisor's liveness ping uses). It consumes
-      // no allowance, so it has no locally-allocated remainder, and sending a number
-      // would state one it does not have. This also means the engine's second, independent ceiling
-      // cannot refuse a subscription apply for TWO reasons rather than one — the route label AND the
-      // absent window — so a spent API balance cannot resurface as a refusal one layer down.
-      quota:
-        routeType === METERED_ROUTE_TYPE
-          ? { period_id: periodId, locally_allocated_tokens_remaining: Math.max(0, remainingTokens) }
-          : { period_id: "", locally_allocated_tokens_remaining: 0 }
+      // QUOTA snapshot: the journal-adjusted remainder (allowance minus the committed debits for this
+      // period), sent on EVERY route now that every route debits. The engine ENFORCES it as defense
+      // in depth behind this client-side check - it refuses when the pre-mutation metered count would
+      // exceed the remainder. Sending the real window on the subscription route is what makes the
+      // engine's independent ceiling agree with this one instead of applying without a bound.
+      quota: { period_id: periodId, locally_allocated_tokens_remaining: Math.max(0, remainingTokens) }
     });
+
+    // SHAPING-ONLY FALLBACK (PUBLIC, ENGINE-FREE, NO IPC). Each of the three allowance refusals below
+    // asks the ENGINE for an output-shaping-only treatment by re-dispatching with a zero remainder.
+    // That only works when the INSTALLED engine enforces the quota frame on THIS route, and an engine
+    // built before the ceiling became route-independent does not: its `exceedsQuota` returns false for
+    // every non-api-key route, so on a subscription route it hands back an input-compacted body
+    // whatever remainder it is sent. The `compactsInput` guard then correctly refuses that body — and
+    // the turn would be forwarded bare, taking OUTPUT SHAPING away at the ceiling. That is precisely
+    // the regression the exhausted path above exists to prevent, and it is reachable today: the CLI
+    // upgrades on its own, an already-verified engine is treated as present rather than replaced, and
+    // the IPC protocol version is unchanged between them, so the old engine accepts the new frame.
+    //
+    // So do not make the degraded treatment depend on the engine at all. `planPublicBasicOutputShaping`
+    // is the same public planner the Open baseline uses: in-process, engine-free, and it carries the
+    // task-aware gate, so a planning/reasoning turn still HOLDS rather than being shaped. It compacts
+    // no input, so `compactedInput` stays false and nothing is debited, on any route. A Community user
+    // at their ceiling therefore lands exactly ON the Open baseline instead of below it, whatever
+    // engine version happens to be installed.
+    const planShapingOnlyFallback = (): { body: string; policyVersion?: string; regime?: "default-shapeable" } | undefined => {
+      // The user's own shaping off-switch (`compaction stop` / `COMPACTION_SHAPING_HOOKS=0`) wins here,
+      // exactly as it does on the Open-basic path. The primary engine dispatch above still sends
+      // `output_shaping_enabled: true` unconditionally, which is a separate defect on a different path;
+      // it is tracked rather than folded into this change, and the asymmetry only ever shapes LESS.
+      if (!isShapingHooksActivated(options.entitlementEnv ?? process.env)) return undefined;
+      // The tool's own prompt hook may already have attached the identical block upstream.
+      if (bodyAlreadyCarriesOutputShaping(originalText)) return undefined;
+      const plan = planPublicBasicOutputShaping(endpoint, originalText);
+      if (!plan.supported || !plan.changed || !plan.mutatedBody) return undefined;
+      return {
+        body: plan.mutatedBody,
+        ...(plan.policyVersion ? { policyVersion: plan.policyVersion } : {}),
+        ...(plan.taskSignal === "default-shapeable" ? { regime: "default-shapeable" as const } : {})
+      };
+    };
+
+    // The applied outcome for that fallback. Retains its OWN byte-exact original first (fail-closed for
+    // the mutation, fail-open for the workflow) and names `open-basic-output-apply` on both the recovery
+    // record and — via `activation.policy` — the receipt, so one turn cannot be described by two
+    // different policies. It carries the allowance pause, so the per-turn line still says input
+    // optimization is paused and still offers the one conversion path.
+    const shapingOnlyFallbackOutcome = (
+      fallback: { body: string; policyVersion?: string; regime?: "default-shapeable" },
+      pause: GatewayReceipt["allowance_pause"],
+      lcmOutcome?: { kind: string; reason: string }
+    ): { activation: ApplyActivation; outcome: ApplyOutcome } | null => {
+      let fallbackRecoveryId: string;
+      try {
+        fallbackRecoveryId = saveOriginalForRecovery(cwd, {
+          endpoint,
+          policy: OPEN_BASIC_OUTPUT_POLICY,
+          originalBody: originalText
+        });
+      } catch (error) {
+        // The error CLASS only - Node fs errors interpolate absolute paths and this log is content-free.
+        const errorClass = error instanceof Error ? error.name : typeof error;
+        log(
+          `compaction gateway: stored authorization ${authorization.id} shaping-only fallback declined - the original could not be retained (${errorClass}); fail-closed, original forwarded unchanged.`
+        );
+        return null;
+      }
+      return {
+        activation: {
+          mode: "apply",
+          requested: true,
+          policy: OPEN_BASIC_OUTPUT_POLICY,
+          activation: "stored-authorization"
+        },
+        outcome: {
+          applied: true,
+          mutatedBody: Buffer.from(fallback.body, "utf8"),
+          recoveryId: fallbackRecoveryId,
+          appliedComponents: ["output-shaping"],
+          // Same as the Open-basic path above: this fallback attached the policy itself.
+          outputShapingState: "attached-this-pass",
+          ...(fallback.policyVersion ? { outputShapingPolicyVersion: fallback.policyVersion } : {}),
+          ...(fallback.regime ? { outputShapingRegime: fallback.regime } : {}),
+          ...(lcmOutcome ? { lcmOutcome } : {}),
+          authorization: {
+            id: authorization.id,
+            scopeLine: authorization.scope.repo
+              ? `${authorization.scope.tool} repo ${authorization.scope.repo}`
+              : authorization.scope.tool,
+            // No engine ran, so there are no engine shape gates to report: the public gates this path
+            // already passed, plus the retention that just succeeded.
+            gatesPassed: [
+              ...Object.entries(gates.gateResults).filter(([, r]) => r === "pass").map(([gate]) => gate),
+              "original-retainable"
+            ]
+          },
+          ...(pause ? { allowancePause: pause } : {})
+        }
+      };
+    };
 
     const first = await dispatchEngine(localRemainingTokens);
 
     if (first.decision !== "apply") {
+      // EXHAUSTED, AND THE ENGINE REFUSED OUTRIGHT rather than degrading. An `allowancePause` here can
+      // only have come from the pre-dispatch exhausted branch above, so this is the ceiling case again:
+      // shape in-process so the baseline survives an engine that answers a zero remainder with a refusal
+      // instead of a shaping-only plan. Every other refusal reason stays a plain fail-open.
+      const fallbackBody = allowancePause !== undefined ? planShapingOnlyFallback() : undefined;
+      if (fallbackBody !== undefined) {
+        log(
+          `compaction gateway: stored authorization ${authorization.id} - the engine refused at the exhausted allowance (${first.reason}); applying the public baseline shaping instead (nothing debited).`
+        );
+        return shapingOnlyFallbackOutcome(fallbackBody, allowancePause, first.lcmOutcome);
+      }
       log(`compaction gateway: stored authorization ${authorization.id} did not apply - ${first.reason} (fail-open, original forwarded unchanged).`);
-      return null;
+      // A no-op the engine PRODUCED still says why LCM did not contribute; a bare `null` would drop
+      // that from the receipt on exactly the did-not-contribute turns.
+      return first.lcmOutcome !== undefined || first.outputShapingState !== undefined
+        ? {
+            declined: true,
+            ...(first.lcmOutcome !== undefined ? { lcmOutcome: first.lcmOutcome } : {}),
+            ...(first.outputShapingState !== undefined ? { outputShapingState: first.outputShapingState } : {}),
+            ...(first.outputShapingPolicyVersion !== undefined
+              ? { outputShapingPolicyVersion: first.outputShapingPolicyVersion }
+              : {})
+          }
+        : null;
     }
 
     let decision: AppliedEngineDecision = first;
@@ -1221,7 +1551,7 @@ async function resolveStoredAuthorizationApply(
     // so it does NOT bound concurrent applies on its own — the binding CONCURRENT guarantee is the
     // re-validation carried into the debit and evaluated under the journal append lock (below).
     // Keeping this one here means an oversized single request is refused BEFORE anything is retained.
-    // WHAT THE ALLOWANCE ACTUALLY BUYS. `optimized-input-v1` meters INPUT compaction, so both the
+    // WHAT THE ALLOWANCE ACTUALLY BUYS. `optimized-input-v2` meters INPUT compaction, so both the
     // ceiling below and the debit further down apply to an apply that compacted input — and to no
     // other. An output-shaping-only apply (the ceiling's own degradation, and any turn where dedupe
     // found nothing but the shaper did) compacts no input: it must not be refused for want of input
@@ -1232,14 +1562,36 @@ async function resolveStoredAuthorizationApply(
       components.some((component) => component === "lcm-compaction" || component === "deterministic-compaction");
     let compactedInput = compactsInput(artifacts.applied_components as unknown[]);
 
-    if (routeType === METERED_ROUTE_TYPE && compactedInput) {
-      const { tokens: wouldMeter } = resolveMeteredOptimizedInput({
+    if (compactedInput) {
+      const { tokens: wouldMeter, meterVersion: wouldMeterVersion } = resolveMeteredOptimizedInput({
         ...(decision.meterVersion !== undefined ? { meterVersion: decision.meterVersion } : {}),
         ...(decision.meteredOptimizedInputTokens !== undefined
           ? { meteredOptimizedInputTokens: decision.meteredOptimizedInputTokens }
           : {}),
         preMutationBody: originalText
       });
+
+      // A DEBIT THIS CLIENT CANNOT PLACE IS NOT A DEBIT OF ZERO. The engine is installed separately
+      // and versioned on its own cadence, so a client on `optimized-input-v2` can meet an engine that
+      // reports the v1 THROUGHPUT count — everything it inspected, ~19x the removal on measured data —
+      // or the documented `chars/4` fallback, which is the same throughput basis. Charging either
+      // against a balance denominated in tokens REMOVED overstates the cost by that factor and writes
+      // a permanent misreading into the audit history; charging it at zero makes input compaction free
+      // and unbounded. Both are wrong, so the apply is DECLINED and the original forwarded unchanged.
+      //
+      // Checked HERE, at the same resolution the debit uses, so nothing is retained or forwarded on a
+      // debit that the journal is going to refuse anyway. `appendUsageEvent` refuses it again under
+      // the lock — this is the early, diagnosable half of one fail-closed rule, not a second rule.
+      //
+      // This is NOT an allowance decision, so it does not degrade to output shaping and does not
+      // claim a pause: nothing about the user's allowance is known here.
+      if (wouldMeterVersion !== ACTIVE_USAGE_METER_VERSION) {
+        log(
+          `compaction gateway: stored authorization ${authorization.id} did not apply - the engine reported an optimized-input count in an unrecognized meter unit (${wouldMeterVersion}); nothing debited, original forwarded unchanged. Update the engine to restore input optimization.`
+        );
+        return null;
+      }
+
       if (wouldMeter > localRemainingTokens) {
         // OVERSHOOT: this single request's optimized input does not fit inside the snapshot, so the
         // INPUT plan is refused whole (never partially metered, never auto-purchased). Re-dispatch with
@@ -1258,8 +1610,15 @@ async function resolveStoredAuthorizationApply(
           degraded.mutatedRequestBody === originalText ||
           compactsInput(degradedArtifacts.applied_components as unknown[])
         ) {
-          log(`compaction gateway: stored authorization ${authorization.id} did not apply - no output-shaping-only treatment available for this request (original forwarded unchanged).`);
-          return null;
+          // The engine could not produce it (refused, no-op, or - on a pre-route-independent engine -
+          // still compacted input). Shape in-process instead so the ceiling never costs the baseline.
+          const fallbackBody = planShapingOnlyFallback();
+          if (fallbackBody === undefined) {
+            log(`compaction gateway: stored authorization ${authorization.id} did not apply - no output-shaping-only treatment available for this request (original forwarded unchanged).`);
+            return null;
+          }
+          log(`compaction gateway: stored authorization ${authorization.id} - the engine returned no output-shaping-only treatment; applying the public baseline shaping instead (nothing debited).`);
+          return shapingOnlyFallbackOutcome(fallbackBody, pauseFor("insufficient"));
         }
         decision = degraded;
         artifacts = degradedArtifacts;
@@ -1273,16 +1632,15 @@ async function resolveStoredAuthorizationApply(
     // THE ENGINE GOT THERE FIRST. The branch above only runs when the FIRST dispatch came back having
     // compacted input — but that dispatch carries the real remainder, so the engine's own ceiling
     // (defense in depth) degrades to output-shaping-only before the body ever reaches here. In every
-    // real overshoot the branch above is therefore dead, and a turn that was refused for want of
-    // allowance arrived looking exactly like a healthy shaping turn: no pause on the receipt, no
-    // ceiling clause on the per-turn line, no conversion path. Measured on a real Community journey —
-    // 40,000 remaining against a 75,777-token eligible turn rendered `full apply` with no CTA.
+    // overshoot the branch above may therefore be bypassed, and a turn that was refused for want of
+    // allowance would otherwise look exactly like a healthy shaping turn: no pause on the receipt,
+    // no ceiling clause on the per-turn line, and no conversion path.
     //
     // So honor the engine's own signal as the authoritative one. `exceedsQuota` fires only for a
     // metered route inside a real allowance window, and `pauseFor` is not overwritten: a pre-dispatch
     // EXHAUSTED pause is already the truer statement of the same turn (nothing remains, rather than
     // not enough), and it was set from this side's own reading of the journal.
-    if (routeType === METERED_ROUTE_TYPE && allowancePause === undefined && decision.quotaDegraded === true) {
+    if (allowancePause === undefined && decision.quotaDegraded === true) {
       log(
         `compaction gateway: stored authorization ${authorization.id} - this request's optimized input exceeds the remaining allowance for this period; input optimization paused, output shaping continues (no auto-purchase).`
       );
@@ -1325,6 +1683,11 @@ async function resolveStoredAuthorizationApply(
         plan: from.deterministic_plan as unknown as DedupePlan,
         optimizationPlan: from.optimization_plan as OptimizationPlanType,
         appliedComponents: from.applied_components as Array<"lcm-compaction" | "deterministic-compaction" | "output-shaping">,
+        // Engine-computed on the FINAL forwarded body; absent from an older engine ⇒ undefined ⇒ unknown.
+        outputShapingState: from.output_shaping_state as "attached-this-pass" | "already-active" | "absent" | undefined,
+        outputShapingPolicyVersion: from.output_shaping_policy_version as string | undefined,
+        outputShapingRegime: from.output_shaping_regime as "default-shapeable" | undefined,
+        lcmOutcome: from.lcm_outcome as { kind: string; reason: string } | undefined,
         // Gate list, in the exact order the previous in-process eligibility produced it: the public
         // deterministic-policy/scope-match gates, then the engine's supported-shape/change-produced,
         // then this function's original-retainable (retention just succeeded).
@@ -1334,18 +1697,21 @@ async function resolveStoredAuthorizationApply(
           "original-retainable"
         ]
       });
-      let { plan, optimizationPlan, appliedComponents, gatesPassed } = receiptFacts(artifacts);
+      let { plan, optimizationPlan, appliedComponents, outputShapingState, outputShapingPolicyVersion, outputShapingRegime, lcmOutcome, gatesPassed } = receiptFacts(artifacts);
 
       // METER — the SINGLE metering hook, at the one confirmed-apply site: engine returned a
       // usable, changed, recoverable mutation, the byte-exact original was retained, this request fits
       // under the ceiling, and the receipt artifacts rebuilt cleanly. Committed BEFORE the outcome
-      // returns (committed-before-complete). METERED ROUTE ONLY: a subscription apply still runs here but
-      // writes NO journal entry and debits nothing. The debit is content-free + device-signed
-      // + hash-chained. Fail-CLOSED for the mutation: if metering does not commit (missing
+      // returns (committed-before-complete). ROUTE-INDEPENDENT, AND GATED ON `compactedInput`: what
+      // buys a debit is that INPUT was compacted, never which transport carried the turn — the
+      // allowance pays for the Hybrid Engine, not for the provider billing route. `routeType` is
+      // RECORDED on the entry, not consulted to skip this hook. A shaping-only turn leaves
+      // `compactedInput` false and writes nothing, on every route. The debit is content-free +
+      // device-signed + hash-chained. Fail-CLOSED for the mutation: if metering does not commit (missing
       // credentials/lease, signing/append/lock failure, or the under-lock ceiling re-check refusing),
       // DECLINE the apply so a mutation is never forwarded without its debit recorded (a debit and a
       // mutation are atomic-or-neither) and total usage never passes the period ceiling.
-      if (routeType === METERED_ROUTE_TYPE && compactedInput) {
+      if (compactedInput) {
         const meterResult = await commitApplyDebit(
           {
             routeType,
@@ -1355,10 +1721,13 @@ async function resolveStoredAuthorizationApply(
             // The lease's allowance travels with the debit so the AUTHORITATIVE remaining-allowance
             // test can be re-evaluated against a fresh tally inside the journal append lock.
             allowanceTokens,
-            receiptId: recoveryId,
+            recoveryId,
             ...(decision.meterVersion !== undefined ? { meterVersion: decision.meterVersion } : {}),
             ...(decision.meteredOptimizedInputTokens !== undefined
               ? { meteredOptimizedInputTokens: decision.meteredOptimizedInputTokens }
+              : {}),
+            ...(decision.estimatedInputTokensBefore !== undefined
+              ? { estimatedInputTokensBefore: decision.estimatedInputTokensBefore }
               : {}),
             ...(decision.estimatedInputTokensAfter !== undefined
               ? { estimatedInputTokensAfter: decision.estimatedInputTokensAfter }
@@ -1390,10 +1759,22 @@ async function resolveStoredAuthorizationApply(
             degraded.mutatedRequestBody === originalText ||
             compactsInput(degradedArtifacts.applied_components as unknown[])
           ) {
+            const fallbackBody = ceilingRefusal ? planShapingOnlyFallback() : undefined;
+            if (fallbackBody === undefined) {
+              log(
+                `compaction gateway: stored authorization ${authorization.id} apply metering did not commit (${meterResult.reason}) - fail-closed, original forwarded unchanged.`
+              );
+              return null;
+            }
+            // Same reasoning as the pre-commit overshoot: the ceiling refused the INPUT plan, the engine
+            // could not hand back a shaping-only treatment, and the baseline must survive that. The
+            // helper retains its OWN original under the policy it actually applies; `recoveryCommitted`
+            // stays false, so the `finally` discards the `deterministic-dedupe` record written above for
+            // the input plan that is no longer being forwarded. One turn, one recovery record, one policy.
             log(
-              `compaction gateway: stored authorization ${authorization.id} apply metering did not commit (${meterResult.reason}) - fail-closed, original forwarded unchanged.`
+              `compaction gateway: stored authorization ${authorization.id} - remaining allowance did not cover this request's optimized input (${meterResult.reason}) and the engine returned no output-shaping-only treatment; applying the public baseline shaping instead (nothing debited, no auto-purchase).`
             );
-            return null;
+            return shapingOnlyFallbackOutcome(fallbackBody, pauseFor("insufficient"));
           }
           log(
             `compaction gateway: stored authorization ${authorization.id} - remaining allowance did not cover this request's optimized input; input optimization paused, output shaping continues (nothing debited, no auto-purchase).`
@@ -1403,7 +1784,24 @@ async function resolveStoredAuthorizationApply(
           // Same product state as the pre-dispatch overshoot, reached under concurrency: what was left
           // did not cover this turn's optimized input once the fresh tally was read under the lock.
           allowancePause = pauseFor("insufficient");
-          ({ plan, optimizationPlan, appliedComponents, gatesPassed } = receiptFacts(degradedArtifacts));
+          ({ plan, optimizationPlan, appliedComponents, outputShapingState, outputShapingPolicyVersion, outputShapingRegime, lcmOutcome, gatesPassed } = receiptFacts(degradedArtifacts));
+        } else if (periodAllowanceTokens !== undefined && allowancePause === undefined) {
+          // THE COUNTDOWN, recorded where the debit happened. `remainingTokens` is measured under the
+          // journal append lock against the same fresh tally the ceiling refuses on, so it already
+          // accounts for every concurrent apply that committed while this one was in the engine —
+          // which the pre-dispatch `localRemainingTokens` above cannot, since all of them read it.
+          //
+          // COHERENCE GATE: a remainder above the total, or a zero total, is a lease the server should
+          // never have signed. Rendering `2.1M/2M left` off one would be worse than rendering nothing,
+          // so an incoherent pair is dropped rather than clamped into a number that looks authoritative.
+          const remaining = Math.max(0, meterResult.remainingTokens);
+          if (periodAllowanceTokens > 0 && remaining <= periodAllowanceTokens) {
+            allowanceSnapshot = {
+              remaining_tokens: remaining,
+              period_total_tokens: periodAllowanceTokens,
+              ...(periodId !== "" ? { period_id: periodId } : {})
+            };
+          }
         }
       }
       const scopeLine = authorization.scope.repo
@@ -1426,9 +1824,17 @@ async function resolveStoredAuthorizationApply(
           mutatedBody: Buffer.from(decision.mutatedRequestBody, "utf8"),
           recoveryId,
           appliedComponents,
+          outputShapingState,
+          outputShapingPolicyVersion,
+          outputShapingRegime,
+          lcmOutcome,
           composedInputEstimate: artifacts.composed_input_estimate,
           authorization: { id: authorization.id, scopeLine, gatesPassed },
-          ...(allowancePause ? { allowancePause } : {})
+          ...(allowancePause ? { allowancePause } : {}),
+          // A pause set under the lock (the concurrent-ceiling branch above) supersedes a snapshot
+          // taken earlier in the same turn: the two describe the same allowance, and the line must
+          // not both count down and announce a pause.
+          ...(allowanceSnapshot && !allowancePause ? { allowanceSnapshot } : {})
         }
       };
     } finally {
@@ -1458,12 +1864,14 @@ async function recordAutoApplyActivity(params: {
   log: (line: string) => void;
 }): Promise<void> {
   const { apply } = params;
-  if (!apply.plan || !apply.recoveryId || !apply.authorization) return;
+  // Mirrors the caller's guard: an input plan, or an output component that ran without one.
+  const shapedOnly = apply.plan === undefined && apply.appliedComponents?.includes("output-shaping") === true;
+  if ((!apply.plan && !shapedOnly) || !apply.recoveryId || !apply.authorization) return;
   const result = await appendAutoApplyActivityEvent({
     cwd: params.options.cwd ?? process.cwd(),
     workflow: params.workflow,
     ...(params.requestModel ? { requestModel: params.requestModel } : {}),
-    plan: apply.plan,
+    ...(apply.plan ? { plan: apply.plan } : {}),
     recoveryId: apply.recoveryId,
     authorizationId: apply.authorization.id,
     authorizationScopeLine: apply.authorization.scopeLine,
@@ -1609,8 +2017,16 @@ async function recordApplyReceiptFor(params: {
   responseTail: string;
   usageUnavailableReason?: string;
   requestModel?: string;
+  /** Device-local keyed hash of the tool session id; recorded on every receipt, both modes. */
+  sessionCorrelationId?: string;
+  /** When the gateway received the request; the run-membership timestamp (see `GatewayReceipt`). */
+  requestStartedAt?: string;
+  /** The engine's LCM outcome when the stored path declined after the engine ran; `apply` wins when it carries one. */
+  lcmOutcome?: { kind: string; reason: string };
   proofRunId?: string;
   proofVariant?: "baseline" | "compacted";
+  /** The route this turn was forwarded on, resolved once per request by `upstreamRouteTypeFor`. */
+  upstreamRouteType: "api-key" | "subscription";
   log: (line: string) => void;
 }): Promise<void> {
   try {
@@ -1619,6 +2035,9 @@ async function recordApplyReceiptFor(params: {
       openAiBreakdownFromNormalizedUsage(params.adapter.extractUsage(params.responseTail)),
       params.usageUnavailableReason
     );
+    // The applied outcome's own outcome first; the engine's declined outcome only when the apply
+    // that followed (an in-process shaping fallback) carries none.
+    const lcmOutcome = params.apply.lcmOutcome ?? params.lcmOutcome;
     const receipt = buildApplyReceipt({
       provider: params.options.provider,
       endpoint: params.endpoint,
@@ -1631,10 +2050,24 @@ async function recordApplyReceiptFor(params: {
       ...(params.apply.recoveryId ? { recoveryId: params.apply.recoveryId } : {}),
       ...(params.apply.authorization ? { authorizationId: params.apply.authorization.id } : {}),
       ...(params.apply.appliedComponents ? { appliedComponents: params.apply.appliedComponents } : {}),
+      ...(params.apply.outputShapingState ? { outputShapingState: params.apply.outputShapingState } : {}),
+      ...(params.apply.outputShapingPolicyVersion
+        ? { outputShapingPolicyVersion: params.apply.outputShapingPolicyVersion }
+        : {}),
+      ...(params.apply.outputShapingRegime ? { outputShapingRegime: params.apply.outputShapingRegime } : {}),
+      ...(lcmOutcome ? { lcmOutcome } : {}),
       ...(params.apply.composedInputEstimate ? { composedInputEstimate: params.apply.composedInputEstimate } : {}),
       ...(params.apply.failClosedReason ? { failClosedReason: params.apply.failClosedReason } : {}),
       ...(params.apply.allowancePause ? { allowancePause: params.apply.allowancePause } : {}),
+      ...(params.apply.allowanceSnapshot ? { allowanceSnapshot: params.apply.allowanceSnapshot } : {}),
+      // The route this turn was actually forwarded on, from the same expression the usage debit uses.
+      // It rides on EVERY apply receipt, not only a metered one: the cost clause it gates is rendered
+      // from the receipt alone, including on a replay months later, and a receipt that records no
+      // route suppresses the clause rather than assuming the billed one.
+      upstreamRouteType: params.upstreamRouteType,
       ...(params.requestModel ? { requestModel: params.requestModel } : {}),
+      ...(params.sessionCorrelationId ? { sessionCorrelationId: params.sessionCorrelationId } : {}),
+      ...(params.requestStartedAt ? { requestStartedAt: params.requestStartedAt } : {}),
       ...(params.proofRunId ? { proofRunId: params.proofRunId } : {}),
       ...(params.proofVariant ? { proofVariant: params.proofVariant } : {})
     });
@@ -1662,6 +2095,15 @@ async function recordReceipt(params: {
   /** Present when the usage-parsing copy could not be decompressed; the honest `unavailable` reason. */
   usageUnavailableReason?: string;
   requestModel?: string;
+  /** Device-local keyed hash of the tool session id; recorded on every receipt, both modes. */
+  sessionCorrelationId?: string;
+  /** When the gateway received the request; the run-membership timestamp (see `GatewayReceipt`). */
+  requestStartedAt?: string;
+  /** Fixed-vocabulary LCM outcome when the engine ran for this turn and applied nothing. */
+  lcmOutcome?: { kind: string; reason: string };
+  /** Output-shaping provenance for the forwarded bytes; see `buildGatewayReceipt`. */
+  outputShapingState?: "attached-this-pass" | "already-active" | "absent";
+  outputShapingPolicyVersion?: string;
   proofRunId?: string;
   proofVariant?: "baseline" | "compacted";
   log: (line: string) => void;
@@ -1679,6 +2121,13 @@ async function recordReceipt(params: {
       upstreamStatus: params.upstreamStatus,
       usage,
       ...(params.requestModel ? { requestModel: params.requestModel } : {}),
+      ...(params.sessionCorrelationId ? { sessionCorrelationId: params.sessionCorrelationId } : {}),
+      ...(params.requestStartedAt ? { requestStartedAt: params.requestStartedAt } : {}),
+      ...(params.lcmOutcome ? { lcmOutcome: params.lcmOutcome } : {}),
+      ...(params.outputShapingState ? { outputShapingState: params.outputShapingState } : {}),
+      ...(params.outputShapingPolicyVersion
+        ? { outputShapingPolicyVersion: params.outputShapingPolicyVersion }
+        : {}),
       ...(params.proofRunId ? { proofRunId: params.proofRunId } : {}),
       ...(params.proofVariant ? { proofVariant: params.proofVariant } : {})
     });

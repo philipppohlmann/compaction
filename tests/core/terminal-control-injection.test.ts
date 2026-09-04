@@ -32,7 +32,7 @@ import {
 } from "../../src/core/terminal-hyperlink.js";
 import { proUrl, PRO_URL_ENV, PRO_PATH } from "../../src/core/pro-destination.js";
 import { DEFAULT_WEB_ORIGIN, WEB_ORIGIN_ENV } from "../../src/core/web-origin.js";
-import { upgradeNoticeLines, validResetsOn, UPGRADE_CTA_LABEL } from "../../src/core/upgrade-cta.js";
+import { COMMUNITY_LIMIT_CLAUSE, upgradeNoticeLines, validResetsOn, UPGRADE_CTA_LABEL } from "../../src/core/upgrade-cta.js";
 import { receiptCeiling, formatReceiptLine } from "../../src/core/gateway/receipt-line.js";
 import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import http from "node:http";
@@ -156,7 +156,7 @@ describe("a hostile resets_on read back off a persisted receipt", () => {
     expect(ceiling?.reason).toBe("insufficient");
   });
 
-  it("yields a per-turn line that states the pause with NO date and NO injected sequence", () => {
+  it("yields a per-turn line that states the ceiling with NO date and NO injected sequence", () => {
     const ceiling = receiptCeiling(hostileReceipt, plain);
     const line = formatReceiptLine({
       outputTokens: 20,
@@ -166,9 +166,34 @@ describe("a hostile resets_on read back off a persisted receipt", () => {
       ctaEnv: plain
     });
     expect(line).not.toMatch(ANY_CONTROL);
-    expect(line).toContain("paused");
+    // THE FACT AND THE WAY OUT BOTH SURVIVE the rejected date — which is the property this suite
+    // guards. The clause degrades to its UNDATED form (`Community limit reached`) rather than
+    // printing a fragment of a value that did not parse.
+    expect(line).toContain(COMMUNITY_LIMIT_CLAUSE);
     expect(line).toContain(`${UPGRADE_CTA_LABEL}: ${CANONICAL_PRO_URL}`);
     expect(line).not.toContain("evil.example");
+  });
+
+  /**
+   * THE SECOND GATE, asserted because the first one no longer stands alone. The primary line PRINTS
+   * the reset date now, so the render path is a place a persisted string reaches a terminal — and a
+   * caller that sets `allowanceResetsOn` without going through `receiptCeiling` (three builders take
+   * it as a plain parameter) would bypass the read-time validation entirely. The clause builder
+   * re-validates, so the hostile value is refused at the point of RENDER as well as at the read.
+   */
+  it("refuses a hostile date handed straight to the renderer, bypassing the receipt read", () => {
+    const line = formatReceiptLine({
+      outputTokens: 20,
+      tier: "observe",
+      allowancePauseReason: "insufficient",
+      // NOT filtered through `receiptCeiling` — this is the unguarded caller shape.
+      allowanceResetsOn: hostile,
+      ctaEnv: plain
+    }) as string;
+    expect(line).not.toMatch(ANY_CONTROL);
+    expect(line).not.toContain("evil.example");
+    expect(line).toContain(COMMUNITY_LIMIT_CLAUSE);
+    expect(line).toContain(`${UPGRADE_CTA_LABEL}: ${CANONICAL_PRO_URL}`);
   });
 
   it("produces no resume sentence in the multi-line notice, and keeps the real destination", () => {

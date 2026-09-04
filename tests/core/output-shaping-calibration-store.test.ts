@@ -1,250 +1,176 @@
 import { describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  addOutputShapingAbRun,
-  initOutputShapingAbExperiment,
-  summarizeOutputShapingAb,
-  type OutputShapingAbExperiment,
-  type OutputShapingAbRun,
-  type OutputShapingAbSummary
-} from "../../src/core/output-shaping-ab.js";
-import {
-  DEFAULT_OUTPUT_SHAPING_RATE,
-  calibratedRate,
+  OUTPUT_SHAPING_CALIBRATION_SCHEMA,
+  bestApplicableOutputCalibration,
   calibrationStorePath,
   emptyCalibration,
-  foldAbSummary,
+  foldCalibrationConfirmation,
   loadCalibration,
-  updateCalibrationFromAbSummary
+  mergeOutputCalibrations,
+  saveCalibration,
+  updateCalibrationFromConfirmation,
+  validateOutputCalibrationConfirmation
 } from "../../src/core/output-shaping-calibration-store.js";
+import {
+  TEST_OUTPUT_POLICY_VERSION,
+  confirmedOutputCalibration
+} from "../helpers/output-calibration-fixture.js";
 
-function providerRun(arm: "control" | "treatment", outputTokens: number): OutputShapingAbRun {
-  return {
-    arm,
-    outputTokens,
-    inputTokens: 1000,
-    providerReported: true,
-    tokenSource: "provider-reported",
-    ...(arm === "treatment"
-      ? { policyFamily: "output_shaping" as const, policyNames: ["concise_response"], evalMarkersPreserved: true }
-      : {})
-  };
-}
+const QUERY = {
+  policyVersion: TEST_OUTPUT_POLICY_VERSION,
+  provider: "anthropic",
+  model: "claude-opus-5"
+} as const;
 
-/** Build a provider-reported A/B summary with the given experiment id and per-arm output means. */
-function summaryFor(id: string, control: number, treatment: number): OutputShapingAbSummary {
-  let exp: OutputShapingAbExperiment = initOutputShapingAbExperiment({ experimentId: id, taskShape: "code" });
-  exp = addOutputShapingAbRun(exp, providerRun("control", control));
-  exp = addOutputShapingAbRun(exp, providerRun("treatment", treatment));
-  return summarizeOutputShapingAb(exp);
-}
-
-describe("output-shaping calibration store - LEARNING (rate tightens as samples accumulate)", () => {
-  it("empty store returns the SHIPPED DEFAULT PRIOR, not silence", () => {
-    // Changed contract. An empty store used to be `calibrated: false`, which meant the per-turn line
-    // degraded to a bare `output N` on EVERY fresh install -- the designed line was unreachable until
-    // a user ran a manual A/B. The prior is a conservative floor from the two coding-task A/Bs in the
-    // evidence matrix (47.5% Codex, 53.3% Claude), taken at the lower end and rounded down.
-    const rate = calibratedRate(emptyCalibration());
-    expect(rate.calibrated).toBe(true);
-    expect(rate.rate).toBe(DEFAULT_OUTPUT_SHAPING_RATE);
-    expect(rate.basis, "provenance is explicit, not inferred from the count").toBe("default-prior");
-    expect(rate.sampleCount, "no experiment backs it, and it says so").toBe(0);
+describe("output-shaping calibration v3 exact applicability", () => {
+  it("resolves an exact policy/provider/model/regime match and no mismatch", () => {
+    const artifact = confirmedOutputCalibration({ regime: "default-shapeable" });
+    const store = foldCalibrationConfirmation(emptyCalibration(), artifact);
+    expect(bestApplicableOutputCalibration(store, { ...QUERY, regime: "default-shapeable" })?.rate).toBeCloseTo(0.4);
+    const differentPolicyVersion = `${TEST_OUTPUT_POLICY_VERSION.slice(0, -1)}${TEST_OUTPUT_POLICY_VERSION.endsWith("0") ? "1" : "0"}`;
+    expect(bestApplicableOutputCalibration(store, { ...QUERY, policyVersion: differentPolicyVersion, regime: "default-shapeable" })).toBeUndefined();
+    expect(bestApplicableOutputCalibration(store, { ...QUERY, provider: "openai", regime: "default-shapeable" })).toBeUndefined();
+    expect(bestApplicableOutputCalibration(store, { ...QUERY, model: "claude-sonnet-5", regime: "default-shapeable" })).toBeUndefined();
+    expect(bestApplicableOutputCalibration(store, QUERY), "missing regime cannot borrow regime-specific evidence").toBeUndefined();
   });
 
-  it("the prior sits at or below BOTH measurements it is drawn from", () => {
-    // The guard against the number drifting upward over time: it is a floor, not a midpoint, and
-    // certainly not the headline 88.6% from the verbose-prose family.
-    expect(DEFAULT_OUTPUT_SHAPING_RATE).toBeLessThanOrEqual(0.475); // exp-cc-output-006, Codex coding
-    expect(DEFAULT_OUTPUT_SHAPING_RATE).toBeLessThanOrEqual(0.533); // exp-cc-output-004, Claude coding
-    expect(DEFAULT_OUTPUT_SHAPING_RATE).toBeGreaterThan(0);
-  });
-
-  it("ONE real A/B replaces the prior outright — never blended with it", () => {
-    // The user's own traffic beats a general figure from ours. If this ever averaged the two, a device
-    // that measured 10% would still be shown something closer to 47%.
-    const cal = foldAbSummary(emptyCalibration(), summaryFor("e1", 1000, 900)); // a measured 10%
-    const rate = calibratedRate(cal);
-    expect(rate.basis).toBe("measured");
-    expect(rate.rate).toBeCloseTo(0.1, 5);
-    expect(rate.rate).not.toBeCloseTo(DEFAULT_OUTPUT_SHAPING_RATE, 2);
-  });
-
-  it("a device that MEASURED no benefit is not overwritten by the prior", () => {
-    // The sharpest case. An unfavourable A/B leaves the derived rate outside (0,1), so the line falls
-    // back to a bare count -- it must NOT fall back to our default, which would silently overrule the
-    // device's own finding that shaping does not help here.
-    const worse = foldAbSummary(emptyCalibration(), summaryFor("e1", 600, 1000));
-    const rate = calibratedRate(worse);
-    expect(rate.calibrated).toBe(false);
-    expect(rate.rate).toBeUndefined();
-  });
-
-  it("one real A/B → calibrated rate = the measured reduction fraction; sampleCount = 1", () => {
-    const cal = foldAbSummary(emptyCalibration(), summaryFor("e1", 1000, 600));
-    const rate = calibratedRate(cal);
-    expect(rate.calibrated).toBe(true);
-    expect(rate.rate).toBeCloseTo(0.4, 5); // (1000-600)/1000
-    expect(rate.sampleCount).toBe(1);
-    expect(rate.totalTurns).toBe(2);
-  });
-
-  it("adding more A/B experiments UPDATES the rate (the learning claim) and grows the sample count", () => {
-    // First experiment: 40% reduction (1000→600). Rate = 0.4.
-    const cal1 = foldAbSummary(emptyCalibration(), summaryFor("e1", 1000, 600));
-    expect(calibratedRate(cal1).rate).toBeCloseTo(0.4, 5);
-
-    // Second experiment with a DIFFERENT reduction (1000→900 = 10%). The sample-weighted rate must MOVE
-    // toward the combined evidence. Each experiment has one turn per arm, so w=2 for both:
-    // totals control = 1000*2 + 1000*2 = 4000, treatment = 600*2 + 900*2 = 3000 → rate = 1000/4000 = 0.25.
-    const cal2 = foldAbSummary(cal1, summaryFor("e2", 1000, 900));
-    const rate2 = calibratedRate(cal2);
-    expect(rate2.sampleCount).toBe(2);
-    expect(rate2.rate).toBeCloseTo(0.25, 5);
-    // It genuinely CHANGED from the 1-sample estimate — this is the learning behavior.
-    expect(rate2.rate).not.toBeCloseTo(0.4, 3);
-  });
-
-  it("turn-weighting: an experiment with more turns pulls the estimate more", () => {
-    // e1 is a single control/treatment pair (n=1 each): 1000→600.
-    const cal1 = foldAbSummary(emptyCalibration(), summaryFor("e1", 1000, 600));
-    // e2 has three control + three treatment runs (n=3 each) at 1000→900. Its mean outputs are 1000/900,
-    // but its weight is its total turns (w=6 vs e1's w=2), so it dominates:
-    // totals control = 1000*2 + 1000*6 = 8000, treatment = 600*2 + 900*6 = 6600 → rate = 1400/8000 = 0.175.
-    // This case is BALANCED (3 vs 3), which is exactly why it passed under v1's broken weighting too.
-    let e2: OutputShapingAbExperiment = initOutputShapingAbExperiment({ experimentId: "e2", taskShape: "code" });
-    for (let i = 0; i < 3; i++) e2 = addOutputShapingAbRun(e2, providerRun("control", 1000));
-    for (let i = 0; i < 3; i++) e2 = addOutputShapingAbRun(e2, providerRun("treatment", 900));
-    const cal2 = foldAbSummary(cal1, summarizeOutputShapingAb(e2));
-    expect(calibratedRate(cal2).rate).toBeCloseTo(0.175, 5);
-  });
-
-  it("re-adding the same experiment id is idempotent (no double-count)", () => {
-    const first = foldAbSummary(emptyCalibration(), summaryFor("e1", 1000, 600));
-    const again = foldAbSummary(first, summaryFor("e1", 1000, 600));
-    expect(again).toBe(first); // unchanged reference: the fold was a no-op
-    expect(calibratedRate(again).sampleCount).toBe(1);
-  });
-
-  it("an INCOMPLETE A/B (missing arm / no provider pair) never moves the rate", () => {
-    // Only a control arm: no treatment turns, so there is no pair to compare and nothing to fold.
-    const controlOnly = initOutputShapingAbExperiment({ experimentId: "e-partial", taskShape: "code" });
-    const oneArm = foldAbSummary(emptyCalibration(), summarizeOutputShapingAb(addOutputShapingAbRun(controlOnly, providerRun("control", 1000))));
-    expect(oneArm.sampleCount).toBe(0);
-    // Still zero folds, so the device is still on the shipped prior -- an incomplete experiment must
-    // not be able to masquerade as this device's own measurement.
-    expect(calibratedRate(oneArm).basis).toBe("default-prior");
-  });
-
-  it("an UNFAVOURABLE A/B is folded in as evidence — it is not discarded (survivorship bias, v1)", () => {
-    // v1 dropped every experiment where `before <= after`, so the running rate was a mean over WINS only
-    // and could never be dragged down by a real result showing shaping did not help. It is real evidence.
-    const worse = foldAbSummary(emptyCalibration(), summaryFor("e1", 600, 1000));
-    expect(worse.sampleCount, "the experiment was recorded, not silently dropped").toBe(1);
-    expect(worse.experimentIds).toEqual(["e1"]);
-    // It is folded in, and the derived rate is correctly refused: the guard is downstream, in
-    // `calibratedRate`, not an upstream filter that hides the evidence.
-    expect(calibratedRate(worse).calibrated).toBe(false);
-  });
-
-  it("an unfavourable result DRAGS THE RATE DOWN instead of vanishing", () => {
-    // A 40% win alone.
-    const win = foldAbSummary(emptyCalibration(), summaryFor("e1", 1000, 600));
-    expect(calibratedRate(win).rate).toBeCloseTo(0.4, 5);
-    // Now a genuine null result (shaping changed nothing: 1000→1000). Under v1 this vanished and the rate
-    // stayed 0.4 — overstating the saving. It must now pull the aggregate toward zero:
-    // totals control = 1000*2 + 1000*2 = 4000, treatment = 600*2 + 1000*2 = 3200 → rate = 800/4000 = 0.2.
-    const withNull = foldAbSummary(win, summaryFor("e2", 1000, 1000));
-    expect(withNull.sampleCount).toBe(2);
-    expect(calibratedRate(withNull).rate).toBeCloseTo(0.2, 5);
-    expect(calibratedRate(withNull).rate).toBeLessThan(calibratedRate(win).rate as number);
-  });
-
-  it("UNBALANCED arms keep the measured sign: a 40% reduction can never fold in as an increase", () => {
-    // The v1 defect: control was weighted by nControl and treatment by nTreatment, then the two sums were
-    // divided. With 3 control turns and 6 treatment turns that yielded totals 3000/3600 — a 20% INCREASE
-    // from an experiment that measured a 40% REDUCTION. Balanced arms cancelled the error, which is exactly
-    // why every pre-existing test missed it.
-    let exp: OutputShapingAbExperiment = initOutputShapingAbExperiment({ experimentId: "e-unbalanced", taskShape: "code" });
-    for (let i = 0; i < 3; i++) exp = addOutputShapingAbRun(exp, providerRun("control", 1000));
-    for (let i = 0; i < 6; i++) exp = addOutputShapingAbRun(exp, providerRun("treatment", 600));
-    const cal = foldAbSummary(emptyCalibration(), summarizeOutputShapingAb(exp));
-    const rate = calibratedRate(cal);
-    expect(rate.calibrated).toBe(true);
-    // The single experiment's own reduction fraction, unchanged by its arm sizes.
-    expect(rate.rate).toBeCloseTo(0.4, 5);
-    expect(rate.totalTurns).toBe(9);
-  });
-
-  it("the aggregate never exceeds the BEST measured per-experiment reduction (convexity)", () => {
-    // The rate is a convex combination of the per-experiment fractions with non-negative weights, so it can
-    // never claim more reduction than the best experiment actually measured. Fuzzed, because this is the
-    // invariant that would catch a future weighting change silently inflating the estimate.
-    let cal = emptyCalibration();
-    let best = -Infinity;
-    // Deterministic pseudo-random (no Math.random: reproducible failures).
-    let seed = 12345;
-    const next = (): number => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
-    for (let i = 0; i < 300; i++) {
-      const control = Math.floor(next() * 2000) + 50;
-      const treatment = Math.floor(next() * 2000) + 1;
-      cal = foldAbSummary(cal, summaryFor(`e${i}`, control, treatment));
-      best = Math.max(best, (control - treatment) / control);
-      const rate = calibratedRate(cal);
-      if (rate.calibrated && rate.rate !== undefined) {
-        expect(rate.rate).toBeLessThanOrEqual(best + 1e-12);
-      }
+  it("rejects known unknown-model sentinels instead of borrowing a known model", () => {
+    const store = foldCalibrationConfirmation(emptyCalibration(), confirmedOutputCalibration());
+    for (const model of ["unknown", "codex-unknown-model", "cursor-unknown-model", "openai-agents-sdk-unknown-model"]) {
+      expect(bestApplicableOutputCalibration(store, { ...QUERY, model })).toBeUndefined();
+      expect(validateOutputCalibrationConfirmation(confirmedOutputCalibration({ model }))).toBeUndefined();
     }
   });
 
-  it("is CONTENT-FREE: the persisted store holds only counts/rates/ids, no prompt or response bytes", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "cal-content-"));
+  it("rejects weak, inconclusive, failed-quality, refusal, truncation, and non-reduction artifacts", () => {
+    const mutations: Array<(artifact: ReturnType<typeof confirmedOutputCalibration>) => void> = [
+      (a) => { a.nControl = 2; },
+      (a) => { a.intervalLow = 0; },
+      (a) => { a.controlFullContentSufficiency = "fail" as never; },
+      (a) => { a.treatmentFullContentSufficiency = "fail" as never; },
+      (a) => { a.refused = true as never; },
+      (a) => { a.truncated = true as never; },
+      (a) => { a.totalTreatmentOutputTokens = a.totalControlOutputTokens; }
+    ];
+    for (const mutate of mutations) {
+      const artifact = confirmedOutputCalibration();
+      mutate(artifact);
+      expect(validateOutputCalibrationConfirmation(artifact)).toBeUndefined();
+      expect(foldCalibrationConfirmation(emptyCalibration(), artifact).records).toEqual([]);
+    }
+  });
+
+  it("keeps a 40% rate with unbalanced arms by applying one shared experiment weight", () => {
+    const artifact = confirmedOutputCalibration({
+      control: [1000, 1000, 1000],
+      treatment: [600, 600, 600, 600, 600, 600]
+    });
+    const match = bestApplicableOutputCalibration(
+      foldCalibrationConfirmation(emptyCalibration(), artifact),
+      QUERY
+    );
+    expect(match?.rate).toBeCloseTo(0.4);
+    expect(match?.nControl).toBe(3);
+    expect(match?.nTreatment).toBe(6);
+  });
+
+  it("deduplicates one confirmation and pools distinct exact-key evidence by token quantities", () => {
+    const first = confirmedOutputCalibration({ confirmedAt: "2026-09-03T00:00:00.000Z" });
+    const second = confirmedOutputCalibration({
+      control: [2000, 2000, 2000],
+      treatment: [1000, 1000, 1000],
+      confirmedAt: "2026-09-04T00:00:00.000Z"
+    });
+    const once = foldCalibrationConfirmation(emptyCalibration(), first);
+    expect(foldCalibrationConfirmation(once, first)).toEqual(once);
+    const pooled = foldCalibrationConfirmation(once, second);
+    const match = bestApplicableOutputCalibration(pooled, QUERY)!;
+    // Equal shared weights: pooled control=1500, treatment=800 => 46.666…%, not averaged display percentages.
+    expect(match.rate).toBeCloseTo((1500 - 800) / 1500);
+    expect(match.evidenceCount).toBe(2);
+  });
+
+  it("treats schema v2 as absent and never migrates or blends it", async () => {
+    const v2 = JSON.stringify({
+      schema: "output-shaping.calibration.v2",
+      sampleCount: 99,
+      totalControlOutputTokens: 1000,
+      totalTreatmentOutputTokens: 1
+    });
+    const loaded = await loadCalibration({} as NodeJS.ProcessEnv, async () => v2);
+    expect(loaded.schema).toBe(OUTPUT_SHAPING_CALIBRATION_SCHEMA);
+    expect(loaded.records).toEqual([]);
+  });
+
+  it("persists a closed content-free artifact with no prompt/output/session/path/credential fields", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "output-calibration-v3-"));
     const env = { COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv;
     try {
-      await updateCalibrationFromAbSummary(summaryFor("exp-alpha", 1000, 600), env);
+      await updateCalibrationFromConfirmation(confirmedOutputCalibration(), env);
       const raw = readFileSync(calibrationStorePath(env), "utf8");
+      expect(raw).not.toMatch(/prompt|response|session|credential|api[_-]?key|\/Users\//i);
       const parsed = JSON.parse(raw) as Record<string, unknown>;
-      expect(Object.keys(parsed).sort()).toEqual(
-        [
-          "experimentIds",
-          "sampleCount",
-          "schema",
-          "totalControlOutputTokens",
-          "totalTreatmentOutputTokens",
-          "totalTurns",
-          "updatedAt"
-        ].sort()
-      );
-      // Every value is a primitive number/string or an array of opaque id strings — never nested content.
-      expect(parsed.experimentIds).toEqual(["exp-alpha"]);
+      expect(Object.keys(parsed).sort()).toEqual(["records", "schema", "updatedAt"]);
+      expect((parsed.records as unknown[])).toHaveLength(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("updateCalibrationFromAbSummary persists and accumulates across calls (round-trip learning)", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "cal-persist-"));
+  it("projects unknown fields out across validation, fold, load, merge, and save boundaries", async () => {
+    const tripwires = {
+      rawPrompt: "PROMPT_TRIPWIRE",
+      rawOutput: "OUTPUT_TRIPWIRE",
+      rawSessionId: "SESSION_TRIPWIRE",
+      credential: "CREDENTIAL_TRIPWIRE",
+      localPath: "/private/tmp/TRACE_PATH_TRIPWIRE"
+    };
+    const confirmation = { ...confirmedOutputCalibration(), ...tripwires };
+    const validated = validateOutputCalibrationConfirmation(confirmation);
+    expect(validated).toBeDefined();
+    expect(JSON.stringify(validated)).not.toMatch(/TRIPWIRE|rawPrompt|rawOutput|rawSessionId|credential|localPath/);
+
+    const first = foldCalibrationConfirmation(emptyCalibration(), confirmation);
+    const dirty = {
+      ...first,
+      ...tripwires,
+      records: first.records.map((record) => ({ ...record, ...tripwires }))
+    };
+    const second = confirmedOutputCalibration({
+      control: [2000, 2000, 2000],
+      treatment: [1000, 1000, 1000],
+      confirmedAt: "2026-09-04T00:00:00.000Z"
+    });
+    const folded = foldCalibrationConfirmation(dirty, second);
+    const merged = mergeOutputCalibrations(dirty, emptyCalibration());
+    for (const value of [folded, merged]) {
+      expect(JSON.stringify(value)).not.toMatch(/TRIPWIRE|rawPrompt|rawOutput|rawSessionId|credential|localPath/);
+    }
+
+    const dir = mkdtempSync(join(tmpdir(), "output-calibration-closed-shapes-"));
     const env = { COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv;
     try {
-      const first = await updateCalibrationFromAbSummary(summaryFor("e1", 1000, 600), env);
-      expect(first.updated).toBe(true);
-      expect(calibratedRate(first.calibration).rate).toBeCloseTo(0.4, 5);
+      writeFileSync(calibrationStorePath(env), JSON.stringify(dirty));
+      const loaded = await loadCalibration(env);
+      expect(JSON.stringify(loaded)).not.toMatch(/TRIPWIRE|rawPrompt|rawOutput|rawSessionId|credential|localPath/);
+      await saveCalibration(dirty, env);
+      expect(readFileSync(calibrationStorePath(env), "utf8")).not.toMatch(
+        /TRIPWIRE|rawPrompt|rawOutput|rawSessionId|credential|localPath/
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
-      const second = await updateCalibrationFromAbSummary(summaryFor("e2", 1000, 900), env);
-      expect(second.updated).toBe(true);
-      expect(calibratedRate(second.calibration).rate).toBeCloseTo(0.25, 5);
-
-      // Re-loading from disk reflects the accumulated state (persistence, not just in-memory).
-      const reloaded = await loadCalibration(env);
-      expect(reloaded.sampleCount).toBe(2);
-      expect(calibratedRate(reloaded).rate).toBeCloseTo(0.25, 5);
-
-      // A repeated fold of e1 is a no-op on disk too.
-      const repeat = await updateCalibrationFromAbSummary(summaryFor("e1", 1000, 600), env);
-      expect(repeat.updated).toBe(false);
-      expect((await loadCalibration(env)).sampleCount).toBe(2);
+  it("fails open to absent on malformed v3 records", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "output-calibration-bad-"));
+    const env = { COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv;
+    try {
+      writeFileSync(calibrationStorePath(env), JSON.stringify({ schema: OUTPUT_SHAPING_CALIBRATION_SCHEMA, records: [{}] }));
+      expect((await loadCalibration(env)).records).toEqual([]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

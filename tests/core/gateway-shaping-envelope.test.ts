@@ -9,10 +9,8 @@ import { taskAwareGate } from "../../src/core/gateway/output-shaping-task-classi
 /**
  * OUTPUT-SHAPING REACHABILITY.
  *
- * Output shaping is the base capability on every plan, but it was gated behind the INPUT-compaction
- * classifier, which fails closed on `tools`, on multimodal content and on a block-array `system`.
- * Real agent traffic is tool-bearing on essentially every turn, so shaping was unreachable in
- * practice: measured 0/10 shaped on a real captured Claude Code session.
+ * Output shaping is the base capability on every plan, and its attachment boundary is independent
+ * from input compaction's stricter request classifier.
  *
  * The rule these tests pin: the REFUSAL boundary is widened for envelopes we can attach to safely;
  * the MUTATION boundary is not widened at all. Shaping only ever ADDS its instruction. Anything it
@@ -142,9 +140,8 @@ describe("the task gate holds on per-turn signals only", () => {
   });
 
   it("does NOT hold on thinking:adaptive or output_config.effort - they are session settings, not task signals", () => {
-    // Measured on a real 10-turn Claude Code session: both fields were identical on every turn,
-    // from "reply OK" to a multi-file edit. Holding on them would suppress shaping on ~100% of
-    // real traffic, which is the reachability bug this work exists to fix.
+    // These are session capabilities rather than a positive per-turn reasoning request. Holding on
+    // them would suppress every turn inheriting the setting.
     const plan = shapeOf("/v1/messages", base({ thinking: { type: "adaptive", display: "omitted" }, output_config: { effort: "high" } }));
     expect(plan.changed).toBe(true);
   });

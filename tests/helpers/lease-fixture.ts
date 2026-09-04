@@ -52,8 +52,11 @@ export function provisionValidLease(
   );
 
   const now = Date.now();
+  // v2 BY DEFAULT, because that is what the control plane now issues: the signed period TOTAL travels
+  // with the remainder so a countdown has a denominator it did not invent. `allowance_tokens` stays the
+  // remainder every existing override adjusts; the total is separate and defaults to the same 2M limit.
   const payload: LeasePayload = {
-    schema_version: 1,
+    schema_version: 2,
     lease_id: "00000000-0000-0000-0000-0000000000aa",
     account_id: "acct-test",
     device_public_key_hash: publicKeyHash(devicePublicKey),
@@ -63,8 +66,13 @@ export function provisionValidLease(
     expires_at: new Date(now + 24 * 60 * 60 * 1000).toISOString(),
     lease_sequence: 1,
     route_scope: "all",
+    period_allowance_tokens: 2_000_000,
     ...overrides
   };
+  // A caller that deliberately pins v1 gets a REAL v1 lease. The total is a v2-only field — the parser
+  // refuses a v1 payload that carries one — so leaving the default in place would hand such a test an
+  // unparseable lease instead of the older wire format it asked for.
+  if (payload.schema_version === 1) delete payload.period_allowance_tokens;
   writeFileSync(leasePath(env), JSON.stringify({ lease: payload, signature: signLeasePayload(payload, signer.privateKeyPem) }));
 
   // The apply gate also requires the persisted product mode to resolve to `full` (a user in

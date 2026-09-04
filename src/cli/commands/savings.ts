@@ -22,7 +22,6 @@ import {
   measuredPerTurnReduction,
   planLifetimeProjection
 } from "../../core/output-shaping-savings.js";
-import { calibratedRate, updateCalibrationFromAbSummary } from "../../core/output-shaping-calibration-store.js";
 import {
   loadNetBilledCalibration,
   netBilledRate,
@@ -133,51 +132,6 @@ export async function runSavings(options: SavingsOptions): Promise<void> {
 
   const summary = summarizeOutputShapingAb(experiment);
   const reduction = measuredPerTurnReduction(summary);
-
-  // LEARNING loop, run BEFORE the display gate below.
-  //
-  // The display gate returns early on `unavailable`, and one of its `unavailable` reasons is
-  // `outputTokenDelta <= 0` — "shaping did not reduce output on this sample". Folding after it therefore
-  // reproduced, one layer up, exactly the survivorship filter that was just removed from `foldAbSummary`:
-  // an A/B where shaping did not help could never reach the store, so the calibrated rate stayed a mean
-  // over wins only. Refusing to DISPLAY a saving that does not exist is right; refusing to LEARN from the
-  // measurement that says so is not.
-  //
-  // The fold is gated on CONFIDENCE, not on the sign of the result. `review_required` and `unavailable`
-  // stay excluded because they are DATA-QUALITY exclusions — truncation, refusal, or a treatment arm whose
-  // sufficiency check did not cleanly pass, i.e. an output-token count that does not measure what it
-  // appears to. That is a different thing from a clean measurement with an unfavourable result, which now
-  // folds in like any other evidence and can drag the rate down (or below the calibrated floor entirely).
-  //
-  // Content-free + best-effort: a local store IO error never fails the read-only savings view.
-  if (summary.confidence === "observed_not_confirmed" || summary.confidence === "eligible_for_engine_confirmation") {
-    try {
-      const { calibration, updated } = await updateCalibrationFromAbSummary(summary);
-      const rate = calibratedRate(calibration);
-      if (updated && rate.calibrated && rate.rate !== undefined) {
-        console.log(
-          chalk.dim(
-            `  Calibration updated: the per-turn output-saved rate is now ${pct(rate.rate * 100)}% ` +
-              `from ${rate.sampleCount} A/B experiment(s) (${group(rate.totalTurns)} provider-reported turns). ` +
-              `More experiments tighten it.`
-          )
-        );
-      } else if (updated) {
-        // Folded in, but the accumulated evidence does not support a rate — the honest outcome of a null
-        // or unfavourable measurement, and the reason it must be folded rather than dropped.
-        console.log(
-          chalk.dim(
-            `  Calibration updated from ${rate.sampleCount} A/B experiment(s), and still shows no net output ` +
-              `reduction — the per-turn line will show a plain output count, not an estimated saving.`
-          )
-        );
-      } else {
-        console.log(chalk.dim("  Calibration unchanged (this A/B was already folded in, or added no new measured sample)."));
-      }
-    } catch {
-      // Best-effort: the learning update never breaks the read-only savings view.
-    }
-  }
 
   if (reduction.availability === "unavailable") {
     console.log(chalk.yellow("  Measured per-turn reduction: unavailable-until-measured."));

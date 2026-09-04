@@ -3,10 +3,20 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import {
+  ACTIVE_USAGE_METER_VERSION,
+  USAGE_EVENT_SCHEMA_VERSION,
+  USAGE_METER_VERSION,
+  canonicalUsageEventBytes,
+  type UsageEvent
+} from "../../src/core/usage/usage-event.js";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
 import { meterConfirmedApply } from "../../src/core/usage/usage-metering.js";
-import { usageJournalPath } from "../../src/core/usage/usage-journal.js";
+import { USAGE_CHAIN_GENESIS, computeEntryHash, usageJournalPath } from "../../src/core/usage/usage-journal.js";
 import { currentPeriodId } from "../../src/core/entitlement/lease.js";
+import { readStoredCredentials } from "../../src/core/auth/credentials.js";
+import { signDetached } from "../../src/core/crypto/ed25519.js";
+import { publicKeyHash } from "../../src/core/crypto/key-hash.js";
 import { generateDeviceKeyPair } from "../../src/core/auth/device-flow.js";
 import { proUrl } from "../../src/core/pro-destination.js";
 
@@ -42,9 +52,10 @@ describe.runIf(CLI_BUILT)("`compaction usage` output honesty", () => {
         provider: "openai",
         periodId: currentPeriodId(),
         allowanceTokens: 2_000_000,
-        receiptId: "rec-cli",
-        meterVersion: "optimized-input-v1",
+        recoveryId: "rec-cli",
+        meterVersion: ACTIVE_USAGE_METER_VERSION,
         meteredOptimizedInputTokens: 1234,
+        estimatedInputTokensBefore: 1734,
         estimatedInputTokensAfter: 500,
         preMutationBody: "x".repeat(2000)
       },
@@ -74,6 +85,71 @@ describe.runIf(CLI_BUILT)("`compaction usage` output honesty", () => {
     expect(out).not.toContain(entry.event_id);
     expect(out).not.toContain(entry.lease_id);
     expect(out).not.toContain(entry.device_id);
+  });
+
+  /** A mixed-version period renders only the active removal-denominated meter. */
+  it("a period spanning the meter change reports the ACTIVE unit only — never a two-unit sum", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "usage-cli-mixed-"));
+    dirs.push(dir);
+    const env = provisionValidLease(dir) as NodeJS.ProcessEnv;
+    const credentials = readStoredCredentials(env);
+    if (!credentials) throw new Error("fixture: credentials");
+
+    // A valid synthetic signed v1 history entry keeps this test on the unit-selection path rather
+    // than the integrity-failure path.
+    const legacy: UsageEvent = {
+      schema_version: USAGE_EVENT_SCHEMA_VERSION,
+      event_id: "dddddddd-0000-4000-8000-000000000001",
+      receipt_id: "rec-legacy",
+      lease_id: "lease-legacy",
+      lease_sequence: 0,
+      device_id: credentials.device_id,
+      device_key_hash: publicKeyHash(credentials.device_public_key),
+      period_id: currentPeriodId(),
+      occurred_at: new Date().toISOString(),
+      route_type: "api-key",
+      workflow: "claude-code",
+      provider: "anthropic",
+      meter_version: USAGE_METER_VERSION,
+      optimized_input_tokens: 800,
+      estimated_input_tokens_after: 790
+    };
+    const signature = signDetached(canonicalUsageEventBytes(legacy), credentials.device_private_key_pem);
+    const entryHash = computeEntryHash(legacy, signature, USAGE_CHAIN_GENESIS);
+    writeFileSync(
+      usageJournalPath(env),
+      `${JSON.stringify({ ...legacy, device_event_signature: signature, prev_hash: USAGE_CHAIN_GENESIS, entry_hash: entryHash })}\n`,
+      { encoding: "utf8", mode: 0o600 }
+    );
+
+    // ...and the first v2 debit lands beside it, through the real metering path.
+    const result = await meterConfirmedApply(
+      {
+        routeType: "api-key",
+        workflow: "claude-code",
+        provider: "anthropic",
+        periodId: currentPeriodId(),
+        allowanceTokens: 2_000_000,
+        recoveryId: "rec-first-v2",
+        meterVersion: ACTIVE_USAGE_METER_VERSION,
+        meteredOptimizedInputTokens: 30,
+        estimatedInputTokensBefore: 1000,
+        estimatedInputTokensAfter: 970,
+        preMutationBody: "x".repeat(2000)
+      },
+      env
+    );
+    expect(result.metered, "the fixture debit must actually commit").toBe(true);
+
+    const out = run(dir);
+    expect(out).toContain("Journal integrity: verified");
+    // The ACTIVE unit's figure, alone.
+    expect(out).toContain("30");
+    // Not the v1 history, and not the sum of the two.
+    expect(out).not.toContain("800");
+    expect(out).not.toContain("830");
+    // And nothing is claimed as service-confirmed: no reconcile has run against this journal.
+    expect(out).not.toContain("already reconciled");
   });
 
   it("an entry this device cannot check reads as UNVERIFIABLE (rotated), never folded into a green `verified`", async () => {
@@ -165,9 +241,10 @@ describe.runIf(CLI_BUILT)("`compaction usage` reports the server-authoritative e
         provider: "openai",
         periodId: currentPeriodId(),
         allowanceTokens: tokens * 10,
-        receiptId: "rec-zero",
-        meterVersion: "optimized-input-v1",
+        recoveryId: "rec-zero",
+        meterVersion: ACTIVE_USAGE_METER_VERSION,
         meteredOptimizedInputTokens: tokens,
+        estimatedInputTokensBefore: tokens + 500,
         estimatedInputTokensAfter: 500,
         preMutationBody: "x".repeat(2000)
       },
@@ -186,9 +263,12 @@ describe.runIf(CLI_BUILT)("`compaction usage` reports the server-authoritative e
     // lives — the figure — and the consequence is pinned as the shared sentence.
     expect(out).toContain("Allowance remaining: 0");
     expect(out).toContain("is paused for this period.");
-    // #832's route scoping must survive: an exhausted API balance never pauses subscription turns.
-    expect(out).toContain("Community input optimization on API-key routed turns is paused");
-    expect(out).toContain("Subscription-routed turns are unaffected.");
+    // SCOPED TO EVERY ROUTE: `optimized-input-v1` pays for use of the Hybrid Engine, not for the
+    // provider billing route, so a spent allowance pauses input optimization wherever the turn is
+    // forwarded. Narrowing it to API-key turns would promise a subscription user an apply that pauses.
+    expect(out).toContain("Community input optimization is paused");
+    expect(out).not.toContain("Subscription-routed turns are unaffected.");
+    // WHAT DID NOT STOP. Output shaping is the Open/base capability and the allowance never bought it.
     expect(out).toContain("Output shaping remains active.");
     // And a blocked user is given the one canonical destination.
     expect(out).toContain(proUrl(process.env));
@@ -264,5 +344,43 @@ describe.runIf(CLI_BUILT)("`compaction usage` reports the server-authoritative e
     expect(out).not.toContain("Upgrade to Pro");
     expect(out).not.toContain(proUrl(process.env));
     expect(out).not.toContain("while the journal does not verify");
+  });
+
+  /**
+   * THE DENOMINATOR IS THE PERIOD TOTAL, NOT THE LEASE REMAINDER. `allowance_tokens` is already net of
+   * the consumption the service has recorded, so a half-spent period carries a HALVED remainder — and
+   * printing `remaining of allowance_tokens` compared that number against itself and read as a full
+   * tank. The signed v2 `period_allowance_tokens` is the only figure that survives another device
+   * spending against the same account, which is why the total is signed rather than derived.
+   */
+  it("(e) HALF-SPENT period: the denominator is the signed period total, not the halved remainder", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "usage-half-spent-"));
+    dirs.push(dir);
+    provisionValidLease(
+      dir,
+      { allowance_tokens: 1_000_000, period_allowance_tokens: 2_000_000 },
+      { productMode: "full" }
+    );
+    await commitOneEntry(dir);
+    const out = run(dir);
+    expect(out).toContain("Allowance remaining: 998,766 of 2,000,000 this period");
+    // The remainder must never appear as the denominator — that is the full-tank misread.
+    expect(out).not.toContain("of 1,000,000 this period");
+  });
+
+  /**
+   * A v1 lease carries NO total (a device keeps its last lease for up to one 24h TTL after a CLI
+   * upgrade). The surface must then render the remaining figure with no denominator at all rather than
+   * substituting the remainder, which would manufacture a number the signature does not cover.
+   */
+  it("(f) v1 lease: a remaining figure with NO denominator clause", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "usage-v1-lease-"));
+    dirs.push(dir);
+    provisionValidLease(dir, { schema_version: 1, allowance_tokens: 2_000_000 }, { productMode: "full" });
+    await commitOneEntry(dir);
+    const out = run(dir);
+    // Pinned WITH the newline so the assertion cannot pass on a line that also carries a denominator.
+    expect(out).toContain("Allowance remaining: 1,998,766\n");
+    expect(out).not.toContain("of 2,000,000 this period");
   });
 });

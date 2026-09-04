@@ -43,7 +43,12 @@ export interface CaptureUsageSidecar {
   /** "present" when the provider emitted a usage block; "missing" when usage was absent (never invented). */
   tokenMetadataStatus: "present" | "missing";
   /** Present on the treatment arm when an output-shaping policy was attached BEFORE generation. */
-  outputShaping?: { policyFamily: typeof OUTPUT_SHAPING_POLICY_FAMILY; policyNames: string[] };
+  outputShaping?: {
+    policyFamily: typeof OUTPUT_SHAPING_POLICY_FAMILY;
+    policyNames: string[];
+    /** Exact identity of the attached model-visible policy bytes. */
+    policyVersion: string;
+  };
   generatedAt: string;
 }
 
@@ -57,6 +62,7 @@ export interface BuildCaptureUsageSidecarInput {
   tokenSource: TokenSource;
   tokenMetadataStatus: "present" | "missing";
   policyNames?: string[];
+  policyVersion?: string;
   generatedAt?: string;
 }
 
@@ -71,8 +77,8 @@ export function buildCaptureUsageSidecar(input: BuildCaptureUsageSidecarInput): 
     providerReported: input.providerReported,
     tokenSource: input.tokenSource,
     tokenMetadataStatus: input.tokenMetadataStatus,
-    ...(input.policyNames && input.policyNames.length > 0
-      ? { outputShaping: { policyFamily: OUTPUT_SHAPING_POLICY_FAMILY, policyNames: input.policyNames } }
+    ...(input.policyNames && input.policyNames.length > 0 && input.policyVersion
+      ? { outputShaping: { policyFamily: OUTPUT_SHAPING_POLICY_FAMILY, policyNames: input.policyNames, policyVersion: input.policyVersion } }
       : {}),
     generatedAt: input.generatedAt ?? new Date().toISOString()
   };
@@ -90,9 +96,12 @@ export interface OutputShapingAbRun {
   /** True ONLY when the output tokens are provider-reported. */
   providerReported: boolean;
   tokenSource: TokenSource;
+  provider?: string;
+  model?: string;
   /** Treatment arm: the output-shaping policy family/names attached BEFORE generation. */
   policyFamily?: typeof OUTPUT_SHAPING_POLICY_FAMILY;
   policyNames?: string[];
+  policyVersion?: string;
   /**
    * Operator/eval-recorded short-but-sufficient outcome for a TREATMENT run: did the shaped (shorter)
    * output preserve all required task-outcome markers? `null`/absent ⇒ not yet evaluated (review required).

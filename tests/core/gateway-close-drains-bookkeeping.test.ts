@@ -108,6 +108,10 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
  */
 async function harness(opts: { storedAuthorization?: boolean } = {}) {
   const cwd = mkdtempSync(join(tmpdir(), "gw-drain-"));
+  // The DEVICE store, deliberately NOT under `cwd`: the gateway reads the authorization from the
+  // device environment alone, so a fixture that wrote it into the working directory would now be
+  // asserting the very thing that must not work (repository content granting apply).
+  const deviceDir = mkdtempSync(join(tmpdir(), "gw-drain-device-"));
   const upstream = http.createServer((req, res) => {
     req.on("data", () => {});
     req.on("end", () => {
@@ -125,7 +129,7 @@ async function harness(opts: { storedAuthorization?: boolean } = {}) {
         preference: "auto-when-gates-pass",
         gates_required: [...AUTO_APPLY_ELIGIBILITY_GATES]
       },
-      join(cwd, ".compaction")
+      deviceDir
     );
   }
 
@@ -134,6 +138,7 @@ async function harness(opts: { storedAuthorization?: boolean } = {}) {
     upstream: `http://127.0.0.1:${upstreamPort}`,
     mode: "record",
     cwd,
+    entitlementEnv: { COMPACTION_CONFIG_DIR: deviceDir },
     ...(opts.storedAuthorization
       ? { workflow: "codex", optimizationMode: "cache-plus-context" as const }
       : {})

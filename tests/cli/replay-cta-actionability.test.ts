@@ -3,9 +3,10 @@
  *
  * `compaction watch` and `compaction status` re-render receipts that were written days or months ago.
  * A July receipt replayed in August is still a true record of July, and rewriting it into the current
- * period would falsify history — so `Community limit reached`, `input optimization paused until
- * <the date July recorded>`, `output shaping continues` and the receipt id all stay exactly as
- * recorded.
+ * period would falsify history — so `input paused`, `Community limit reached`, that turn's own output
+ * arrow and the receipt id all stay exactly as recorded. (The pause narration and the resume date are
+ * not among them because the PRIMARY line no longer prints them for any turn, live or replayed; they
+ * live on the detail surfaces.)
  *
  * The `Upgrade to Pro ↗` CTA is not one of those facts. It is an ACTION offered to the reader now,
  * about a ceiling they are no longer at: the allowance reset, the pause ended, and nothing about the
@@ -19,6 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
+import { TEST_OUTPUT_POLICY_VERSION, seedOutputCalibration } from "../helpers/output-calibration-fixture.js";
 import { currentPeriodId, periodEndUtc } from "../../src/core/entitlement/lease.js";
 import { receiptCeiling } from "../../src/core/gateway/receipt-line.js";
 import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
@@ -58,6 +60,11 @@ function pausedReceipt(periodId: string): GatewayReceipt {
     content_uploaded: false,
     label: "apply",
     applied_components: ["output-shaping"],
+    // The gateway attached the policy on THIS pass, so the receipt records the durable provenance the
+    // arrow and the `output shaping continues` clause both read.
+    output_shaping_state: "attached-this-pass",
+    output_shaping_policy_version: TEST_OUTPUT_POLICY_VERSION,
+    output_shaping_regime: "default-shapeable",
     allowance_pause: {
       reason: "insufficient",
       period_id: periodId,
@@ -84,6 +91,25 @@ function entitledDevice(allowanceTokens = 2_000_000): NodeJS.ProcessEnv {
   const dir = mkdtempSync(join(tmpdir(), "replay-cta-cfg-"));
   dirs.push(dir);
   return provisionValidLease(dir, { allowance_tokens: allowanceTokens }, { productMode: "full" }) as NodeJS.ProcessEnv;
+}
+
+/**
+ * Fold a real provider-reported A/B (1000 → 530, a measured 47%) into an entitled device's calibration
+ * store, and hand back that same env.
+ *
+ * The output arrow requires the DEVICE'S OWN measurement — the shipped default prior renders a plain
+ * count — so a case that pins the arrow surviving replay has to run on a device that measured one.
+ */
+async function measuredEntitledDevice(): Promise<NodeJS.ProcessEnv> {
+  const env = entitledDevice();
+  await seedOutputCalibration(env, {
+    provider: "anthropic",
+    model: "claude-opus-5",
+    regime: "default-shapeable",
+    control: [1000, 1000, 1000],
+    treatment: [530, 530, 530]
+  });
+  return env;
 }
 
 describe("the ceiling a receipt is translated into", () => {
@@ -151,18 +177,33 @@ describe.runIf(CLI_BUILT)("the replayed line on the surfaces that replay", () =>
     }
   });
 
-  it("...and the historical facts on that stale line are all still there", () => {
+  it("...and the historical facts on that stale line are all still there", async () => {
     const stale = previousPeriodId();
-    const env = entitledDevice();
+    // MEASURED, so the output arrow below is one this device earned. An unmeasured device renders the
+    // plain count instead, which would leave the `→300` assertion passing or failing for a reason that
+    // has nothing to do with replay.
+    const env = await measuredEntitledDevice();
     const cwd = cwdWithPausedTurn(stale);
     for (const args of [["watch", "--once"], ["status"]]) {
       const line = receiptLineIn(run(env, cwd, args));
       expect(line, args.join(" ")).toContain("input paused");
-      expect(line, args.join(" ")).toContain("Community limit reached");
-      // The date JULY recorded — not today's period, and not dropped.
-      expect(line, args.join(" ")).toContain(`paused until ${periodEndUtc(stale)}`);
-      expect(line, args.join(" ")).toContain("output shaping continues");
-      expect(line, args.join(" ")).toContain("output 300");
+      // THE RECORDED DATE, NOT TODAY'S. A replayed line states what that turn recorded; the existing
+      // rule is that the recorded facts pass through unrewritten and only the CTA is period-bound
+      // (asserted in the case above, where this same line carries no `Upgrade to Pro`). So the stale
+      // date is REQUIRED to be the one the pause was written with...
+      expect(line, args.join(" ")).toContain(`Community limit resets ${periodEndUtc(stale) as string}`);
+      // ...and the CURRENT period's date must be absent, which is the falsification this suite exists
+      // to prevent: re-stamping a July pause with August's reset would turn a record into a claim.
+      expect(line, args.join(" ")).not.toContain(periodEndUtc(currentPeriodId()) as string);
+      expect(line, args.join(" ")).not.toContain("paused until");
+      expect(line, args.join(" ")).not.toContain("output shaping continues");
+      // The output count survives, now as the AFTER half of the estimated arrow. This receipt records
+      // `output_shaping_state: "attached-this-pass"` and the clause above says shaping continued, so the
+      // turn WAS shaped and the arrow is earned; replay simply used to drop it (the live-only
+      // `shapedEvidence` gate). Asserted as `→300` rather than a bare `output 300` so the fact is
+      // still pinned without the assertion silently passing on a line that lost the estimate again.
+      expect(line, args.join(" ")).toContain("→300");
+      expect(line, args.join(" ")).toContain("est.");
       expect(line, args.join(" ")).toContain(`id ${RECEIPT_ID.slice(0, 8)}`);
     }
   });

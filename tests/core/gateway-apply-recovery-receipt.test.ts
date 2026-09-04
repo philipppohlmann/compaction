@@ -110,6 +110,58 @@ describe("buildApplyReceipt - honest before/after, claim only when mutated", () 
     expect(r.apply_label).not.toMatch(/input reduced by/i); // dry-run never claims an APPLIED reduction
   });
 
+  /** The LCM-only receipt must use the pipeline's end-to-end input basis. */
+  it("LCM-only apply: reports the TRUE pre-LCM input as before, not the already-compacted figure", () => {
+    const lcmOnlyPlan: DedupePlan = {
+      policy: "deterministic-dedupe",
+      shape: "messages-array",
+      supported: true,
+      changed: false, // dedupe found nothing on the body LCM handed it
+      removedBlocks: 0,
+      charsBefore: 3_600,
+      charsAfter: 3_600,
+      estTokensBefore: 900, // LCM's output, so it cannot be the end-to-end "before"
+      estTokensAfter: 900,
+      reductionPercent: 0
+    };
+    const r = buildApplyReceipt({
+      provider: "anthropic",
+      endpoint: "/v1/messages",
+      upstreamStatus: 200,
+      usage: NO_USAGE,
+      activation: APPLY_ACT,
+      plan: lcmOnlyPlan,
+      applied: true,
+      appliedComponents: ["lcm-compaction"],
+      composedInputEstimate: { before: 1_000, after: 900 },
+      recoveryId: "rec-lcm"
+    });
+    expect(r.estimated_input_tokens_before).toBe(1_000);
+    expect(r.estimated_input_tokens_after).toBe(900);
+    expect(r.estimated_input_tokens_before).toBeGreaterThan(r.estimated_input_tokens_after!);
+    // The percent is derived from the SAME basis, so the receipt cannot state a number its own two
+    // figures contradict. The synthetic 1000→900 basis is exactly 10%.
+    expect(r.estimated_model_visible_input_reduction_percent).toBe(10);
+  });
+
+  it("deterministic-only apply is UNCHANGED by the LCM basis fix (single-layer plan stays the source)", () => {
+    const r = buildApplyReceipt({
+      provider: "openai",
+      endpoint: "/v1/responses",
+      upstreamStatus: 200,
+      usage: PROVIDER_USAGE,
+      activation: APPLY_ACT,
+      plan: CHANGED_PLAN,
+      applied: true,
+      appliedComponents: ["deterministic-compaction"],
+      // Deliberately CONTRADICTORY: a deterministic-only turn must ignore this and read its own plan.
+      composedInputEstimate: { before: 999_999, after: 1 }
+    });
+    expect(r.estimated_input_tokens_before).toBe(250);
+    expect(r.estimated_input_tokens_after).toBe(125);
+    expect(r.estimated_model_visible_input_reduction_percent).toBe(50);
+  });
+
   it("fail-closed apply: not mutated, reason recorded, no reduction claim, provider usage still parsed-or-unavailable", () => {
     const failReason = "request contains 'tools' - fail closed";
     const r = buildApplyReceipt({

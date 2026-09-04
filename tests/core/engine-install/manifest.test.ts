@@ -111,6 +111,16 @@ describe("trust-root pinning (production root ACTIVE, still fail-closed)", () =>
     expect(pinnedRootKeys().map((r) => r.key_id)).toEqual(ENGINE_ROOT_KEYS.map((r) => r.key_id));
   });
 
+  // MIRROR PIN. The control plane may not import `src/`, so its retirement tool re-declares this
+  // key in apps/control-plane/src/engine-root-keys.ts and pins the same literal in its own test.
+  // Rotating the root has to break BOTH pins, or the operator tool would go on trusting the old
+  // one and accept retirement evidence no client can verify.
+  it("pins the exact root key literal the control-plane mirror carries", () => {
+    expect(ENGINE_ROOT_KEYS.map((r) => r.public_key_spki_b64u)).toEqual([
+      "MCowBQYDK2VwAyEAE_hyUbMqPEb08gIjtL7N7Naq0a3Tjg2L_w29HFtOG34"
+    ]);
+  });
+
   it("a real Ed25519 SPKI key WOULD pin (the guard is about the placeholder, not the mechanism)", () => {
     const pair = generateDevSigningKeyPair();
     expect(rootKeyPinned({ key_id: "test", public_key_spki_b64u: pair.publicKeySpkiB64u })).toBe(true);

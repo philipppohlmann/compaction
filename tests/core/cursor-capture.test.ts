@@ -121,19 +121,19 @@ describe("normalizeCursorAgentOutput - LOCAL-ESTIMATE only, output where separab
     expect(r.usageMetadata.output_tokens).toBe(50);
     expect(r.usageMetadata.cost_source).toBe("local_estimate");
     expect(r.usageMetadata.cost_source).not.toBe("provider_reported");
-    // Provider is attributed as cursor; there is no provider-reported usage.
+    // Provider is attributed as cursor; Compaction did not ingest provider-reported usage.
     expect(r.usageMetadata.provider).toBe("cursor");
     expect(r.usageMetadata.provider_reported_tokens).toBe(false);
   });
 
-  it("the UNAVAILABLE output warning states the reason (provider emits no usage) - never a silent zero", () => {
+  it("the UNAVAILABLE output warning states the parser gap - never a silent zero", () => {
     const r = normalizeCursorAgentOutput({ captureId: "reason", rawOutput: "plain text, no result field", commandParts: CMD });
     expect(r.outputStatus).toBe("unavailable");
     expect(r.usageMetadata.output_tokens).toBeUndefined(); // absent, not 0
     const warning = r.warnings.join(" ");
     expect(warning).toContain("Output tokens UNAVAILABLE");
     expect(warning).toContain("no separable `result` field");
-    expect(warning).toMatch(/Cursor emits no usage/i);
+    expect(warning).toMatch(/does not ingest[^.]*conditional result\.usage/i);
     // The limitation carried into the usage metadata records the unavailability too.
     expect(r.usageMetadata.limitations.join(" ")).toContain("Output tokens are unavailable");
   });

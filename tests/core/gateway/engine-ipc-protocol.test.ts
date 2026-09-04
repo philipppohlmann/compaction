@@ -117,6 +117,9 @@ describe("engine IPC protocol codec", () => {
     expect(isEngineIpcRequest({ protocol_version: 2, request_id: "x", operation: "ping", request_body: "", authorization: {} })).toBe(false);
     expect(isEngineIpcRequest(null)).toBe(false);
     expect(isEngineIpcResponse({})).toBe(false);
+    expect(isEngineIpcResponse(sampleResponse({ output_shaping_state: "already-active" }))).toBe(true);
+    expect(isEngineIpcResponse({ ...sampleResponse(), output_shaping_state: "invented" })).toBe(false);
+    expect(isEngineIpcResponse({ ...sampleResponse({ result: "refused" }), output_shaping_state: "absent" })).toBe(false);
   });
 
   it("carries no credential or network field in the request type", () => {

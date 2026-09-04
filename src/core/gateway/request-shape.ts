@@ -96,8 +96,8 @@ export interface DedupePlan {
   charsAfter: number;
   /**
    * LOCAL-ESTIMATE token counts (chars/4), never provider-reported, never a billing figure on their
-   * own - but this is the number the meter is built from (`optimized-input-v1`, frozen to pre-mutation
-   * MODEL-VISIBLE input tokens), so it is measured on the PROMPT basis: model-visible text only. On the
+   * own - but this is the number the meter is built from (`optimized-input-v2`, the MODEL-VISIBLE
+   * input tokens an apply removed), so it is measured on the PROMPT basis: model-visible text only. On the
    * OpenAI shapes that is the same text `charsBefore` counts. On the Anthropic apply path it is NOT:
    * `charsBefore` there is the whole envelope, and metering it would spend a user's allowance on JSON
    * punctuation and transport-only fields (`max_tokens`, `stream`, `metadata`).

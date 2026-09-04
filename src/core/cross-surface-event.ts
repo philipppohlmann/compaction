@@ -252,8 +252,9 @@ export function surfaceForToolName(tool: ToolName): CrossSurfaceSurface | undefi
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Surfaces whose token tier can never be provider-reported: Cursor emits no usage (vendor gap), and the
- * browser's visible surface exposes no provider usage.
+ * Surfaces whose current Compaction integration can never label tokens provider-reported: the Cursor
+ * reader does not ingest or attribute its conditional `result.usage`, and the browser's visible surface
+ * exposes no provider usage.
  */
 export const NEVER_PROVIDER_REPORTED_SURFACES: readonly CrossSurfaceSurface[] = ["cursor", "browser_extension"];
 
@@ -389,7 +390,7 @@ export function validateCrossSurfaceEvent(value: unknown): CrossSurfaceEventVali
       const axis = tokenSource[axisName];
       if (isPlainObject(axis) && axis.source === "provider-reported") {
         problems.push(
-          `token_source.${axisName}.source: surface "${String(event.surface)}" can never be provider-reported (contract tier table - vendor exposes no usage)`
+          `token_source.${axisName}.source: surface "${String(event.surface)}" can never be provider-reported (the current Compaction ingestion contract has no attributable provider-usage provenance for this surface)`
         );
       }
     }
@@ -474,7 +475,8 @@ function axisFromReport(source: RunFlowTokenReport["input_token_source"], reason
  * Per-surface constraints for the `run` local-run-record writers:
  * - `codex` - provider `openai`; token axes provider-reported where a `turn.completed.usage` block existed.
  *   Codex reports tokens but no cost/billing figure → cost unavailable with that reason.
- * - `cursor` - provider `cursor`; local-estimate/unavailable only (Cursor emits no usage), no cost data.
+ * - `cursor` - provider `cursor`; local-estimate/unavailable only because Compaction does not ingest or
+ *   attribute the CLI's conditional `result.usage`; no cost data.
  * - `cli` - bare `run -- <cmd>`: provider `other` (no observable provider); input is a local chars/4
  *   estimate, output is unavailable with the command-surface reason, no billing surface.
  * - `claude_code` - the `capture claude-code --from-hook` path; provider `anthropic`; token axes
@@ -498,7 +500,8 @@ export const RUN_RECORD_EVENT_SURFACES = {
   cursor: {
     surface: "cursor",
     provider: "cursor",
-    cost_unavailable_reason: "Cursor emits no usage or cost data; no cost figure exists for this run"
+    cost_unavailable_reason:
+      "Compaction does not ingest Cursor's conditional result.usage, and no per-run cost or billing figure is available; no cost figure exists for this run"
   },
   cli: {
     surface: "cli",

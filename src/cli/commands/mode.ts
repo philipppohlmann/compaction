@@ -148,8 +148,9 @@ export interface ModeSelectionOutcome {
   leaseTrust?: LeaseTrustSource;
   /**
    * For a `full` selection that unlocked on a lease whose METERED balance is already spent. Full apply
-   * is genuinely enabled — subscription-routed turns apply normally — but API-key routed turns
-   * will refuse until the period resets, and saying only "enabled" would over-promise for them.
+   * is genuinely enabled — the entitlement is real and OUTPUT SHAPING keeps running — but INPUT
+   * compaction will refuse on every route until the period resets, and saying only "enabled" would
+   * over-promise it.
    */
   meteredBalanceExhausted?: boolean;
 }
@@ -164,10 +165,11 @@ export interface ModeSelectionOutcome {
  * explains what Community adds and points at the onboarding stepper (`compaction`), which sets up the
  * account AND the lease in one step.
  *
- * ENTITLEMENT, NOT BALANCE: a valid lease whose metered allowance is spent still ENABLES full —
- * subscription-routed full apply consumes no allowance and runs. The spent balance travels out as
- * `meteredBalanceExhausted` so the rendering can scope its promise to the route it actually holds for,
- * rather than refusing a mode the user is entitled to.
+ * ENTITLEMENT, NOT BALANCE: a valid lease whose metered allowance is spent still ENABLES full — the
+ * mode is a durable preference, the allowance is a per-period balance, and output shaping keeps running
+ * on a spent period. The spent balance travels out as `meteredBalanceExhausted` so the rendering can
+ * bound its promise to what the device actually has this period, rather than refusing a mode the user
+ * is entitled to.
  */
 export function applyModeSelection(mode: ProductMode, env: NodeJS.ProcessEnv = process.env): ModeSelectionOutcome {
   if (mode === "full") {
@@ -254,7 +256,7 @@ export async function fullModeCeilingLines(
   const ceiling =
     (await allowanceNoticeInput(env, cwd)) ??
     (outcome.meteredBalanceExhausted
-      ? { reason: "exhausted" as const, scope: "api-key-route" as const }
+      ? { reason: "exhausted" as const, scope: "all-routes" as const }
       : undefined);
   if (!ceiling) return [];
   return upgradeNoticeLines({ ...ceiling, env });
@@ -337,9 +339,10 @@ async function handleFullMode(env: NodeJS.ProcessEnv = process.env): Promise<voi
         chalk.yellow("  This lease is DEV-SIGNED — not a production entitlement (local development only).")
       );
     }
-    // SCOPE THE PROMISE. The entitlement is real and subscription-routed turns apply normally,
-    // but this period's metered allowance is gone, so API-key routed turns will refuse. Announcing a
-    // bare "full apply enabled" here would describe a capability the very next API-key turn declines.
+    // SCOPE THE PROMISE. The entitlement is real and output shaping keeps running, but this period's
+    // metered allowance is gone, so INPUT compaction refuses on every route. Announcing a bare "full
+    // apply enabled" here would describe a capability the very next turn declines, whatever route it
+    // takes — the allowance pays for the Hybrid Engine, not for the billing route.
     //
     // ONE VOCABULARY, ONE DESTINATION. This used to be a bespoke sentence written only here: it said the
     // allowance was SPENT (false whenever the real state is `insufficient` — tokens left, just not enough

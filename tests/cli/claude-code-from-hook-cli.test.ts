@@ -1,11 +1,16 @@
-import { mkdtemp, readFile, readdir } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { captureClaudeCodeFromHook } from "../../src/cli/commands/capture-claude-code.js";
 import { createUsageMetadata, missingUsageMetadata } from "../../src/core/usage-metadata.js";
-import { readActivityEvents } from "../../src/core/activity-store.js";
+import { appendActivityEvent, readActivityEvents } from "../../src/core/activity-store.js";
 import { validateActivityEventForStore } from "../../src/core/activity-store.js";
+import { sessionCorrelationId } from "../../src/core/gateway/session-correlation.js";
+import { currentUserRun, startUserRun } from "../../src/core/gateway/run-boundary.js";
+import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
+import { computeActivityEventId, type ActivityEvent } from "../../src/core/activity-event.js";
+import { emptyLedger } from "../../src/core/claude-code-hook-record.js";
 
 /**
  * `capture claude-code --from-hook` behavior (deps injected). Covers: missing transcript_path (no-op),
@@ -127,6 +132,33 @@ describe("captureClaudeCodeFromHook", () => {
     expect(await recordsIn(cwd)).toHaveLength(0);
   });
 
+  it("dry-run leaves the session's open run untouched (the run store is a write too)", async () => {
+    const cwd = await tempCwd();
+    const env = { COMPACTION_CONFIG_DIR: await mkdtemp(path.join(tmpdir(), "cc-hook-cfg-")) } as NodeJS.ProcessEnv;
+    const c = sessionCorrelationId("s1", env)!;
+    startUserRun(c, "2026-06-29T00:00:00.000Z", env);
+    await captureClaudeCodeFromHook({ dryRun: true }, {
+      cwd, env, now: NOW, hostedConfigured: noHosted,
+      readStdin: async () => JSON.stringify({ session_id: "s1", transcript_path: "/x/y.jsonl" }),
+      normalize: async () => ({ usage: providerUsage, messageCount: 8, fingerprint: "fp-abc" })
+    });
+    expect(currentUserRun(c, env)?.ended_at).toBeUndefined();
+    expect(await recordsIn(cwd)).toHaveLength(0);
+  });
+
+  it("a real Stop closes the session's open run", async () => {
+    const cwd = await tempCwd();
+    const env = { COMPACTION_CONFIG_DIR: await mkdtemp(path.join(tmpdir(), "cc-hook-cfg-")) } as NodeJS.ProcessEnv;
+    const c = sessionCorrelationId("s1", env)!;
+    startUserRun(c, "2026-06-29T00:00:00.000Z", env);
+    await captureClaudeCodeFromHook({}, {
+      cwd, env, now: NOW, hostedConfigured: noHosted,
+      readStdin: async () => JSON.stringify({ session_id: "s1", transcript_path: "/x/y.jsonl" }),
+      normalize: async () => ({ usage: providerUsage, messageCount: 8, fingerprint: "fp-abc" })
+    });
+    expect(currentUserRun(c, env)?.ended_at).toBeDefined();
+  });
+
   it("fail-open: a normalize crash never throws", async () => {
     const cwd = await tempCwd();
     await expect(
@@ -221,6 +253,149 @@ describe("captureClaudeCodeFromHook - activity bridge", () => {
     await captureClaudeCodeFromHook({}, deps);
     const { events } = await activityIn(cwd);
     expect(events).toHaveLength(1);
+  });
+
+  it("freezes an exact gateway-backed Stop and recovers one authoritative event after append failure", async () => {
+    const cwd = await tempCwd();
+    const env = { COMPACTION_CONFIG_DIR: await mkdtemp(path.join(tmpdir(), "cc-hook-cfg-")) } as NodeJS.ProcessEnv;
+    const c = sessionCorrelationId("s1", env)!;
+    startUserRun(c, "2026-06-29T00:00:00.000Z", env);
+    const receipt: GatewayReceipt = {
+      receipt_id: "exact-run-receipt",
+      captured_at: "2026-06-29T00:00:30.100Z",
+      request_started_at: "2026-06-29T00:00:30.000Z",
+      provider: "anthropic",
+      model: "claude-x",
+      endpoint: "/v1/messages",
+      mode: "record",
+      upstream_status: 200,
+      model_visible_bytes_changed: false,
+      tokens: { prompt_input: 1000, output: 200 },
+      fresh_billed_input_reduction: { available: false, note: "none" },
+      token_source: "provider-reported",
+      cache_source: "unavailable",
+      cost_source: "unavailable",
+      reasons: { cost: "unavailable" },
+      claim_scope: "run-scoped",
+      approval_status: "not-required",
+      sync_status: "local-only",
+      content_uploaded: false,
+      label: "test",
+      session_correlation_id: c,
+      output_shaping_state: "already-active",
+      output_shaping_policy_version: "output-shaping-v1"
+    };
+    let appendAttempts = 0;
+    const append = async (...args: Parameters<typeof appendActivityEvent>): ReturnType<typeof appendActivityEvent> => {
+      appendAttempts += 1;
+      if (appendAttempts === 1) return { appended: false, reason: "synthetic persistence failure" };
+      return appendActivityEvent(...args);
+    };
+    const lines: string[] = [];
+    const deps = {
+      cwd,
+      env,
+      now: () => "2026-06-29T00:01:00.000Z",
+      hostedConfigured: noHosted,
+      readStdin: async () => JSON.stringify({ session_id: "s1", transcript_path: "/x/y.jsonl" }),
+      normalize: async () => ({ usage: providerUsage, messageCount: 8, fingerprint: "fp-frozen" }),
+      readGatewayReceipts: async () => ({ receipts: [receipt], truncated: false }),
+      appendActivity: append,
+      printReceiptLine: (line: string) => lines.push(line)
+    };
+
+    await captureClaudeCodeFromHook({}, deps);
+    expect((await activityIn(cwd)).events).toHaveLength(0);
+    expect(lines).toEqual([]);
+    const [recordFile] = await recordsIn(cwd);
+    const record = JSON.parse(await readFile(
+      path.join(cwd, ".compaction", "hooks", "claude-code", "records", recordFile),
+      "utf8"
+    ));
+    expect(record.logicalRunId).toMatch(/^claude-stop-[0-9a-f]{32}$/);
+    expect(record.settledActivityEvent?.activity_kind).toBe("claude-stop");
+
+    // Simulate the adjacent crash boundary: the immutable record reached disk, but its ledger entry
+    // did not. Same Stop restores only that ledger entry; receipts/calibration are never re-read.
+    const ledgerPath = path.join(cwd, ".compaction", "hooks", "claude-code", "ledger.json");
+    await writeFile(ledgerPath, `${JSON.stringify(emptyLedger(), null, 2)}\n`, "utf8");
+    await captureClaudeCodeFromHook({}, {
+      ...deps,
+      readGatewayReceipts: async () => { throw new Error("must not reread"); }
+    });
+    expect((await activityIn(cwd)).events).toHaveLength(1);
+    expect(JSON.parse(await readFile(ledgerPath, "utf8")).entries).toHaveLength(1);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("output N/A→200 (N/A%, est.)");
+    expect(lines[0]).toContain("basic shaping");
+    expect(lines[0]).not.toContain("47%");
+
+    await captureClaudeCodeFromHook({}, deps);
+    expect((await activityIn(cwd)).events).toHaveLength(1);
+    expect(lines).toHaveLength(1);
+  });
+
+  it("fails closed when a frozen event belongs to a different hashed session", async () => {
+    const cwd = await tempCwd();
+    const env = { COMPACTION_CONFIG_DIR: await mkdtemp(path.join(tmpdir(), "cc-hook-cfg-")) } as NodeJS.ProcessEnv;
+    const c = sessionCorrelationId("s1", env)!;
+    startUserRun(c, "2026-06-29T00:00:00.000Z", env);
+    const receipt: GatewayReceipt = {
+      receipt_id: "exact-run-foreign-frozen",
+      captured_at: "2026-06-29T00:00:30.100Z",
+      request_started_at: "2026-06-29T00:00:30.000Z",
+      provider: "anthropic",
+      model: "claude-x",
+      endpoint: "/v1/messages",
+      mode: "record",
+      upstream_status: 200,
+      model_visible_bytes_changed: false,
+      tokens: { prompt_input: 1000, output: 200 },
+      fresh_billed_input_reduction: { available: false, note: "none" },
+      token_source: "provider-reported",
+      cache_source: "unavailable",
+      cost_source: "unavailable",
+      reasons: { cost: "unavailable" },
+      claim_scope: "run-scoped",
+      approval_status: "not-required",
+      sync_status: "local-only",
+      content_uploaded: false,
+      label: "test",
+      session_correlation_id: c
+    };
+    const lines: string[] = [];
+    const deps = {
+      cwd,
+      env,
+      now: () => "2026-06-29T00:01:00.000Z",
+      hostedConfigured: noHosted,
+      readStdin: async () => JSON.stringify({ session_id: "s1", transcript_path: "/x/y.jsonl" }),
+      normalize: async () => ({ usage: providerUsage, messageCount: 8, fingerprint: "fp-foreign-frozen" }),
+      readGatewayReceipts: async () => ({ receipts: [receipt], truncated: false }),
+      appendActivity: async () => ({ appended: false as const, reason: "synthetic persistence failure" }),
+      printReceiptLine: (line: string) => lines.push(line)
+    };
+    await captureClaudeCodeFromHook({}, deps);
+    const [recordFile] = await recordsIn(cwd);
+    const recordPath = path.join(cwd, ".compaction", "hooks", "claude-code", "records", recordFile);
+    const record = JSON.parse(await readFile(recordPath, "utf8"));
+    const tamperedBase: ActivityEvent = {
+      ...record.settledActivityEvent,
+      session_id: `claude-session-${"f".repeat(32)}`
+    };
+    record.settledActivityEvent = {
+      ...tamperedBase,
+      activity_event_id: computeActivityEventId(tamperedBase)
+    };
+    await writeFile(recordPath, `${JSON.stringify(record, null, 2)}\n`, "utf8");
+
+    await captureClaudeCodeFromHook({}, {
+      ...deps,
+      appendActivity: appendActivityEvent,
+      readGatewayReceipts: async () => { throw new Error("must not reread"); }
+    });
+    expect((await activityIn(cwd)).events).toHaveLength(0);
+    expect(lines).toEqual([]);
   });
 
   it("dry-run writes NO activity event", async () => {

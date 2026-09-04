@@ -284,9 +284,10 @@ export function writeProductMode(mode: ProductMode, env: EnvLike = process.env):
  * off a bare intent.
  *
  * DELIBERATELY INDEPENDENT OF THE METERED ALLOWANCE BALANCE (load-bearing): a spent
- * optimized-input allowance stops the METERED api-key route only. Subscription-route
- * full apply is non-debitable, so clamping the tier on a spent balance would switch off apply for
- * traffic that owes the allowance nothing. This holds for BOTH ways a balance goes to zero — the
+ * optimized-input allowance stops metered INPUT compaction — on every route, since the allowance pays
+ * for the Hybrid Engine and not for the billing route. It does NOT stop OUTPUT SHAPING, which the
+ * allowance never bought, so clamping the tier on a spent balance would switch off a capability that
+ * owes the allowance nothing. This holds for BOTH ways a balance goes to zero — the
  * local journal having spent it, and the ISSUER having signed a lease with none left — because the
  * lease-store now reports the second as `meteredBalanceExhausted` on a VALID verdict rather than as
  * a terminal entitlement label. The ceiling therefore rides `resolveOpenTier` as a SCOPED reason
@@ -320,9 +321,9 @@ export function effectiveOpenTier(env: EnvLike = process.env): "observe" | "basi
  *
  * `clampTier` answers "what posture is this turn?" and is what the gate and the label both use, so
  * the two can never disagree about the tier. But the clamp is deliberately SILENT about the balance:
- * a spent allowance correctly leaves the tier at `full`, because subscription-route apply owes the
- * allowance nothing and keeps running — and nothing on the line would then ever mention that METERED
- * apply has stopped. This function adds that missing fact, scoped to the traffic it covers, and
+ * a spent allowance correctly leaves the tier at `full`, because output shaping owes the allowance
+ * nothing and keeps running — and nothing on the line would then ever mention that metered INPUT
+ * compaction has stopped. This function adds that missing fact, scoped to the traffic it covers, and
  * changes no tier.
  *
  * The ceiling is reported ONLY when the user actually asked for `full` — an `observe`/`basic` user was
@@ -334,23 +335,17 @@ export function effectiveOpenTier(env: EnvLike = process.env): "observe" | "basi
  */
 
 /**
- * WHICH TRAFFIC a spent allowance actually pauses. The route contract
- * makes this a real distinction, not a nuance:
- * only the api-key route is metered, and subscription full apply consumes no allowance at all.
+ * WHICH TRAFFIC a spent allowance actually pauses.
  *
- *  - `api-key-route` — the period's optimized-input allowance is spent while the signed lease is
- *    still a valid entitlement. This is what `resolveOpenTier` reports for BOTH ways the balance
- *    reaches zero (the local journal spent it; the issuer signed a lease with none left), because
- *    the metered route is the only route that spends it. The gateway declines the metered
- *    route (`server.ts`) and leaves the subscription route running, so a surface that said "full
- *    apply is paused" without qualification would be telling a subscription user something false
- *    about their own product.
- *  - `all-routes` — the CONSERVATIVE DEFAULT for a renderer handed a reset date with no scope, and
- *    nothing else. No allowance state produces it: an exhausted balance never stops subscription
- *    apply, and the cases that DO stop every route (absent/invalid/expired/wrong-device lease) are
- *    not allowance pauses and carry no reset date at all. It exists so a caller that forgets the
- *    scope over-states the pause instead of promising an api-key user apply that will be refused;
- *    `resolveOpenTier` always supplies the scope, so it is never reached from the resolver.
+ *  - `all-routes` — what a spent allowance means TODAY, and what `resolveOpenTier` reports. The
+ *    Compaction allowance pays for use of the Hybrid Engine, not for the provider billing route, so a
+ *    confirmed input apply debits it on the API-key route and on a Claude Code subscription session
+ *    alike. When it is spent, INPUT OPTIMIZATION pauses everywhere; output shaping is the Open/base
+ *    capability and keeps running on every route.
+ *  - `api-key-route` — HISTORICAL. Metering was api-key-only until route-independent metering landed,
+ *    and receipts persisted before that carry this narrower label. The renderers still accept it and
+ *    still qualify it, so an old receipt replays as the statement that was true when it was written.
+ *    NOTHING PRODUCES IT ANYMORE.
  */
 export type AllowancePauseScope = "api-key-route" | "all-routes";
 
@@ -419,15 +414,14 @@ export async function resolveOpenTier(env: EnvLike = process.env): Promise<OpenT
   //  - the ISSUER signed this lease with none left — server-authoritative, needs no journal read, and
   //    still readable when the journal does not verify;
   //  - THIS DEVICE's local journal has consumed an otherwise-positive allowance since issue.
-  // Whichever it is, the metered api-key route is the only route that spends the allowance,
-  // so the scope is the same and the tier does not move: subscription-route apply keeps running (see
-  // `clampTier`, which the gateway's gate reads too).
+  // Whichever it is, EVERY route spends the allowance, so the pause covers every route and the tier
+  // does not move: output shaping keeps running (see `clampTier`, which the gateway's gate reads too).
   const resetsOn = verdict.meteredBalanceExhausted
     ? verdict.periodId
       ? periodEndUtc(verdict.periodId)
       : undefined
     : await localAllowanceSpentResetDate(verdict, env);
-  return { tier, ...(resetsOn ? { allowanceResetsOn: resetsOn, allowancePauseScope: "api-key-route" as const } : {}) };
+  return { tier, ...(resetsOn ? { allowanceResetsOn: resetsOn, allowancePauseScope: "all-routes" as const } : {}) };
 }
 
 /**

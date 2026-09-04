@@ -6,18 +6,51 @@ import { discoverClaudeCodeSessions, DISCOVERY_PRIVACY_NOTE } from "../../core/a
 import { recordCaptureContentFree } from "../../core/capture-record.js";
 import { buildRunFlowTokenReport, formatRunFlowTokenReport } from "../../core/run-flow-report.js";
 import { buildRunCrossSurfaceEvent } from "../../core/cross-surface-event.js";
-import { buildMeasureOnlyActivityEvent } from "../../core/activity-event.js";
-import { appendActivityEvent, readActivityEvents, DEFAULT_ACTIVITY_DIRECTORY } from "../../core/activity-store.js";
+import { buildMeasureOnlyActivityEvent, computeActivityEventId, type ActivityEvent } from "../../core/activity-event.js";
+import {
+  appendActivityEvent,
+  readActivityEvents,
+  validateActivityEventForStore,
+  DEFAULT_ACTIVITY_DIRECTORY
+} from "../../core/activity-store.js";
+import {
+  claudeLogicalRunIdentity,
+  claudeLogicalSessionId,
+  validClaudeLogicalRunId,
+  type ClaudeLogicalRunIdentity
+} from "../../core/claude-logical-run-id.js";
+import {
+  buildClaudeStopActivityEvent,
+  buildClaudeTranscriptStopActivityEvent,
+  type ClaudeTranscriptUsageBaseline
+} from "../../core/claude-stop-activity.js";
+import {
+  exactPriorClaudeHookRecord,
+  loadHookUsageRecords
+} from "../../core/hook-usage-aggregate.js";
+import { settledStopLineFromActivityEvent } from "../../core/settled-stop-activity.js";
 import { communityInviteLine } from "../../core/community-graduation.js";
 import { readStoredCredentials } from "../../core/auth/credentials.js";
 import { detectAvoidableContext } from "../../core/before-call.js";
 import { parseUserPromptSubmitPayload, buildClaudeCodeBeforeCallEvent } from "../../core/claude-code-before-call.js";
 import { decideShaping } from "../../core/subscription-shaping-runtime.js";
-import { lastTurnWasShaped, recordShapingOutcome } from "../../core/output-shaping-turn-state.js";
+import { invalidateShapingTurnRecord, lastTurnShapingOutcome, recordShapingOutcome } from "../../core/output-shaping-turn-state.js";
+import type { ShapingTurnScope } from "../../core/output-shaping-turn-state.js";
 import { isShapingHooksActivated } from "../../core/output-shaping-hook-activation.js";
-import { estimatePerTurnOutputSaved, loadCalibrationReduction } from "../../core/output-shaping-savings.js";
+import {
+  estimatePerTurnOutputSaved,
+  loadCalibrationReduction,
+  loadOutputCalibrationResolver
+} from "../../core/output-shaping-savings.js";
+import { outputCalibrationQuery } from "../../core/output-shaping-calibration-store.js";
+import { buildOutputShapingPolicy } from "../../core/output-shaping.js";
 import { resolveOpenTier } from "../../core/onboarding-preferences.js";
-import { readLatestGatewayReceipt, type GatewayReceipt } from "../../core/gateway/receipt.js";
+import {
+  readGatewayReceiptTailWindow,
+  readLatestGatewayReceipt,
+  type GatewayReceipt,
+  type GatewayReceiptTailWindow
+} from "../../core/gateway/receipt.js";
 import {
   isReceiptLineEnabled,
   communityFullApplyReceiptLine,
@@ -28,16 +61,30 @@ import {
   type OpenLineRendering
 } from "../../core/gateway/receipt-line.js";
 import { resolveApiConfig } from "../../core/api-client/index.js";
+import { claudePromptCorrelationId, sessionCorrelationId } from "../../core/gateway/session-correlation.js";
+import {
+  claudeProvisionalPending,
+  commitClaudePositiveSettlement,
+  completedUserRuns,
+  completeClaudePositiveSettlement,
+  endClaudeUserRun,
+  projectClaudePositiveSettlement,
+  startClaudeUserRun
+} from "../../core/gateway/run-boundary.js";
+import type { ClaudeSettledProvisionalPending } from "../../core/gateway/run-boundary.js";
+import { hasClaudeTaskNotificationEvidence } from "../../core/claude-code-run-continuation.js";
 import { hostedConfigured } from "./optimize-hosted.js";
 import type { UsageMetadata } from "../../core/usage-metadata.js";
 import {
+  CLAUDE_CODE_HOOK_RECORD_SCHEMA,
   buildClaudeCodeHookRecord,
   computeDedupKey,
   emptyLedger,
   isAlreadyRecorded,
   parseStopPayload,
   resolveTranscriptPath,
-  type ClaudeCodeHookLedger
+  type ClaudeCodeHookLedger,
+  type ClaudeCodeHookRecord
 } from "../../core/claude-code-hook-record.js";
 
 /**
@@ -293,6 +340,16 @@ export interface FromHookDeps {
   hostedConfigured?: () => boolean;
   /** Read the latest gateway receipt for the per-turn line (injectable for tests). */
   readLatestGatewayReceipt?: (cwd: string) => Promise<GatewayReceipt | undefined>;
+  /** Read the bounded gateway window used to freeze an exact whole-run Stop event. */
+  readGatewayReceipts?: (cwd: string) => Promise<GatewayReceiptTailWindow>;
+  /** Activity append seam, injectable for persistence-failure recovery tests. */
+  appendActivity?: typeof appendActivityEvent;
+  /** Run-store settlement seam, injectable only to prove the pre-persistence failure barrier. */
+  endClaudeRun?: typeof endClaudeUserRun;
+  /** Atomic positive-collapse + frozen-event seam, injectable for exact crash-boundary tests. */
+  commitClaudeSettlement?: typeof commitClaudePositiveSettlement;
+  /** Frozen settlement cleanup seam, injectable for exact crash-boundary tests. */
+  completeClaudeSettlement?: typeof completeClaudePositiveSettlement;
   /** Sink for the per-turn receipt line (defaults to console.log; injectable for tests). */
   printReceiptLine?: (line: string) => void;
   /** Env for the kill-switch read (injectable for tests). */
@@ -334,6 +391,38 @@ async function loadLedger(cwd: string): Promise<ClaudeCodeHookLedger> {
   }
 }
 
+async function loadHookRecord(cwd: string, dedupKey: string): Promise<ClaudeCodeHookRecord | undefined> {
+  if (!/^[0-9a-f]{32}$/.test(dedupKey)) return undefined;
+  try {
+    const parsed = JSON.parse(
+      await readFile(path.join(hookDir(cwd), "records", `${dedupKey}.json`), "utf8")
+    ) as ClaudeCodeHookRecord;
+    return parsed?.schema === CLAUDE_CODE_HOOK_RECORD_SCHEMA &&
+      parsed.tool === "claude-code" &&
+      parsed.dedupKey === dedupKey
+      ? parsed
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function frozenClaudeStopEvent(
+  record: ClaudeCodeHookRecord | undefined,
+  expected: { rawSessionId: string; hashedSessionId: string }
+): ActivityEvent | undefined {
+  const event = record?.settledActivityEvent;
+  return record?.sessionId === expected.rawSessionId &&
+    validClaudeLogicalRunId(record.logicalRunId) &&
+    event?.activity_kind === "claude-stop" &&
+    event.session_id === expected.hashedSessionId &&
+    event.run_id === record.logicalRunId &&
+    event.activity_event_id === computeActivityEventId(event) &&
+    validateActivityEventForStore(event).problems.length === 0
+    ? event
+    : undefined;
+}
+
 /**
  * Append ONE metrics-only activity event for a Stop-hook capture (the always-on bridge). Builds the
  * `claude_code` cross-surface event from the SAME honest token report the record uses, then the
@@ -346,15 +435,26 @@ async function appendClaudeCodeHookActivity(input: {
   usage: UsageMetadata;
   dedupKey: string;
   sessionId?: string;
-}): Promise<void> {
+  logicalIdentity?: ClaudeLogicalRunIdentity;
+  settledEvent?: ActivityEvent;
+  appendEvent?: typeof appendActivityEvent;
+}): Promise<"appended" | "duplicate" | "failed"> {
   try {
+    if (input.settledEvent) {
+      const result = await (input.appendEvent ?? appendActivityEvent)(
+        input.settledEvent,
+        path.join(input.cwd, ".compaction", "activity")
+      );
+      if (result.appended) return "appended";
+      return result.reason.includes("duplicate activity_event_id") ? "duplicate" : "failed";
+    }
     // outputStatus "present": buildRunFlowTokenReport honestly downgrades a missing output axis to
     // unavailable - a genuinely-absent field is never labeled provider-reported (no silent zero).
     const tokenReport = buildRunFlowTokenReport({ tool: "claude-code", usage: input.usage, outputStatus: "present" });
     const crossSurfaceEvent = buildRunCrossSurfaceEvent("claude_code", {
       // run_id is the deterministic content-free dedup key → deterministic activity_event_id → the
       // store dedupes a re-captured session (same state = one event).
-      runId: `claude-code-${input.dedupKey}`,
+      runId: input.logicalIdentity?.runId ?? `claude-code-${input.dedupKey}`,
       tokenReport,
       reasons: {
         input: "the Claude Code session usage did not report input tokens for this session state",
@@ -363,19 +463,27 @@ async function appendClaudeCodeHookActivity(input: {
       ...(input.usage.model ? { modelLabel: input.usage.model } : {})
     });
     // session_id rides on the event too (content-free identity), when the Stop payload carried one.
-    const eventWithSession = input.sessionId
-      ? { ...crossSurfaceEvent, session_id: input.sessionId }
+    const eventWithSession = input.logicalIdentity
+      ? { ...crossSurfaceEvent, session_id: input.logicalIdentity.sessionId }
+      : input.sessionId
+        ? { ...crossSurfaceEvent, session_id: input.sessionId }
       : crossSurfaceEvent;
     // Measurement only: nothing was applied or retained by Compaction, so original_retained=false.
     const activityEvent = buildMeasureOnlyActivityEvent(eventWithSession, { original_retained: false });
-    const result = await appendActivityEvent(activityEvent, path.join(input.cwd, ".compaction", "activity"));
+    const result = await (input.appendEvent ?? appendActivityEvent)(
+      activityEvent,
+      path.join(input.cwd, ".compaction", "activity")
+    );
     console.log(
       result.appended
         ? `compaction hook: recorded metrics-only activity (surface=claude_code, id ${result.activity_event_id.slice(0, 12)}…) - see 'compaction activity'.`
         : `compaction hook: activity not appended (${result.reason}).`
     );
+    if (result.appended) return "appended";
+    return result.reason.includes("duplicate activity_event_id") ? "duplicate" : "failed";
   } catch {
     // Best-effort local append - never fail the fail-open hook on a filesystem/store error.
+    return "failed";
   }
 }
 
@@ -393,6 +501,12 @@ async function printPerTurnReceiptLine(input: {
   readReceipt: (cwd: string) => Promise<GatewayReceipt | undefined>;
   print: (line: string) => void;
   env: NodeJS.ProcessEnv;
+  /**
+   * WHOSE turn this line describes. The shaping evidence is keyed by Claude Code's own `session_id`, so
+   * a Stop hook can only ever read the decision ITS session recorded. Undefined (no `session_id` on the
+   * payload) fails closed: the line still prints, with no shaping label and no output arrow.
+   */
+  shapingScope: ShapingTurnScope | undefined;
 }): Promise<void> {
   try {
     if (!isReceiptLineEnabled(input.env)) return;
@@ -402,7 +516,7 @@ async function printPerTurnReceiptLine(input: {
     // turn's own evidence below.
     // Reads local disk only (lease, credentials, local usage journal) — no account/entitlement/
     // usage-service or network call, and fail-open by construction.
-    const { tier: productTier, allowanceResetsOn, allowancePauseScope } = await resolveOpenTier(input.env);
+    const { tier: productTier, allowanceResetsOn } = await resolveOpenTier(input.env);
     // CALIBRATION FIRST, before the gateway branch. This used to load
     // only on the hook-only path below, so a turn WITH a gateway receipt returned before it ran and the
     // apply lines could never carry the output arrow — the strongest line on the strongest route was
@@ -419,8 +533,19 @@ async function printPerTurnReceiptLine(input: {
     // nothing was injected. `lastTurnWasShaped` reads what the prompt hook actually decided, and is
     // false whenever that cannot be confirmed.
     const outputTokensNow = typeof input.usage.output_tokens === "number" ? input.usage.output_tokens : undefined;
-    const hookShapedTurn = await lastTurnWasShaped(input.env);
-    const reductionNow = hookShapedTurn ? await loadCalibrationReduction(input.env) : undefined;
+    const hookOutcome = await lastTurnShapingOutcome(input.shapingScope, input.env);
+    const hookShapedTurn = hookOutcome === "shape" || hookOutcome === "shape-basic";
+    const hookQuery = hookShapedTurn
+      ? outputCalibrationQuery({
+        policyVersion: buildOutputShapingPolicy().policyVersion,
+        provider: input.usage.provider,
+        model: input.usage.model,
+        ...(hookOutcome === "shape" ? { regime: "default-shapeable" } : {})
+      })
+      : undefined;
+    const reductionNow = hookShapedTurn
+      ? await loadCalibrationReduction(input.env, hookQuery)
+      : undefined;
 
     const receipt = await input.readReceipt(input.cwd);
     if (receipt) {
@@ -428,8 +553,21 @@ async function printPerTurnReceiptLine(input: {
       // via the community builder; a non-apply turn falls back to the honest Open observe line — and
       // that fallback carries the ceiling, since those are the turns a spent allowance produces.
       // Derived from THIS RECEIPT's output, not the session total.
-      const savedForReceipt = reductionNow
-        ? estimatePerTurnOutputSaved(reductionNow, receipt.tokens?.output)
+      const gatewayShaped =
+        receipt.output_shaping_state === "attached-this-pass" || receipt.output_shaping_state === "already-active";
+      const query = outputCalibrationQuery({
+        policyVersion: receipt.output_shaping_policy_version,
+        provider: receipt.provider,
+        model: receipt.model,
+        regime: receipt.output_shaping_regime
+      });
+      const receiptReduction = gatewayShaped
+        ? await loadCalibrationReduction(input.env, query)
+        : hookShapedTurn
+          ? reductionNow
+          : undefined;
+      const savedForReceipt = receiptReduction
+        ? estimatePerTurnOutputSaved(receiptReduction, receipt.tokens?.output)
         : undefined;
       // THE LABEL DESCRIBES THE TURN, NOT THE SETTING. It used to be the stored product mode, so a
       // `basic` user read `basic shaping` on turns nothing had shaped, and an `observe` user read
@@ -444,8 +582,8 @@ async function printPerTurnReceiptLine(input: {
       const line =
         productTier === "full"
           ? (communityFullApplyReceiptLine(receipt, savedForReceipt, ceiling) ??
-            receiptLineFromGatewayReceipt(receipt, openLine, allowanceResetsOn, allowancePauseScope, savedForReceipt, ceiling))
-          : receiptLineFromGatewayReceipt(receipt, openLine, allowanceResetsOn, allowancePauseScope, savedForReceipt, ceiling);
+            receiptLineFromGatewayReceipt(receipt, openLine, allowanceResetsOn, savedForReceipt, ceiling))
+          : receiptLineFromGatewayReceipt(receipt, openLine, allowanceResetsOn, savedForReceipt, ceiling);
       if (line) input.print(line);
       await printCommunityInviteIfDue(input, productTier);
       return;
@@ -455,8 +593,8 @@ async function printPerTurnReceiptLine(input: {
     // here, so the per-turn label reflects the ACTUAL turn: `basic shaping` iff shaping was active this
     // turn (not killed, not `compaction stop`-ed), else `apply off`. When shaping is active the line also
     // opts into the estimated-output-saved arrow — a LOCAL ESTIMATE derived from the measured shaping A/B
-    // reduction rate × this turn's output. With no calibration artifact the clause degrades to a plain
-    // `output N`, never a fabricated number or reconstructed before.
+    // reduction rate × this turn's output. With no applicable calibration the clause explicitly keeps
+    // the unknown counterfactual as `output N/A→N (N/A%, est.)`, never a fabricated number.
     const outputTokens = outputTokensNow;
     const providerReported = input.usage.provider_reported_tokens === true;
     // The TIER LABEL still rides activation: `basic shaping` describes the posture the user chose, which
@@ -472,8 +610,7 @@ async function printPerTurnReceiptLine(input: {
       shapingActive,
       tier: hookTier,
       ...(estimatedSaved ? { estimatedSaved } : {}),
-      ...(allowanceResetsOn ? { allowanceResetsOn } : {}),
-      ...(allowanceResetsOn && allowancePauseScope ? { allowancePauseScope } : {})
+      ...(allowanceResetsOn ? { allowanceResetsOn } : {})
     });
     if (line) input.print(line);
     await printCommunityInviteIfDue(input, productTier);
@@ -541,11 +678,17 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
   const normalize = deps.normalize ?? defaultHookNormalize;
   const hostedIsConfigured = deps.hostedConfigured ?? hostedConfigured;
   const readReceipt = deps.readLatestGatewayReceipt ?? readLatestGatewayReceipt;
+  const readReceiptWindow = deps.readGatewayReceipts ?? readGatewayReceiptTailWindow;
+  const appendActivity = deps.appendActivity ?? appendActivityEvent;
+  const endClaudeRun = deps.endClaudeRun ?? endClaudeUserRun;
+  const commitClaudeSettlement = deps.commitClaudeSettlement ?? commitClaudePositiveSettlement;
+  const completeClaudeSettlement = deps.completeClaudeSettlement ?? completeClaudePositiveSettlement;
   const printReceiptLine = deps.printReceiptLine ?? ((line: string) => console.log(line));
   const env = deps.env ?? process.env;
 
   try {
-    const payload = parseStopPayload(await readStdin());
+    const stdinText = await readStdin();
+    const payload = parseStopPayload(stdinText);
 
     // FOREIGN-TOOL GUARD. This handler attributes every turn it records to `surface: "claude_code"`
     // with `source: provider-reported`, unconditionally — so it must refuse anything that is not
@@ -584,8 +727,136 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
     }
 
     const sessionId = typeof payload?.session_id === "string" ? payload.session_id : undefined;
-    const { usage, messageCount, fingerprint } = await normalize(transcriptPath);
-    const dedupKey = computeDedupKey({
+    // RUN END. `Stop` closes the run this session opened. One exact provisional successor may collapse
+    // into its predecessor only after this transcript exposes the structured task-notification row;
+    // every absent, malformed, foreign, or ambiguous case remains a separate run.
+    //
+    // NOT ON A DRY RUN. `--dry-run` promises "nothing written", and the run store is a write: closing
+    // the live run from a diagnostic invocation would exclude every receipt that lands afterwards from
+    // the run the user is actually in. The run-membership timestamp is the request's arrival at the
+    // gateway (`request_started_at`), so closing at this instant cannot drop the response this `Stop`
+    // is reporting on, however late its receipt is appended.
+    const correlationId = sessionId ? sessionCorrelationId(sessionId, env) : undefined;
+    let logicalIdentity: ClaudeLogicalRunIdentity | undefined;
+    let settledRun: import("../../core/gateway/run-boundary.js").UserRun | undefined;
+    let settledActivityEvent: ActivityEvent | undefined;
+    let settledPending: ClaudeSettledProvisionalPending | undefined;
+    let normalized: HookNormalizeResult | undefined;
+    let dedupKey: string | undefined;
+    let positiveSettlementEvidenceInsufficient = false;
+    const stopAt = now();
+    if (correlationId && !options.dryRun) {
+      const pending = claudeProvisionalPending(correlationId, env);
+      const taskNotification = pending
+        ? await hasClaudeTaskNotificationEvidence(stdinText, pending.prompt_correlation_id, env)
+        : false;
+      if (pending?.phase === "settled") {
+        normalized = await normalize(transcriptPath);
+        dedupKey = computeDedupKey({
+          sessionId,
+          fingerprint: normalized.fingerprint,
+          messageCount: normalized.messageCount,
+          inputTokens: typeof normalized.usage.input_tokens === "number" ? normalized.usage.input_tokens : null,
+          outputTokens: typeof normalized.usage.output_tokens === "number" ? normalized.usage.output_tokens : null
+        });
+        if (!taskNotification || dedupKey !== pending.dedup_key) {
+          console.log("compaction hook: frozen Claude settlement did not match this exact Stop - nothing recorded.");
+          return;
+        }
+        settledPending = pending;
+        settledActivityEvent = pending.event;
+        logicalIdentity = { runId: pending.event.run_id!, sessionId: pending.event.session_id! };
+      } else if (pending?.phase === "open" && taskNotification) {
+        const projected = projectClaudePositiveSettlement(correlationId, stopAt, pending, env);
+        normalized = await normalize(transcriptPath);
+        dedupKey = computeDedupKey({
+          sessionId,
+          fingerprint: normalized.fingerprint,
+          messageCount: normalized.messageCount,
+          inputTokens: typeof normalized.usage.input_tokens === "number" ? normalized.usage.input_tokens : null,
+          outputTokens: typeof normalized.usage.output_tokens === "number" ? normalized.usage.output_tokens : null
+        });
+        if (projected) {
+          try {
+            settledActivityEvent = buildClaudeStopActivityEvent({
+              run: projected,
+              window: await readReceiptWindow(cwd),
+              calibrationResolver: await loadOutputCalibrationResolver(env)
+            });
+          } catch {
+            // Without exact frozen bytes, a positive pair may not collapse into unrecoverable state.
+          }
+          if (!settledActivityEvent) {
+            const priorRun = completedUserRuns(correlationId, env)
+              .find((run) => run.run_seq === projected.run_seq - 1);
+            const priorIdentity = priorRun ? claudeLogicalRunIdentity(priorRun) : undefined;
+            let baseline: ClaudeTranscriptUsageBaseline | undefined;
+            if (priorIdentity && sessionId) {
+              const priorRecord = exactPriorClaudeHookRecord(
+                await loadHookUsageRecords(hookDir(cwd)),
+                {
+                  sessionId,
+                  logicalRunId: priorIdentity.runId,
+                  before: projected.started_at
+                }
+              );
+              if (
+                priorRecord &&
+                (priorRecord.tokenSource === "provider-reported" || priorRecord.tokenSource === "local-estimate")
+              ) {
+                baseline = {
+                  inputTokens: priorRecord.inputTokens,
+                  outputTokens: priorRecord.outputTokens,
+                  cacheReadInputTokens: priorRecord.cacheReadInputTokens,
+                  cacheCreationInputTokens: priorRecord.cacheCreationInputTokens,
+                  tokenSource: priorRecord.tokenSource
+                };
+              }
+            }
+            const shapingOutcome = sessionId
+              ? await lastTurnShapingOutcome(
+                  { tool: "claude-code", sessionId },
+                  env,
+                  () => new Date(stopAt)
+                )
+              : undefined;
+            settledActivityEvent = buildClaudeTranscriptStopActivityEvent({
+              run: projected,
+              usage: normalized.usage,
+              shaped: shapingOutcome === "shape" || shapingOutcome === "shape-basic",
+              ...(baseline ? { baseline } : {})
+            });
+            positiveSettlementEvidenceInsufficient = settledActivityEvent === undefined;
+          }
+        }
+        settledPending = projected && settledActivityEvent
+          ? commitClaudeSettlement(correlationId, stopAt, pending, dedupKey, settledActivityEvent, env)
+          : undefined;
+        if (!settledPending) {
+          console.log(
+            positiveSettlementEvidenceInsufficient
+              ? "compaction hook: the final Claude transcript did not carry usable token axes for exact continuation settlement - nothing recorded."
+              : projected
+              ? "compaction hook: exact Claude continuation settlement was not durable - retrying the same Stop is safe."
+              : "compaction hook: Claude continuation evidence did not resolve one exact run pair - nothing recorded."
+          );
+          return;
+        }
+        settledRun = projected;
+        logicalIdentity = projected ? claudeLogicalRunIdentity(projected) : undefined;
+      } else {
+        settledRun = endClaudeRun(
+          correlationId,
+          stopAt,
+          pending?.phase === "open" ? { expected: pending, taskNotification } : undefined,
+          env
+        );
+        logicalIdentity = settledRun ? claudeLogicalRunIdentity(settledRun) : undefined;
+      }
+    }
+    normalized ??= await normalize(transcriptPath);
+    const { usage, messageCount, fingerprint } = normalized;
+    dedupKey ??= computeDedupKey({
       sessionId,
       fingerprint,
       messageCount,
@@ -594,12 +865,83 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
     });
 
     const ledger = await loadLedger(cwd);
+    const existingRecord = await loadHookRecord(cwd, dedupKey);
+    const hashedSessionId = correlationId ? claudeLogicalSessionId(correlationId) : undefined;
+    const frozen = sessionId && hashedSessionId
+      ? frozenClaudeStopEvent(existingRecord, { rawSessionId: sessionId, hashedSessionId })
+      : undefined;
+    if (
+      settledPending &&
+      existingRecord &&
+      (!frozen || frozen.activity_event_id !== settledPending.event.activity_event_id)
+    ) {
+      // The run-store settlement is the first frozen authority. A pre-existing malformed or
+      // conflicting per-dedup record may never replace it, be overwritten, or trigger cleanup.
+      console.log("compaction hook: frozen Claude settlement conflicted with its hook record - nothing recorded.");
+      return;
+    }
+    if (frozen && existingRecord) {
+      // RECORD-BEFORE-LEDGER CRASH RECOVERY. The per-dedup record is written first so the immutable
+      // event survives a process exit or ledger-write failure. If the ledger entry is absent, restore
+      // only that entry from the validated record before attempting the activity append. Never rebuild
+      // the event from receipts/calibration/tier state after its run has already closed.
+      if (!isAlreadyRecorded(ledger, dedupKey)) {
+        const dir = hookDir(cwd);
+        await mkdir(path.join(dir, "records"), { recursive: true });
+        ledger.entries.push({
+          dedupKey,
+          ...(sessionId ? { sessionId } : {}),
+          recordedAt: existingRecord.recordedAt
+        });
+        await writeFile(path.join(dir, "ledger.json"), `${JSON.stringify(ledger, null, 2)}\n`, "utf8");
+      }
+      const replay = await appendClaudeCodeHookActivity({
+        cwd,
+        usage,
+        dedupKey,
+        ...(sessionId ? { sessionId } : {}),
+        settledEvent: frozen,
+        appendEvent: appendActivity
+      });
+      if (replay === "appended") {
+        const line = settledStopLineFromActivityEvent(frozen);
+        if (line && isReceiptLineEnabled(env)) printReceiptLine(line);
+      }
+      if (settledPending && replay !== "failed") {
+        completeClaudeSettlement(correlationId!, settledPending, env);
+      }
+      console.log(`compaction hook: already recorded this session state (dedup ${dedupKey.slice(0, 8)}…) - skipped.`);
+      return;
+    }
     if (isAlreadyRecorded(ledger, dedupKey)) {
+      // Legacy or malformed recorded state has no validated immutable whole-run event to replay.
+      // Preserve the historical dedup behavior; never reconstruct authority from changed receipts,
+      // calibration, tier, or a run which may already be closed.
       console.log(`compaction hook: already recorded this session state (dedup ${dedupKey.slice(0, 8)}…) - skipped.`);
       return;
     }
 
-    const record = buildClaudeCodeHookRecord({ usage, ...(sessionId ? { sessionId } : {}), messageCount, dedupKey, recordedAt: now() });
+    if (!settledActivityEvent && settledRun && logicalIdentity) {
+      try {
+        settledActivityEvent = buildClaudeStopActivityEvent({
+          run: settledRun,
+          window: await readReceiptWindow(cwd),
+          calibrationResolver: await loadOutputCalibrationResolver(env)
+        });
+      } catch {
+        // Exact gateway settlement is additive. Any read/validation failure retains the legacy
+        // transcript snapshot and never guesses a whole-run event.
+      }
+    }
+    const record = buildClaudeCodeHookRecord({
+      usage,
+      ...(sessionId ? { sessionId } : {}),
+      ...(logicalIdentity ? { logicalRunId: logicalIdentity.runId } : {}),
+      ...(settledActivityEvent ? { settledActivityEvent } : {}),
+      messageCount,
+      dedupKey,
+      recordedAt: now()
+    });
 
     if (options.dryRun) {
       console.log("compaction hook --dry-run: would record (content-free, nothing written):");
@@ -626,13 +968,46 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
     // id is DETERMINISTIC from session state (run_id = the content-free dedup key), so a re-captured
     // session yields the SAME id and the store dedupes it. Best-effort + content-free; a local
     // filesystem failure here never breaks the hook.
-    await appendClaudeCodeHookActivity({ cwd, usage, dedupKey, sessionId });
+    const activityResult = await appendClaudeCodeHookActivity({
+      cwd,
+      usage,
+      dedupKey,
+      ...(sessionId ? { sessionId } : {}),
+      ...(logicalIdentity ? { logicalIdentity } : {}),
+      ...(settledActivityEvent ? { settledEvent: settledActivityEvent } : {}),
+      appendEvent: appendActivity
+    });
+    if (settledPending && activityResult !== "failed") {
+      completeClaudeSettlement(correlationId!, settledPending, env);
+    }
 
     // PER-TURN RECEIPT LINE: the single canonical content-free line for this turn. Input+output when a
     // gateway receipt exists this session (the run routed through the local Gateway), else the
     // output-only hook line. Display only - it never changes what was recorded above, is silenced by
     // COMPACTION_RECEIPT_LINE=0, and is fully fail-open (prints nothing on any error).
-    await printPerTurnReceiptLine({ cwd, usage, readReceipt, print: printReceiptLine, env });
+    // SCOPED TO THIS SESSION. `sessionId` is Claude Code's own `session_id` from the Stop payload, the
+    // same identifier its `UserPromptSubmit` payload and its status-line stdin carry — so this hook reads
+    // the decision ITS session recorded and can never pick up a concurrent session's. Absent ⇒ no scope ⇒
+    // no shaping claim on this line.
+    const shapingScope: ShapingTurnScope | undefined = sessionId ? { tool: "claude-code", sessionId } : undefined;
+    if (settledActivityEvent) {
+      // A gateway-backed run has ONE durable shared line. Do not print a false final if persistence
+      // failed; replay of the same Stop will append and print the frozen event exactly once.
+      if (activityResult !== "failed" && isReceiptLineEnabled(env)) {
+        const line = settledStopLineFromActivityEvent(settledActivityEvent);
+        if (line) printReceiptLine(line);
+      }
+    } else {
+      await printPerTurnReceiptLine({ cwd, usage, readReceipt, print: printReceiptLine, env, shapingScope });
+    }
+
+    // THE RECORD DELIBERATELY SURVIVES THIS HOOK. Stop used to delete it here, one line after printing
+    // the receipt line above — but Claude Code swallows hook stdout, so that line is invisible and the
+    // status line is what the user actually reads. The status line renders AGAIN once the turn is
+    // final, and with the record gone it found no evidence and redrew the finished turn as a bare
+    // `input N · output M`, dropping the reduction and the `basic shaping` label it had been showing
+    // throughout. The next `UserPromptSubmit` overwrites the record with its own turn's decision —
+    // unconditionally, for every outcome — so ending it here bought nothing and cost the turn its line.
 
     if (hostedIsConfigured()) {
       const rec = await recordCaptureContentFree(resolveApiConfig(), { usage, tool: "claude-code", reference: `hook:${dedupKey}` });
@@ -691,6 +1066,37 @@ export interface ShapePromptHookDeps {
   env?: NodeJS.ProcessEnv;
   /** Where the injection JSON is written (defaults to process.stdout). */
   write?: (text: string) => void;
+  /** Injectable clock for run-boundary tests. */
+  now?: () => string;
+}
+
+/**
+ * The shaping scope for a Claude Code hook payload: its own `session_id`, or `undefined` when the payload
+ * has none (or is unparseable). Parsed defensively and separately from `decideShaping` so a malformed
+ * payload costs the turn its shaping CLAIM, never its shaping — the decision still stands, it simply is
+ * not attributable to a session and so is not recorded.
+ *
+ * Content-free: only `session_id` is read; the prompt text is never touched here.
+ */
+function claudeCodeScopeFromHookStdin(
+  stdinText: string
+): Extract<ShapingTurnScope, { tool: "claude-code" }> | undefined {
+  try {
+    const payload = JSON.parse(stdinText) as { session_id?: unknown } | null;
+    const sessionId = typeof payload?.session_id === "string" ? payload.session_id : undefined;
+    return sessionId ? { tool: "claude-code", sessionId } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function claudePromptIdFromHookStdin(stdinText: string): string | undefined {
+  try {
+    const payload = JSON.parse(stdinText) as { prompt_id?: unknown } | null;
+    return typeof payload?.prompt_id === "string" ? payload.prompt_id : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -719,10 +1125,56 @@ export async function captureClaudeCodeShapeFromPromptHook(deps: ShapePromptHook
   const write = deps.write ?? ((text: string) => process.stdout.write(text));
   try {
     const stdinText = await readStdin();
-    const decision = await decideShaping("claude-code", stdinText, deps.env ?? process.env);
+    const env = deps.env ?? process.env;
+    const now = deps.now ?? (() => new Date().toISOString());
     // See `hooks shape`: the status line needs to know whether THIS turn was shaped, and only the
-    // decision itself knows that.
-    await recordShapingOutcome(decision.outcome, deps.env ?? process.env);
+    // decision itself knows that. Recorded UNDER THIS SESSION'S ID, taken from the same payload the
+    // decision was made from, so the status line and Stop hook for THIS session — and no other — can
+    // read it. No `session_id` ⇒ no scope ⇒ nothing recorded and nothing later claimed.
+    const scope = claudeCodeScopeFromHookStdin(stdinText);
+    // RUN START. `UserPromptSubmit` is the only deterministic beginning of one user request, and this
+    // hook is the one that ALWAYS runs on it (the recommendation hook returns early when a prompt has
+    // no avoidable context, so it cannot mark boundaries). Marking it here lets the status line
+    // describe the whole run instead of whichever provider call landed last.
+    //
+    // Keyed by the SAME session correlation the gateway writes on each receipt — a device-local keyed
+    // hash, never the session id — so membership is `same session AND inside this run's interval`, and
+    // two concurrent sessions in one directory cannot mix. Best-effort: a device with no run marker
+    // simply keeps the per-receipt rendering it had before.
+    if (scope?.sessionId) {
+      const correlationId = sessionCorrelationId(scope.sessionId, env);
+      if (correlationId) {
+        const pending = claudeProvisionalPending(correlationId, env);
+        const taskNotification = pending?.phase === "open"
+          ? await hasClaudeTaskNotificationEvidence(stdinText, pending.prompt_correlation_id, env)
+          : false;
+        const promptId = claudePromptIdFromHookStdin(stdinText);
+        startClaudeUserRun(
+          correlationId,
+          promptId === undefined
+            ? undefined
+            : claudePromptCorrelationId(scope.sessionId, promptId, env),
+          now(),
+          pending?.phase === "open" ? { expected: pending, taskNotification } : undefined,
+          env
+        );
+      }
+    }
+    // DROP THE PREVIOUS TURN'S RECORD **BEFORE** THE FALLIBLE DECISION, not after it. `decideShaping`
+    // can THROW: `classifyShapingTask` deliberately re-raises everything that is not a module-absence
+    // error, so a runtime fault inside the classifier — or a missing dependency OF the classifier —
+    // propagates here and lands in the fail-open catch below, skipping the write entirely. A record
+    // now outlives Stop by design, so that turn would inherit the PREVIOUS turn's `shape` and the
+    // status line would draw `basic shaping` and an estimated reduction for a turn on which this hook
+    // emitted nothing at all — a savings claim for shaping that never happened, which is the exact
+    // class of defect this record exists to prevent.
+    //
+    // Invalidating first makes that inheritance impossible: from this line on, the worst case is a
+    // plain count. The success path records the real decision one await later, and the gap between
+    // the two is the very start of a turn, before the model has produced any output.
+    await invalidateShapingTurnRecord(scope, env);
+    const decision = await decideShaping("claude-code", stdinText, env);
+    await recordShapingOutcome(scope, decision.outcome, env);
     if (decision.stdout !== "") write(decision.stdout);
     // Non-shape outcomes (dormant/stopped, planning-hold, parse error) emit NOTHING: the prompt runs unchanged.
   } catch {

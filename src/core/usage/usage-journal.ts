@@ -1,6 +1,6 @@
 /**
  * Client hash-chained usage journal (PUBLIC client) — the append-only, content-free,
- * device-signed record of metered `optimized-input-v1` full-applies, and the LOCAL consumed-so-far
+ * device-signed record of metered optimized-input full-applies, and the LOCAL consumed-so-far
  * tally that enforces the allowance ceiling WITHIN the life of one lease.
  *
  * It is no longer the only ceiling: the SERVER subtracts the consumption it has recorded
@@ -30,8 +30,14 @@
  * module never touches a private key.
  *
  * CONTENT-FREE: fixed fields only (ids, counts, labels, timestamps). The ids kept here
- * (`event_id`/`receipt_id`/`lease_id`/`device_id`) are journal-only; they are NEVER rendered in the
- * content-free gateway receipt. `optimized_input_tokens` is a PRODUCT ALLOWANCE unit, never a bill.
+ * (`event_id`/`recovery_id` — `receipt_id` on legacy schema v1 —/`lease_id`/`device_id`) are
+ * journal-only; they are NEVER rendered in the content-free gateway receipt.
+ * `optimized_input_tokens` is a PRODUCT ALLOWANCE unit, never a bill.
+ *
+ * THREE SIGNED SHAPES, ONE CHAIN. Schema v1 names the recovery id `receipt_id`; v2 names it
+ * `recovery_id`; v3 additionally signs the before/after input-only meter basis. Nothing here
+ * branches on that: the serializer this module hashes and verifies through does, so one journal may
+ * hold all three as one unbroken chain. A mixed SCHEMA version is normal and must never fail closed.
  */
 import { appendFile, mkdir, open, readFile, rm, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -41,6 +47,8 @@ import { publicKeyFromSpkiB64u, verifyDetachedSignature } from "../crypto/ed2551
 import {
   canonicalUsageEventBytes,
   parseUsageEvent,
+  ACTIVE_USAGE_METER_VERSION,
+  KNOWN_USAGE_METER_VERSIONS,
   type UsageEvent
 } from "./usage-event.js";
 import { readReconciliationWatermark, watermarkForPeriod } from "./reconciliation-watermark.js";
@@ -54,8 +62,8 @@ export const USAGE_CHAIN_DOMAIN = "compaction-usage-chain-v1";
 /** The fixed genesis `prev_hash` for the first entry in a journal. */
 export const USAGE_CHAIN_GENESIS = "0".repeat(64);
 
-/** A stored journal line: the signed event + its device signature + the hash-chain links. */
-export interface UsageJournalEntry extends UsageEvent {
+/** The per-line fields the journal adds on top of the signed event payload. */
+export interface UsageJournalChainFields {
   /** Base64url Ed25519 signature over `canonicalUsageEventBytes(event)` with the DEVICE private key. */
   device_event_signature: string;
   /** The previous entry's `entry_hash` (or the genesis constant for the first entry). */
@@ -65,6 +73,13 @@ export interface UsageJournalEntry extends UsageEvent {
   /** OPTIONAL: the engine-reported debit event id, recorded for reconciliation (client id is authoritative). */
   engine_event_id?: string;
 }
+
+/**
+ * A stored journal line: the signed event + its device signature + the hash-chain links. An
+ * INTERSECTION rather than an `extends`, because `UsageEvent` is a discriminated union — this
+ * distributes over all schema versions and keeps `schema_version` narrowing an entry to its shape.
+ */
+export type UsageJournalEntry = UsageEvent & UsageJournalChainFields;
 
 /** Absolute path of the usage journal (`<configDir>/usage-journal.jsonl`). */
 export function usageJournalPath(env: ConfigDirEnv = process.env): string {
@@ -248,7 +263,20 @@ async function withJournalLock<T>(env: ConfigDirEnv, onLockFailure: () => T, fn:
 }
 
 export type AppendUsageEventResult =
-  | { appended: true; path: string; event_id: string; entry_hash: string }
+  | {
+      appended: true;
+      path: string;
+      event_id: string;
+      entry_hash: string;
+      /**
+       * Allowance left for the period AFTER this debit — the AUTHORITATIVE figure, because it is the
+       * fresh under-lock tally minus the entry that was just written, not the caller's pre-dispatch
+       * snapshot. Concurrent applies all observe the same stale snapshot before dispatch, so a
+       * countdown derived from it would show headroom that a sibling request has already spent.
+       * Never negative: the ceiling check above refuses the whole request before reaching here.
+       */
+      remaining_tokens: number;
+    }
   | { appended: false; reason: string };
 
 /**
@@ -284,8 +312,8 @@ export interface AppendCeiling {
  * the apply (original forwarded unchanged).
  *
  * `ceiling` IS REQUIRED, and `options` with it: every entry this function writes is a metered debit
- * against a period allowance (the non-debitable subscription route writes nothing at all), so there
- * is no append for which the re-check is optional. It was optional when introduced, which left the
+ * against a period allowance (a turn that compacts no input writes nothing at all — output shaping
+ * alone is never a debit, on any route), so there is no append for which the re-check is optional. It was optional when introduced, which left the
  * invariant compiler-enforced on the metering context and convention-enforced here — the same
  * asymmetry that allowed the original check-then-debit race. If a genuinely non-metered append is
  * ever needed, it belongs in its own function with its own type, not behind an optional field here.
@@ -316,6 +344,26 @@ export async function appendUsageEvent(
       // Checking the ceiling first would mislabel a re-submitted debit as a ceiling refusal.
       if (entries.some((existing) => existing.event_id === event.event_id)) {
         return { appended: false, reason: `duplicate event_id ${event.event_id} - already recorded (dedupe; nothing written)` };
+      }
+
+      // THE ENTRY MUST BE DENOMINATED IN THE UNIT THE TALLY COUNTS. The ceiling below compares this
+      // event's count against a tally of ACTIVE-unit entries only, so an event stamped with any other
+      // unit would be checked against a balance it will never join: it passes the ceiling, is written,
+      // and is then skipped by every subsequent read — an unbounded run of applies that consume
+      // nothing. That is not a hypothetical shape. `resolveMeteredOptimizedInput` still returns the
+      // documented `chars/4` fallback stamped `optimized-input-v1-fallback-chars4` when the engine
+      // omits its count, and that estimate measures the PRE-MUTATION body — a v1 throughput quantity.
+      // It cannot be charged to a balance denominated in tokens REMOVED, and it must not be charged
+      // at zero cost either.
+      //
+      // So refuse it. The reason is deliberately NOT an allowance-ceiling reason: the caller's
+      // fail-closed path forwards the original unchanged rather than degrading, because this is an
+      // integrity condition (a debit that cannot be expressed) and not a user out of allowance.
+      if (event.meter_version !== ACTIVE_USAGE_METER_VERSION) {
+        return {
+          appended: false,
+          reason: "meter-version-not-active - this debit is denominated in a superseded unit and cannot be charged to the active allowance (nothing written; fail-closed)"
+        };
       }
 
       // FRESH tally under the lock, integrity-gated exactly as `readPeriodConsumption` is (a
@@ -355,15 +403,37 @@ export async function appendUsageEvent(
       };
       const path = usageJournalPath(env);
       await appendFile(path, `${JSON.stringify(entry)}\n`, { encoding: "utf8", mode: 0o600 });
-      return { appended: true, path, event_id: event.event_id, entry_hash: entryHash };
+      return {
+        appended: true,
+        path,
+        event_id: event.event_id,
+        entry_hash: entryHash,
+        // Both terms come from inside the lock: `consumption.remaining` is the fresh integrity-gated
+        // tally, and the token count is the one the entry just written actually commits.
+        remaining_tokens: consumption.remaining - event.optimized_input_tokens
+      };
     }
   );
 }
 
-/** Sum `optimized_input_tokens` across the entries for one `period_id` (the consumed-so-far tally). */
-export function sumOptimizedInputTokensForPeriod(entries: UsageJournalEntry[], periodId: string): number {
+/**
+ * Sum `optimized_input_tokens` across the entries for one `period_id` (the consumed-so-far tally),
+ * IN ONE UNIT.
+ *
+ * The unit parameter is not decoration. Across a migration boundary a period holds entries in two
+ * incomparable quantities — v1 counted tokens INSPECTED, v2 counts tokens REMOVED, and v1 runs ~19x
+ * v2 on real data. A meter-blind sum here is a number with no meaning, and `compaction usage` printed
+ * exactly that: a two-unit total presented as "metered this period", with the difference against the
+ * unreconciled tally then rendered as a reconciliation that never happened. Both figures are on the
+ * one surface whose entire job is not overstating what is known.
+ */
+export function sumOptimizedInputTokensForPeriod(
+  entries: UsageJournalEntry[],
+  periodId: string,
+  meterVersion: string = ACTIVE_USAGE_METER_VERSION
+): number {
   return entries
-    .filter((entry) => entry.period_id === periodId)
+    .filter((entry) => entry.period_id === periodId && entry.meter_version === meterVersion)
     .reduce((sum, entry) => sum + entry.optimized_input_tokens, 0);
 }
 
@@ -387,9 +457,24 @@ export function sumOptimizedInputTokensForPeriod(entries: UsageJournalEntry[], p
 export function sumUnreconciledOptimizedInputTokensForPeriod(
   entries: UsageJournalEntry[],
   periodId: string,
-  reconciledThroughEntryHash?: string
+  reconciledThroughEntryHash?: string,
+  /**
+   * THE UNIT THIS BALANCE IS DENOMINATED IN. `optimized-input-v1` counts tokens INSPECTED;
+   * `optimized-input-v2` counts tokens actually REMOVED. They are different quantities and summing
+   * them produces a number that means nothing.
+   *
+   * So the tally counts ONLY entries stamped with the meter the allowance is denominated in. A period
+   * containing both (only possible across a migration boundary) charges the active meter's entries and
+   * leaves the other unit's history for audit, where it stays labelled and is never reinterpreted.
+   *
+   * DEFAULTS TO THE ACTIVE UNIT, never to a superseded one. A default naming the old meter is the
+   * ceiling-bypass shape wearing a friendly name: it looks like backwards compatibility and it makes
+   * every caller that forgets the argument sum to ZERO. `compaction usage` was exactly that caller —
+   * it reported a full untouched allowance to a device that had spent, on a user-facing surface.
+   */
+  meterVersion: string = ACTIVE_USAGE_METER_VERSION
 ): number {
-  const inPeriod = entries.filter((entry) => entry.period_id === periodId);
+  const inPeriod = entries.filter((entry) => entry.period_id === periodId && entry.meter_version === meterVersion);
   const cut =
     reconciledThroughEntryHash === undefined
       ? -1
@@ -540,7 +625,38 @@ function consumptionFromJournalRead(
   if (read.skipped.length > 0) return { ok: false, reason: "usage-journal-malformed-line" };
   const chain = verifyUsageChain(read.entries);
   if (!chain.valid) return { ok: false, reason: "usage-journal-chain-invalid" };
-  const consumed = sumUnreconciledOptimizedInputTokensForPeriod(read.entries, periodId, reconciledThroughEntryHash);
+  // THE UNIT COMES FROM THE ONE CONSTANT THE WRITER ALSO STAMPS, and a unit this client cannot place
+  // fails CLOSED.
+  //
+  // Two failure modes pull in opposite directions here and both are real.
+  //
+  // FAIL-OPEN: if the version this reader filters on ever differs from the version the writer stamps,
+  // every check computes `consumed = 0` and the allowance stops existing while still looking
+  // enforced. `ACTIVE_USAGE_METER_VERSION` keeps the reader
+  // and `resolveMeteredOptimizedInput` name the SAME constant, so they cannot drift.
+  //
+  // FAIL-CLOSED-TOO-HARD: an earlier attempt derived the unit from the period's own entries and
+  // refused any period carrying more than one. That bricks a device on the day the meter changes —
+  // the current period already holds v1 entries, the first v2 debit makes the period mixed, and every
+  // subsequent apply declines for the rest of the period. Our own migration is not the user's fault
+  // and must not cost them the capability.
+  //
+  // So: a KNOWN superseded unit (v1, and the v1 chars/4 fallback) is audit history. It is skipped —
+  // never summed into the active tally, never reinterpreted as active-unit tokens — because it was
+  // charged against a different allowance in a different quantity (v1 throughput runs ~19x v2 on real
+  // data, so a mixed sum means nothing). An UNRECOGNISED unit is a quantity this client cannot place
+  // at all, most likely because it is behind the writer, and skipping it would silently drop real
+  // consumption. That one refuses the tally.
+  const unplaceable = read.entries.some(
+    (entry) => entry.period_id === periodId && !KNOWN_USAGE_METER_VERSIONS.has(entry.meter_version)
+  );
+  if (unplaceable) return { ok: false, reason: "usage-journal-unknown-meter-version" };
+  const consumed = sumUnreconciledOptimizedInputTokensForPeriod(
+    read.entries,
+    periodId,
+    reconciledThroughEntryHash,
+    ACTIVE_USAGE_METER_VERSION
+  );
   return { ok: true, consumed, remaining: allowanceTokens - consumed };
 }
 

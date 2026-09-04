@@ -91,7 +91,7 @@ export interface WorkflowRouting {
   defaultProvider?: string;
   /** True when the integration only records session activity (no gateway provider routing). */
   activityOnly: boolean;
-  /** True when only a local estimate is possible (the provider emits no usage; vendor gap). */
+  /** True when the current Compaction integration can produce only a local estimate. */
   localEstimateOnly: boolean;
   /** Honest note about the routing mechanism (always present when not fully `true`). */
   routingNote: string;
@@ -236,8 +236,8 @@ export function deriveProviderCapabilities(
 /**
  * Workflow routing descriptors, grounded in the current integration: Codex's shim is capture/activity
  * (routable only if `OPENAI_BASE_URL` points at the Gateway); Claude Code is a post-session Stop hook
- * (activity-only); Cursor emits no provider usage (local-estimate vendor gap); the custom OpenAI-compatible
- * app is the primary gateway-routable path.
+ * (activity-only); Compaction does not ingest Cursor's conditional `result.usage` (local-estimate only);
+ * the custom OpenAI-compatible app is the primary gateway-routable path.
  */
 export const WORKFLOW_ROUTING: WorkflowRouting[] = [
   {
@@ -296,9 +296,9 @@ export const WORKFLOW_ROUTING: WorkflowRouting[] = [
     activityOnly: false,
     localEstimateOnly: true,
     routingNote:
-      "Cursor emits no provider usage and cannot be routed through the Gateway (vendor gap); Compaction can only produce a local estimate of activity.",
+      "Cursor cannot be routed through the Gateway; although its headless output can conditionally include result.usage, Compaction does not ingest or attribute those fields and currently produces only a local estimate of activity.",
     unavailableReason:
-      "Cursor is detected, installable, and plan-auth-ready (content-free local estimate of activity); only provider cache proof is unavailable because Cursor emits no provider usage (vendor gap) and cannot be routed through the Gateway. The workflow itself is not unavailable."
+      "Cursor is detected, installable, and plan-auth-ready (content-free local estimate of activity); provider cache proof is unavailable because Cursor cannot be routed through the Gateway. Its headless output can conditionally include result.usage, but Compaction does not ingest or attribute those fields today. The workflow itself is not unavailable."
   }
 ];
 

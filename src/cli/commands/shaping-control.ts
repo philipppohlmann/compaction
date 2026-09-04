@@ -36,6 +36,7 @@ import {
 } from "../../core/subscription-shaping-state.js";
 import { SHAPING_HOOKS_ENV } from "../../core/output-shaping-hook-activation.js";
 import { isShapingTaskClassifierPresent } from "../../core/gateway/task-awareness-seam.js";
+import { hasValidFullApplyLease } from "../../core/entitlement/lease-store.js";
 
 /** True when the env kill-switch is thrown (so `start` can honestly warn it is still overridden by env). */
 function killSwitchThrown(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -44,13 +45,15 @@ function killSwitchThrown(env: NodeJS.ProcessEnv = process.env): boolean {
 }
 
 /**
- * Whether the gateway APPLY-ROUTING lever is even available to this session: it needs the API-key path
- * (`ANTHROPIC_API_KEY`). Presence only - the value is never read. A subscription/saved-login session has
- * no key, so it has only the output-shaping lever; the copy states that honestly (never claims to have
- * turned off an apply lever the user does not have).
+ * Whether the gateway APPLY-ROUTING lever is even available to this session. It needs a credential that
+ * entitles apply, which is EITHER the API-key path (`ANTHROPIC_API_KEY`, presence only - the value is
+ * never read) OR a verified entitlement lease on this device. Mirrors condition 1 of the apply-routing
+ * dormant guard exactly, so `stop`/`start` never claim to have switched a lever the user does not have -
+ * and, since an activated Community device DOES have it, never omit one they do.
  */
 function applyRoutingLeverAvailable(env: NodeJS.ProcessEnv = process.env): boolean {
-  return Boolean(env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim() !== "");
+  if (env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim() !== "") return true;
+  return hasValidFullApplyLease(env);
 }
 
 /**
@@ -65,7 +68,7 @@ function leversLine(env: NodeJS.ProcessEnv): { levers: string; verb: "is" | "are
     levers: "Output shaping",
     verb: "is",
     subscriptionNote:
-      "  (no ANTHROPIC_API_KEY: this session has only the output-shaping lever - apply routing needs the API-key path.)"
+      "  (no API key and no verified entitlement lease: this session has only the output-shaping lever.)"
   };
 }
 

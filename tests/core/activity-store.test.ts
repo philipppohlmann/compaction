@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   buildMeasureOnlyActivityEvent,
   ACTIVITY_EVENT_ID_PATTERN,
+  computeActivityEventId,
   type ActivityEvent
 } from "../../src/core/activity-event.js";
 import {
@@ -32,6 +33,7 @@ import {
   validateActivityEventForStore
 } from "../../src/core/activity-store.js";
 import type { StandardCrossSurfaceEvent } from "../../src/core/cross-surface-event.js";
+import { TEST_OUTPUT_POLICY_VERSION } from "../helpers/output-calibration-fixture.js";
 
 const BASE_EVENT: StandardCrossSurfaceEvent = {
   surface: "cursor",
@@ -44,7 +46,8 @@ const BASE_EVENT: StandardCrossSurfaceEvent = {
   },
   input_before: 800,
   cost_source: "unavailable",
-  cost_unavailable_reason: "Cursor emits no usage or cost data; no cost figure exists for this run",
+  cost_unavailable_reason:
+    "Compaction does not ingest Cursor's conditional result.usage, and no per-run cost or billing figure is available; no cost figure exists for this run",
   claim_scope: "run-scoped"
 };
 
@@ -118,6 +121,250 @@ describe("activity store - append/read/list round-trip (tmpdir)", () => {
     expect((await appendActivityEvent(measureOnly({ run_id: "cursor-1751600000002" }), dir)).appended).toBe(true);
     const { events } = await readActivityEvents(dir);
     expect(events).toHaveLength(2);
+  });
+
+  it("keeps physical Claude snapshots append-only while the public reader/list keep only the latest cumulative run", async () => {
+    const identity: Partial<ActivityEvent> = {
+      surface: "claude_code" as const,
+      provider: "anthropic" as const,
+      workflow_id: "claude-stop",
+      session_id: `claude-session-${"1".repeat(32)}`,
+      run_id: `claude-stop-${"2".repeat(32)}`,
+      token_source: {
+        input: { source: "provider-reported" as const },
+        output: { source: "provider-reported" as const }
+      },
+      claim_scope: "run-scoped",
+      evidence_level: "exact correlated gateway run",
+      approval_status: "not-required",
+      recovery: { original_retained: false },
+      sync_status: "local-only",
+      activity_kind: "claude-stop",
+      run_started_at: "2026-07-30T09:59:00.000Z",
+      measurement_source: "gateway-run"
+    };
+    const parentBase = {
+      ...identity,
+      input_before: 100,
+      output_after: 20,
+      recorded_at: "2026-07-30T10:00:00.000Z"
+    } as ActivityEvent;
+    const finalBase = {
+      ...identity,
+      input_before: 180,
+      output_after: 35,
+      recorded_at: "2026-07-30T10:01:00.000Z"
+    } as ActivityEvent;
+    const parent = { ...parentBase, activity_event_id: computeActivityEventId(parentBase) };
+    const final = { ...finalBase, activity_event_id: computeActivityEventId(finalBase) };
+    expect((await appendActivityEvent(parent, dir)).appended).toBe(true);
+    expect((await appendActivityEvent(final, dir)).appended).toBe(true);
+    expect((await readFile(join(dir, ACTIVITY_LOG_FILENAME), "utf8")).trim().split("\n")).toHaveLength(2);
+    const { events } = await readActivityEvents(dir);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.input_before).toBe(180);
+    expect((await listActivityEvents(dir)).summaries).toHaveLength(1);
+    // The hidden parent snapshot still owns its physical idempotency key.
+    const replay = await appendActivityEvent(parent, dir);
+    expect(replay.appended).toBe(false);
+    if (!replay.appended) expect(replay.reason).toContain("duplicate activity_event_id");
+    expect((await readFile(join(dir, ACTIVITY_LOG_FILENAME), "utf8")).trim().split("\n")).toHaveLength(2);
+  });
+
+  it("lets a validated final Claude Stop supersede its exact earlier hook-only legacy snapshot", async () => {
+    const sessionId = `claude-session-${"a".repeat(32)}`;
+    const runId = `claude-stop-${"b".repeat(32)}`;
+    const legacy = measureOnly({
+      surface: "claude_code",
+      provider: "anthropic",
+      session_id: sessionId,
+      run_id: runId,
+      input_before: 100,
+      output_after: 20,
+      token_source: {
+        input: { source: "provider-reported" },
+        output: { source: "provider-reported" }
+      }
+    });
+    const finalBase: ActivityEvent = {
+      surface: "claude_code",
+      provider: "anthropic",
+      workflow_id: "claude-stop",
+      session_id: sessionId,
+      run_id: runId,
+      input_before: 180,
+      output_after: 35,
+      token_source: {
+        input: { source: "provider-reported" },
+        output: { source: "provider-reported" }
+      },
+      claim_scope: "workflow-scoped",
+      evidence_level: "final normalized Claude transcript cumulative session usage",
+      approval_status: "not-required",
+      recovery: { original_retained: false },
+      sync_status: "local-only",
+      activity_kind: "claude-stop",
+      run_started_at: "2026-07-30T09:59:00.000Z",
+      recorded_at: "2026-07-30T10:01:00.000Z",
+      measurement_source: "claude-transcript"
+    };
+    const final = { ...finalBase, activity_event_id: computeActivityEventId(finalBase) };
+    expect((await appendActivityEvent(legacy, dir)).appended).toBe(true);
+    expect((await appendActivityEvent(final, dir)).appended).toBe(true);
+    expect((await readFile(join(dir, ACTIVITY_LOG_FILENAME), "utf8")).trim().split("\n")).toHaveLength(2);
+    expect((await readActivityEvents(dir)).events).toEqual([final]);
+    expect((await listActivityEvents(dir)).summaries).toHaveLength(1);
+  });
+
+  it("keeps a legacy Claude snapshot separate when its count conflicts with the final transcript", async () => {
+    const sessionId = `claude-session-${"c".repeat(32)}`;
+    const runId = `claude-stop-${"d".repeat(32)}`;
+    const legacy = measureOnly({
+      surface: "claude_code",
+      provider: "anthropic",
+      session_id: sessionId,
+      run_id: runId,
+      input_before: 200,
+      output_after: 40,
+      token_source: {
+        input: { source: "provider-reported" },
+        output: { source: "provider-reported" }
+      }
+    });
+    const finalBase: ActivityEvent = {
+      surface: "claude_code",
+      provider: "anthropic",
+      workflow_id: "claude-stop",
+      session_id: sessionId,
+      run_id: runId,
+      input_before: 180,
+      output_after: 35,
+      token_source: {
+        input: { source: "provider-reported" },
+        output: { source: "provider-reported" }
+      },
+      claim_scope: "workflow-scoped",
+      evidence_level: "final normalized Claude transcript cumulative session usage",
+      approval_status: "not-required",
+      recovery: { original_retained: false },
+      sync_status: "local-only",
+      activity_kind: "claude-stop",
+      run_started_at: "2026-07-30T09:59:00.000Z",
+      recorded_at: "2026-07-30T10:01:00.000Z",
+      measurement_source: "claude-transcript"
+    };
+    const final = { ...finalBase, activity_event_id: computeActivityEventId(finalBase) };
+    await appendActivityEvent(legacy, dir);
+    await appendActivityEvent(final, dir);
+    expect((await readActivityEvents(dir)).events).toHaveLength(2);
+  });
+
+  it("keeps one logical Claude run when later calls legitimately change model, posture, token source, and policy", async () => {
+    const identity = {
+      surface: "claude_code" as const,
+      provider: "anthropic" as const,
+      workflow_id: "claude-stop",
+      session_id: `claude-session-${"6".repeat(32)}`,
+      run_id: `claude-stop-${"7".repeat(32)}`,
+      claim_scope: "run-scoped" as const,
+      evidence_level: "exact correlated gateway run",
+      approval_status: "not-required" as const,
+      recovery: { original_retained: false },
+      sync_status: "local-only" as const,
+      activity_kind: "claude-stop" as const,
+      run_started_at: "2026-07-30T09:59:00.000Z",
+      measurement_source: "gateway-run" as const,
+      output_shaping_state: "active" as const
+    };
+    const parentBase: ActivityEvent = {
+      ...identity,
+      model_label: "claude-opus-5",
+      input_before: 100,
+      output_after: 20,
+      token_source: {
+        input: { source: "provider-reported" },
+        output: { source: "provider-reported" }
+      },
+      policy_used: TEST_OUTPUT_POLICY_VERSION,
+      output_estimate_state: "unseeded",
+      apply_posture: "basic",
+      recorded_at: "2026-07-30T10:00:00.000Z"
+    };
+    const finalBase: ActivityEvent = {
+      ...identity,
+      // Mixed-model final snapshots truthfully omit one model and one policy label.
+      input_before: 180,
+      input_after: 160,
+      output_after: 35,
+      token_source: {
+        input: { source: "local-estimate" },
+        output: { source: "provider-reported" }
+      },
+      apply_posture: "full",
+      recorded_at: "2026-07-30T10:01:00.000Z"
+    };
+    const parent = { ...parentBase, activity_event_id: computeActivityEventId(parentBase) };
+    const final = { ...finalBase, activity_event_id: computeActivityEventId(finalBase) };
+    expect((await appendActivityEvent(parent, dir)).appended).toBe(true);
+    expect((await appendActivityEvent(final, dir)).appended).toBe(true);
+    expect((await readFile(join(dir, ACTIVITY_LOG_FILENAME), "utf8")).trim().split("\n")).toHaveLength(2);
+    const { events } = await readActivityEvents(dir);
+    expect(events).toEqual([final]);
+    expect((await listActivityEvents(dir)).summaries).toHaveLength(1);
+  });
+
+  it("fails closed to separate events for foreign/malformed identity, changed run window, or decreasing snapshots", async () => {
+    const run = `claude-stop-${"3".repeat(32)}`;
+    const shared = {
+      surface: "claude_code" as const,
+      provider: "anthropic" as const,
+      run_id: run,
+      token_source: {
+        input: { source: "provider-reported" as const },
+        output: { source: "provider-reported" as const }
+      }
+    };
+    await appendActivityEvent(measureOnly({
+      ...shared, session_id: `claude-session-${"4".repeat(32)}`, input_before: 100, output_before: 20
+    }), dir);
+    await appendActivityEvent(measureOnly({
+      ...shared, session_id: `claude-session-${"5".repeat(32)}`, input_before: 200, output_before: 30
+    }), dir);
+    await appendActivityEvent(measureOnly({
+      ...shared, session_id: `claude-session-${"4".repeat(32)}`, input_before: 90, output_before: 19
+    }), dir);
+    await appendActivityEvent(measureOnly({
+      ...shared, run_id: "claude-stop-malformed", session_id: `claude-session-${"4".repeat(32)}`,
+      input_before: 300, output_before: 40
+    }), dir);
+    const exactIdentity = {
+      surface: "claude_code" as const,
+      provider: "anthropic" as const,
+      workflow_id: "claude-stop",
+      session_id: `claude-session-${"8".repeat(32)}`,
+      run_id: `claude-stop-${"9".repeat(32)}`,
+      input_before: 100,
+      output_after: 10,
+      token_source: {
+        input: { source: "provider-reported" as const },
+        output: { source: "provider-reported" as const }
+      },
+      claim_scope: "run-scoped" as const,
+      evidence_level: "exact correlated gateway run",
+      approval_status: "not-required" as const,
+      recovery: { original_retained: false },
+      sync_status: "local-only" as const,
+      activity_kind: "claude-stop" as const,
+      measurement_source: "gateway-run" as const
+    };
+    for (const [run_started_at, recorded_at] of [
+      ["2026-07-30T09:59:00.000Z", "2026-07-30T10:00:00.000Z"],
+      ["2026-07-30T09:58:00.000Z", "2026-07-30T10:01:00.000Z"]
+    ] as const) {
+      const base: ActivityEvent = { ...exactIdentity, run_started_at, recorded_at };
+      await appendActivityEvent({ ...base, activity_event_id: computeActivityEventId(base) }, dir);
+    }
+    expect((await readActivityEvents(dir)).events).toHaveLength(6);
   });
 
   it("DEDUPES defensively on read: a hand-duplicated line keeps the first occurrence, skipped with a reason", async () => {

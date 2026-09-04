@@ -23,7 +23,8 @@ import { BEFORE_CALL_REDUCTION_LABEL, type BeforeCallRecommendation, type Before
 /** The honest per-tool reason the OUTPUT axis is unavailable at pre-call time. */
 const OUTPUT_UNAVAILABLE_REASON: Record<BeforeCallTool, string> = {
   codex: "no output tokens exist before the call; provider usage (turn.completed.usage) is only reported after codex runs",
-  cursor: "Cursor emits no provider usage, and no output exists before the call"
+  cursor:
+    "no output tokens exist before the call; Cursor's conditional result.usage can arrive only after the call and is not ingested by Compaction today"
 };
 
 /** A content-free, deterministic run id from the tool + local-estimate counts (never any content). */

@@ -41,9 +41,10 @@ import {
 } from "../../core/subscription-hooks-install.js";
 import { decideShaping } from "../../core/subscription-shaping-runtime.js";
 import { isShapingTaskClassifierPresent } from "../../core/gateway/task-awareness-seam.js";
-import { recordShapingOutcome } from "../../core/output-shaping-turn-state.js";
+import { invalidateShapingTurnRecord, recordShapingOutcome } from "../../core/output-shaping-turn-state.js";
+import type { ShapingTurnScope, ShapingTurnTool } from "../../core/output-shaping-turn-state.js";
 import { codexTurnLineCommand, codexTurnLineStdout } from "../../core/codex-turn-line-hook.js";
-import { computeStatusLine } from "./statusline.js";
+import { beginCodexTurn, settleCodexStop } from "../../core/codex-stop-usage.js";
 import { SHAPING_HOOKS_ENV } from "../../core/output-shaping-hook-activation.js";
 import {
   aggregateHookUsageRecords,
@@ -348,10 +349,22 @@ export function registerHooksCommand(program: Command): void {
       try {
         if (tool !== "codex" && tool !== "cursor") return; // unknown tool → hold (emit nothing)
         const stdinText = await readAllStdin();
+        // Codex names the exact session+turn on both lifecycle hooks. Validate before shaping, hash
+        // before persistence, and open the existing run-boundary store at UserPromptSubmit. Cursor's
+        // sessionStart surface remains tool-scoped.
+        const codexScope = tool === "codex" ? beginCodexTurn(stdinText) : undefined;
+        if (tool === "codex" && !codexScope) return;
+        const scope: ShapingTurnScope = tool === "codex"
+          ? codexScope!
+          : { tool: tool as Exclude<ShapingTurnTool, "codex" | "claude-code"> };
+        // Drop the previous turn's record before the fallible decision — same ordering, same reason, as
+        // the Claude Code prompt hook (see `captureClaudeCodeShapeFromPromptHook`). `decideShaping` can
+        // throw out of the classifier seam into the fail-open catch below, and a record now outlives
+        // the turn that wrote it, so recording only on success would let the previous turn's `shape`
+        // ride a turn this hook held. The real decision is recorded one await later.
+        await invalidateShapingTurnRecord(scope);
         const decision = await decideShaping(tool as SubscriptionHookTool, stdinText);
-        // Record WHAT WAS DECIDED so the per-turn line can tell a shaped turn from a held one. Without
-        // it the line falls back to activation state, which says nothing about this turn.
-        await recordShapingOutcome(decision.outcome);
+        await recordShapingOutcome(scope, decision.outcome);
         if (decision.stdout !== "") process.stdout.write(decision.stdout);
       } catch {
         // Fail-open: swallow everything, emit nothing, leave the prompt unchanged.
@@ -376,10 +389,8 @@ export function registerHooksCommand(program: Command): void {
           return;
         }
         const stdinText = await readAllStdin();
-        // The SAME renderer every other surface uses, so Codex can never show a line the status line
-        // would not. `computeStatusLine` already honours the receipt-line kill switch.
-        const line = await computeStatusLine(stdinText);
-        process.stdout.write(codexTurnLineStdout(line));
+        const settled = await settleCodexStop(stdinText);
+        process.stdout.write(codexTurnLineStdout(settled?.line));
       } catch {
         process.stdout.write("{}\n");
       }

@@ -40,10 +40,14 @@
  * - **Codex**, PER-PROMPT `UserPromptSubmit`. Same gate: with the classifier present, planning/reasoning
  *   turns HOLD (prose is plausibly load-bearing) and code/answer turns SHAPE; without it, blanket. On
  *   either shape outcome, emit `{ hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext } }`.
- * - **Cursor**, SESSION-LEVEL `sessionStart` only. There is NO per-prompt injecting hook on Cursor
- *   (`beforeSubmitPrompt` is block-only), so shaping is COARSE: one session-level "prefer concise"
- *   instruction, and it CANNOT do per-turn HOLD on planning turns — blanket by construction, on every
- *   tier. Emit `{ additional_context }`.
+ * - **Cursor**, reliable shipped floor: SESSION-LEVEL `sessionStart`. Cursor's vendor artifacts also
+ *   expose `beforeSubmitPrompt`: its response schema accepts `additional_context`, hook output
+ *   validation permits the field, and the bridge transports it as `additionalContext`. Those
+ *   artifacts prove the capability surface, not downstream model application on every supported
+ *   IDE/CLI path. IDE delivery remains behind `enable_hook_additional_context`, and the cross-path
+ *   live behavior has not passed release acceptance. Compaction 0.6.8 therefore conservatively keeps
+ *   the session hook: one coarse "prefer concise" instruction, with no per-turn HOLD on planning
+ *   turns in the shipped path. Emit `{ additional_context }`.
  */
 import { buildOutputShapingPolicy } from "./output-shaping.js";
 import { OUTPUT_SHAPING_HONESTY_NOTE } from "./output-shaping.js";
@@ -129,8 +133,9 @@ export async function decideShaping(
   if (!isShapingHooksActivated(env)) return HOLD_DORMANT;
 
   if (tool === "cursor") {
-    // Session-level only: no per-turn classification is possible. When activated, always emit the
-    // coarse session instruction. The stdin payload is not required and is never echoed.
+    // Reliable sessionStart floor: this shipped path performs no per-turn classification. When
+    // activated, always emit the coarse session instruction. The stdin payload is not required and
+    // is never echoed.
     return { stdout: `${JSON.stringify({ additional_context: shapingInstructionBlock() })}\n`, outcome: "shape" };
   }
 

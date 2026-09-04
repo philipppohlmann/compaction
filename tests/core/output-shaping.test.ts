@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildOutputShapingPolicy,
+  outputShapingPolicyVersion,
   OUTPUT_SHAPING_POLICIES,
   OUTPUT_SHAPING_HONESTY_NOTE
 } from "../../src/core/output-shaping.js";
@@ -28,6 +29,14 @@ describe("output-shaping policy family (deterministic)", () => {
     const r = buildOutputShapingPolicy({ policies: ["verbosity_budget"], verbosityBudgetTokens: 300 });
     expect(r.instructions).toContain("300 output tokens");
     expect(r.applied).toEqual([{ policy_name: "verbosity_budget", policy_family: "output_shaping", risk_level: "low" }]);
+  });
+
+  it("versions the exact emitted instruction bytes deterministically", () => {
+    const current = buildOutputShapingPolicy();
+    expect(current.policyVersion).toMatch(/^output-shaping\.v1\.sha256\.[a-f0-9]{64}$/);
+    expect(current.policyVersion).toBe(outputShapingPolicyVersion(current.instructions));
+    expect(buildOutputShapingPolicy().policyVersion).toBe(current.policyVersion);
+    expect(buildOutputShapingPolicy({ verbosityBudgetTokens: 300 }).policyVersion).not.toBe(current.policyVersion);
   });
 
   it("ignores unknown policy names (never invents a policy)", () => {

@@ -58,7 +58,7 @@ describe("plan-auth workflows derive a plan-lifetime (Route A) scope", () => {
     }
   });
 
-  it("Cursor plan-lifetime scope is local-estimate (vendor gap) but still plan-lifetime + not-directly-observable", () => {
+  it("Cursor plan-lifetime scope is local-estimate (Compaction parser gap) but still plan-lifetime + not-directly-observable", () => {
     const pl = planLifetime(scopesFor("cursor"));
     expect(pl).toBeDefined();
     expect(pl!.authMode).toBe("plan-auth");

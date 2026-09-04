@@ -4,12 +4,18 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { currentPeriodId, periodEndUtc } from "../../src/core/entitlement/lease.js";
 import { formatReceiptLine, receiptLineOutputOnly, upgradeNoticeLines } from "../../src/core/gateway/receipt-line.js";
-import { UPGRADE_CTA_LABEL } from "../../src/core/upgrade-cta.js";
+import {
+  COMMUNITY_LIMIT_CLAUSE,
+  COMMUNITY_LIMIT_RESETS_PREFIX,
+  communityLimitClause,
+  UPGRADE_CTA_LABEL
+} from "../../src/core/upgrade-cta.js";
 import { hyperlinkTarget } from "../../src/core/terminal-hyperlink.js";
 import { proUrl } from "../../src/core/pro-destination.js";
 import { resolveOpenTier, effectiveOpenTier, writeProductMode } from "../../src/core/onboarding-preferences.js";
 import { readLeaseVerdict } from "../../src/core/entitlement/lease-store.js";
 import { meterConfirmedApply } from "../../src/core/usage/usage-metering.js";
+import { ACTIVE_USAGE_METER_VERSION } from "../../src/core/usage/usage-event.js";
 import { computeStatusLine } from "../../src/cli/commands/statusline.js";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
 
@@ -54,7 +60,7 @@ describe("periodEndUtc — the allowance reset date", () => {
 });
 
 describe("the ceiling clause", () => {
-  it("says what happened, when it ends, and where to convert", () => {
+  it("says what happened and where to convert, and nothing else", () => {
     expect(
       formatReceiptLine({
         observedInput: 100,
@@ -66,9 +72,101 @@ describe("the ceiling clause", () => {
     ).toBe(
       // `input paused`, NOT `observed input 100`: at the ceiling the input axis states the pause. The
       // observed count is not wrong, but it is the one number a blocked user could read as a saving.
-      "compaction · input paused · output 20 · apply off · Community limit reached · input optimization paused until 2026-09-01 · " +
+      "compaction · input paused · output 20 · apply off · Community limit resets 2026-09-01 · " +
         `${UPGRADE_CTA_LABEL}: ${proUrl(PLAIN_TEXT_ENV)}`
     );
+  });
+
+  /**
+   * THE PROPERTY BEHIND THE PIN ABOVE, asserted separately so it cannot die inside it.
+   *
+   * The pin is an exact `toBe`, so if the clause ever regrows narration the pin fails FIRST and these
+   * rules never report — which is how a property rule silently stops being tested. Kept as its own
+   * case, driven by a DIFFERENT field set (a `full` tier, an `insufficient` reason, an explicit reset
+   * date), so the rule is exercised on inputs the pin does not cover.
+   */
+  it("states the reset date ONCE, inside the clause, and narrates nothing beside it", () => {
+    const line = formatReceiptLine({
+      // `inputAxisOwned` rather than the pin's `observedInput`: a gateway that saw the request can say
+      // `input paused` with no count at all, and that is the route the pin does not cover.
+      inputAxisOwned: true,
+      outputTokens: 20,
+      tier: "full",
+      allowancePauseReason: "insufficient",
+      allowanceResetsOn: "2026-09-01",
+      ctaEnv: PLAIN_TEXT_ENV
+    });
+    expect(line).toContain(`${COMMUNITY_LIMIT_RESETS_PREFIX} 2026-09-01`);
+    // The primary line must stay scannable: the two REDUNDANT clauses moved to the surfaces that hold
+    // sentences. Asserted as SUBSTRINGS of the words themselves, not the old sentence, so a reworded
+    // reintroduction is caught too.
+    expect(line).not.toContain("optimization paused");
+    expect(line).not.toContain("output shaping continues");
+    // THE DATE APPEARS EXACTLY ONCE. It is now part of the clause, so an absence rule would be false;
+    // what must stay true is that it is not ALSO narrated in a second clause, which is how the old
+    // `paused until <date>` grew beside it. A count is the rule that survives both rewordings.
+    expect(line.split("2026-09-01").length - 1).toBe(1);
+    expect(line).not.toContain("until 2026-09-01");
+    // ...and the pause is still SAID, by the axis that owns it. The user is not left guessing.
+    expect(line).toContain("input paused");
+  });
+
+  /**
+   * THE UNDATED FALLBACK, which the shape above cannot express.
+   *
+   * A pause can be real and undatable: `insufficient` is stamped per-turn and a receipt can carry no
+   * usable period. The clause must not degrade to a dangling `Community limit resets` with nothing
+   * after it, and it must not vanish — a blocked user with no clause reads a bare `apply off`, which
+   * describes a refusal as if it were the posture they chose.
+   */
+  it("falls back to the undated clause when the pause carries no usable date", () => {
+    const line = formatReceiptLine({
+      inputAxisOwned: true,
+      outputTokens: 20,
+      tier: "full",
+      allowancePauseReason: "insufficient",
+      ctaEnv: PLAIN_TEXT_ENV
+    });
+    expect(line).toContain(COMMUNITY_LIMIT_CLAUSE);
+    expect(line).not.toContain(COMMUNITY_LIMIT_RESETS_PREFIX);
+    // The blocked user still gets the pause and the way out.
+    expect(line).toContain("input paused");
+    expect(line).toContain(UPGRADE_CTA_LABEL);
+  });
+
+  /**
+   * A DATE THAT DID NOT PARSE IS NOT A DATE. The value is read back off a receipt under the working
+   * directory, which is not a trust boundary, so an unparseable one must take the undated form rather
+   * than reach the terminal verbatim inside a clause that reads as an authoritative promise.
+   */
+  it("refuses a malformed reset date rather than printing it", () => {
+    for (const bad of ["2026-13-01", "soon", "2026-09-01\u001b[2K", "", "2026-9-1"]) {
+      const line = formatReceiptLine({
+        inputAxisOwned: true,
+        outputTokens: 20,
+        tier: "full",
+        allowancePauseReason: "exhausted",
+        allowanceResetsOn: bad,
+        ctaEnv: PLAIN_TEXT_ENV
+      }) as string;
+      expect(line, bad).toContain(COMMUNITY_LIMIT_CLAUSE);
+      expect(line, bad).not.toContain(COMMUNITY_LIMIT_RESETS_PREFIX);
+      if (bad !== "") expect(line, bad).not.toContain(bad);
+    }
+  });
+
+  /**
+   * THE COPY IS PINNED TO THE RUNTIME THAT COMPOSES IT, so the two cannot drift: the clause is the
+   * exported constant, not a literal retyped in this file.
+   */
+  it("the clause IS what the exported builder composes, verbatim", () => {
+    expect(COMMUNITY_LIMIT_RESETS_PREFIX).toBe("Community limit resets");
+    expect(COMMUNITY_LIMIT_CLAUSE).toBe("Community limit reached");
+    expect(communityLimitClause("2026-09-01")).toBe("Community limit resets 2026-09-01");
+    expect(communityLimitClause(undefined)).toBe(COMMUNITY_LIMIT_CLAUSE);
+    const line = formatReceiptLine({ outputTokens: 20, tier: "observe", allowanceResetsOn: "2026-09-01", ctaEnv: PLAIN_TEXT_ENV });
+    // Between the tier label and the CTA there is EXACTLY what the builder returns and nothing more.
+    expect(line).toContain(` · ${communityLimitClause("2026-09-01")} · ${UPGRADE_CTA_LABEL}`);
   });
 
   it("rides immediately after the tier label it explains", () => {
@@ -79,8 +177,9 @@ describe("the ceiling clause", () => {
       shortReceiptId: "abcd1234",
       ctaEnv: PLAIN_TEXT_ENV
     });
-    expect(line.indexOf("apply off")).toBeLessThan(line.indexOf("Community limit reached"));
-    expect(line.indexOf("Community limit reached")).toBeLessThan(line.indexOf("id abcd1234"));
+    const clause = communityLimitClause("2026-09-01");
+    expect(line.indexOf("apply off")).toBeLessThan(line.indexOf(clause));
+    expect(line.indexOf(clause)).toBeLessThan(line.indexOf("id abcd1234"));
   });
 
   it("is OMITTED when there is no reset date (never a bare 'paused' with no end)", () => {
@@ -188,7 +287,15 @@ describe("the status line renders the ceiling and stays fail-open", () => {
       allowanceResetsOn: periodEndUtc(currentPeriodId())
     });
     expect(line).toContain("apply off");
-    expect(line).toContain("Community limit reached · input optimization paused until");
+    // DERIVED, NOT PINNED TO A LITERAL: the clause this surface renders must be the one the CURRENT
+    // allowance period produces, so a hard-coded date in the renderer fails here rather than passing
+    // for the month it happens to name.
+    expect(line).toContain(communityLimitClause(periodEndUtc(currentPeriodId())));
+    expect(line).toContain(`${COMMUNITY_LIMIT_RESETS_PREFIX} ${periodEndUtc(currentPeriodId()) as string}`);
+    // The hook-only path has no input axis, so this line carries the ceiling clause alone — and it
+    // still must not grow the narration back to compensate.
+    expect(line).not.toContain("optimization paused");
+    expect(line).not.toContain("output shaping continues");
   });
 
   it("never throws and never goes empty, whatever the receipt reader does", async () => {
@@ -207,31 +314,34 @@ describe("the status line renders the ceiling and stays fail-open", () => {
  * END-TO-END on a REAL issuer-exhausted lease: a dev-signed, device-bound, in-period lease whose
  * allowance is zero. This is the exact state that used to render a bare `apply off`.
  *
- * IT IS ALSO THE STATE THAT USED TO TAKE FULL APPLY AWAY FROM SUBSCRIPTION TRAFFIC. The verdict ended
- * the entitlement chain on the allowance, so the tier clamped to `observe` and every route lost full
- * apply — including the one that consumes no allowance at all. The tier now stays `full` and
- * the pause names the traffic it covers.
+ * WHAT THE ZERO DOES AND DOES NOT MEAN. It is a spent BALANCE, not a withdrawn ENTITLEMENT: the lease
+ * is valid, the device is entitled, and the tier stays `full`. What pauses is the capability the
+ * allowance bought — Hybrid INPUT optimization — on every upstream route, because `optimized-input-v1`
+ * pays for use of the engine rather than for a billing path. Output shaping is the Open/base
+ * capability and keeps running, so the surface must say what stopped, not that everything stopped.
  */
-describe("a REAL issuer-exhausted lease pauses the METERED route only, and says so", () => {
+describe("a REAL issuer-exhausted lease pauses input optimization on every route, and says so", () => {
   function exhausted(): NodeJS.ProcessEnv {
     // allowance_tokens: 0 is precisely what the issuer signs once the period's consumption is spent.
     return provisionValidLease(dir, { allowance_tokens: 0 }, { productMode: "full" }) as NodeJS.ProcessEnv;
   }
 
-  it("keeps the tier at `full` — the entitlement is intact, only the metered balance is gone", async () => {
+  it("keeps the tier at `full` — the entitlement is intact, only the balance is gone", async () => {
     const leaseEnv = exhausted();
-    // Clamping here withdrew subscription full apply, which owes the API allowance nothing. The gate
-    // reads the same clamp, so this assertion is also what keeps the gateway applying on that route.
+    // Clamping here would say the device lost the private engine, which is a different fact with a
+    // different remedy. The gateway reads the same clamp, so this assertion is also what keeps output
+    // shaping running on a turn whose input optimization the ceiling paused.
     expect((await resolveOpenTier(leaseEnv)).tier).toBe("full");
     expect(effectiveOpenTier(leaseEnv)).toBe("full");
   });
 
-  it("reports the period's reset date (not the lease expiry), scoped to API-key routed traffic", async () => {
+  it("reports the period's reset date (not the lease expiry), scoped to every route", async () => {
     const leaseEnv = exhausted();
     const resolved = await resolveOpenTier(leaseEnv);
-    // Not `all-routes`: an exhausted API allowance never stops subscription-routed full apply, so the
-    // unqualified claim would be false for exactly the users this fix restores apply for.
-    expect(resolved.allowancePauseScope).toBe("api-key-route");
+    // `all-routes`: the allowance governs Hybrid input optimization wherever the turn is forwarded, so
+    // there is no route left to call unaffected. The narrower label would promise a subscription user
+    // an apply the gateway will pause.
+    expect(resolved.allowancePauseScope).toBe("all-routes");
     expect(resolved.allowanceResetsOn).toBe(periodEndUtc(currentPeriodId()));
     // The lease's own expiry is WITHIN the period and is renewed inside it — surfacing it as the
     // allowance reset would promise the allowance back days or weeks early.
@@ -245,14 +355,23 @@ describe("a REAL issuer-exhausted lease pauses the METERED route only, and says 
     writeFileSync(join(dir, "usage-journal.jsonl"), "{not json\n", "utf8");
     const resolved = await resolveOpenTier(leaseEnv);
     expect(resolved.allowanceResetsOn).toBe(periodEndUtc(currentPeriodId()));
-    expect(resolved.allowancePauseScope).toBe("api-key-route");
+    expect(resolved.allowancePauseScope).toBe("all-routes");
   });
 
-  it("the status line explains the pause and names the route it covers", async () => {
+  it("the status line explains the pause and names what it covers", async () => {
     const leaseEnv = exhausted();
     const line = await computeStatusLine('{"cwd":"/x","usage":{"output_tokens":286}}', { env: leaseEnv, readReceipt: async () => undefined });
-    expect(line).toContain("Community limit reached · API-key input optimization paused until");
-    expect(line).toContain(periodEndUtc(currentPeriodId()) as string);
+    // THE DATE'S PROVENANCE, END TO END, THROUGH A REAL LEASE. This is the strongest form of the
+    // rule the founder set: the date on the primary line must come from the CURRENT allowance period
+    // and from nowhere else. Nothing here types a date — it is derived from the same `periodEndUtc`
+    // the entitlement chain derives it from, so a renderer that hard-coded one, defaulted to one, or
+    // reached for the lease's own expiry fails here.
+    const resetsOn = periodEndUtc(currentPeriodId()) as string;
+    expect(line).toContain(communityLimitClause(resetsOn));
+    // ...and it is NOT today's date. The `paused until <date>` clause this replaced was fixed once
+    // before (#942) for deriving its date from a literal; the failure mode worth pinning is a date
+    // that looks plausible because it is simply now.
+    expect(line).not.toContain(`${COMMUNITY_LIMIT_RESETS_PREFIX} ${new Date().toISOString().slice(0, 10)}`);
     // THE CONVERSION PATH IS NOW REQUIRED, not forbidden. This assertion used to read
     // `not.toMatch(/https?:/)` — a rule that made the surface a dead end for the one user it exists
     // to serve. What stays forbidden is a PRICE: the ceiling refuses, it never charges.
@@ -264,7 +383,9 @@ describe("a REAL issuer-exhausted lease pauses the METERED route only, and says 
     const leaseEnv = provisionValidLease(dir, {}, { productMode: "full" }) as NodeJS.ProcessEnv;
     expect((await resolveOpenTier(leaseEnv)).allowanceResetsOn).toBeUndefined();
     const line = await computeStatusLine('{"cwd":"/x","usage":{"output_tokens":286}}', { env: leaseEnv, readReceipt: async () => undefined });
-    expect(line).not.toContain("Community limit reached");
+    // BOTH FORMS ABSENT, matched on the shared stem so neither the dated nor the undated clause can
+    // reappear on a healthy turn through the other's wording.
+    expect(line).not.toContain("Community limit");
     expect(line).not.toContain(UPGRADE_CTA_LABEL);
   });
 });
@@ -293,8 +414,16 @@ describe("a LOCALLY spent allowance (valid lease, not yet reconciled) is visible
         provider: "openai",
         periodId: currentPeriodId(),
         allowanceTokens,
-        receiptId: "rec-ceiling",
+        recoveryId: "rec-ceiling",
+        // THE COUNT TRAVELS WITH ITS UNIT. A confirmed apply is metered from an ENGINE-declared
+        // count, and the engine names the unit it measured in on every applied response. A fixture
+        // that omitted it would be a pre-v2 engine reporting throughput, which the journal refuses
+        // outright — so it would exercise the fail-closed path rather than the spent-allowance one
+        // this block is about.
+        meterVersion: ACTIVE_USAGE_METER_VERSION,
         meteredOptimizedInputTokens: allowanceTokens,
+        estimatedInputTokensBefore: allowanceTokens,
+        estimatedInputTokensAfter: 0,
         preMutationBody: "x".repeat(40)
       },
       leaseEnv
@@ -308,16 +437,16 @@ describe("a LOCALLY spent allowance (valid lease, not yet reconciled) is visible
     expect(readLeaseVerdict(leaseEnv).label).toBe("lease-valid");
   });
 
-  it("reports the ceiling with the period's reset date, scoped to API-key routed traffic", async () => {
+  it("reports the ceiling with the period's reset date, scoped to every route", async () => {
     const resolved = await resolveOpenTier(await locallySpent());
     expect(resolved.allowanceResetsOn).toBe(periodEndUtc(currentPeriodId()));
-    expect(resolved.allowancePauseScope).toBe("api-key-route");
+    expect(resolved.allowancePauseScope).toBe("all-routes");
   });
 
-  it("does NOT clamp the tier: subscription full apply is non-debitable and still runs", async () => {
+  it("does NOT clamp the tier: output shaping is unmetered and still runs", async () => {
     const leaseEnv = await locallySpent();
-    // Clamping here would switch off apply for traffic that owes the allowance nothing — and would
-    // also change the gateway gate, since it reads the same clamp.
+    // Clamping here would switch off the capability the allowance never bought — and would also
+    // change the gateway gate, since it reads the same clamp.
     expect((await resolveOpenTier(leaseEnv)).tier).toBe("full");
     expect(effectiveOpenTier(leaseEnv)).toBe("full");
   });
@@ -332,8 +461,11 @@ describe("a LOCALLY spent allowance (valid lease, not yet reconciled) is visible
         provider: "openai",
         periodId: currentPeriodId(),
         allowanceTokens,
-        receiptId: "rec-partial",
+        recoveryId: "rec-partial",
+        meterVersion: ACTIVE_USAGE_METER_VERSION,
         meteredOptimizedInputTokens: 100,
+        estimatedInputTokensBefore: 100,
+        estimatedInputTokensAfter: 0,
         preMutationBody: "x".repeat(40)
       },
       leaseEnv
@@ -369,22 +501,26 @@ describe("a LOCALLY spent allowance (valid lease, not yet reconciled) is visible
       env: leaseEnv,
       readReceipt: async () => undefined
     });
-    expect(line).toContain("Community limit reached · API-key input optimization paused until");
-    expect(line).toContain(periodEndUtc(currentPeriodId()) as string);
+    // Same derivation as the issuer-exhausted case above, on the path where the ceiling comes from
+    // the LOCAL journal instead of the lease — one clause, one date, whichever half of the chain saw
+    // the allowance run out.
+    expect(line).toContain(communityLimitClause(periodEndUtc(currentPeriodId())));
+    expect(line).not.toContain("optimization paused");
   });
 });
 
 /**
- * The pause notice was FALSE for subscription traffic. `optimized-input-v1` is debited on the
- * metered api-key route only, and subscription full apply is explicitly non-debitable, so a globally rendered "Community full apply is paused" told a
- * subscription user their own working product had stopped.
+ * The notice is `upgradeNoticeLines` — one block, one vocabulary, one destination, shared by `status`,
+ * `usage`, `lease status`, and `watch`. It states what stopped, what did not, when it returns, and
+ * where to convert.
  *
- * The notice is now `upgradeNoticeLines` — one block, one vocabulary, one destination, shared by
- * `status`, `usage`, `lease status`, and `watch`. The scope property below is what it inherited and
- * must keep; the destination is what it gained.
+ * THE SCOPE PROPERTY IS A REPLAY CONTRACT NOW. Every live pause is `all-routes`. `api-key-route` is
+ * produced by nothing and survives only on receipts persisted while metering was api-key-only; those
+ * really did leave subscription traffic applying, so replaying one must still say so rather than
+ * re-narrate the period as something it was not.
  */
 describe("the pause notice names the traffic it actually covers", () => {
-  it("scopes the local (api-key) ceiling and says subscription turns are unaffected", () => {
+  it("replays the HISTORICAL api-key scope with its qualification intact", () => {
     const notice = upgradeNoticeLines({ reason: "exhausted", resetsOn: "2026-09-01", scope: "api-key-route", env: PLAIN_TEXT_ENV }).join("\n");
     expect(notice).toContain("API-key routed turns");
     expect(notice).toContain("Subscription-routed turns are unaffected");
@@ -407,10 +543,7 @@ describe("the pause notice names the traffic it actually covers", () => {
     );
   });
 
-  /**
-   * `insufficient` is a DIFFERENT SENTENCE, not a synonym. Telling a user with 44,054 tokens left that
-   * their allowance is spent is false, and the surface saying it is the one asking them to convert.
-   */
+  /** `insufficient` is distinct from `exhausted`: a positive remainder is not a spent allowance. */
   it("distinguishes an insufficient remainder from an exhausted one, and shows the CTA for both", () => {
     const insufficient = upgradeNoticeLines({ reason: "insufficient", env: PLAIN_TEXT_ENV });
     expect(insufficient[0]).toBe(
@@ -426,16 +559,16 @@ describe("the pause notice names the traffic it actually covers", () => {
   });
 
   /**
-   * THE DEFAULT IS A BACKSTOP, NOT A RENDERING PATH. `all-routes` over-states the pause, which is the
-   * safe direction for a caller that forgot the scope (an api-key user is never promised apply that
-   * will be refused) — but it is FALSE for a subscription user, so no real resolution may reach it.
-   * `resolveOpenTier` is the only producer, and it must always name the scope alongside the date.
+   * THE SCOPE IS STILL ALWAYS NAMED. It is now always the same value, but leaving it undefined would
+   * fall through to a default rather than to a stated fact, and the default is a backstop for a caller
+   * that forgot — not a rendering path. `resolveOpenTier` is the only producer, and it must name the
+   * scope alongside the date on both exhaustion causes.
    */
   it("the resolver NEVER emits a reset date without a scope, on either exhaustion cause", async () => {
     const issuerExhausted = provisionValidLease(dir, { allowance_tokens: 0 }, { productMode: "full" }) as NodeJS.ProcessEnv;
     const resolved = await resolveOpenTier(issuerExhausted);
     expect(resolved.allowanceResetsOn).toBeDefined();
-    expect(resolved.allowancePauseScope).toBe("api-key-route");
+    expect(resolved.allowancePauseScope).toBe("all-routes");
 
     const locallySpentEnv = await (async (): Promise<NodeJS.ProcessEnv> => {
       const allowanceTokens = 400;
@@ -447,8 +580,11 @@ describe("the pause notice names the traffic it actually covers", () => {
           provider: "openai",
           periodId: currentPeriodId(),
           allowanceTokens,
-          receiptId: "rec-scope",
+          recoveryId: "rec-scope",
+          meterVersion: ACTIVE_USAGE_METER_VERSION,
           meteredOptimizedInputTokens: allowanceTokens,
+          estimatedInputTokensBefore: allowanceTokens,
+          estimatedInputTokensAfter: 0,
           preMutationBody: "x".repeat(40)
         },
         e
@@ -457,19 +593,58 @@ describe("the pause notice names the traffic it actually covers", () => {
     })();
     const local = await resolveOpenTier(locallySpentEnv);
     expect(local.allowanceResetsOn).toBeDefined();
-    expect(local.allowancePauseScope).toBe("api-key-route");
+    expect(local.allowancePauseScope).toBe("all-routes");
   });
 
-  it("the per-turn clause carries the same scope", () => {
-    expect(
-      formatReceiptLine({
-        outputTokens: 20,
-        tier: "full",
-        allowanceResetsOn: "2026-09-01",
-        allowancePauseScope: "api-key-route",
-        ctaEnv: PLAIN_TEXT_ENV
-      })
-    ).toContain("Community limit reached · API-key input optimization paused until 2026-09-01");
+  /**
+   * THE PRIMARY LINE IS SCOPE-NEUTRAL, and that is what makes the trim safe.
+   *
+   * The scope qualifier existed because an UNQUALIFIED pause SENTENCE ("input optimization paused")
+   * is false to a subscription reader replaying a receipt from the period when metering was
+   * api-key-only. Neither `Community limit resets <date>` nor its undated fallback states a scope at
+   * all, so both are true under either and the hazard is retired rather than left unguarded. Naming
+   * WHEN the limit resets says nothing about WHICH traffic it covered. The scope still reaches the
+   * reader — qualified, exactly as before — on the detail surfaces, which is asserted immediately
+   * below.
+   */
+  it("the per-turn clause states NO scope, so it cannot misstate one", () => {
+    const lines = (["all-routes", "api-key-route"] as const).map(() =>
+      formatReceiptLine({ outputTokens: 20, tier: "full", allowanceResetsOn: "2026-09-01", ctaEnv: PLAIN_TEXT_ENV })
+    );
+    for (const line of lines) {
+      expect(line).toContain(communityLimitClause("2026-09-01"));
+      expect(line).not.toContain("API-key");
+      expect(line).not.toContain("optimization paused");
+    }
+    // ...and the undated fallback is scope-neutral for the same reason, on the same axis.
+    const undated = formatReceiptLine({
+      outputTokens: 20,
+      tier: "full",
+      allowancePauseReason: "insufficient",
+      ctaEnv: PLAIN_TEXT_ENV
+    }) as string;
+    expect(undated).toContain(COMMUNITY_LIMIT_CLAUSE);
+    expect(undated).not.toContain("API-key");
+  });
+
+  it("the DETAIL surface still qualifies the historical api-key scope, and still names the date", () => {
+    const historical = upgradeNoticeLines({
+      reason: "exhausted",
+      resetsOn: "2026-09-01",
+      scope: "api-key-route",
+      env: PLAIN_TEXT_ENV
+    }).join("\n");
+    expect(historical).toContain("Community input optimization on API-key routed turns is paused");
+    expect(historical).toContain("Subscription-routed turns are unaffected.");
+    // THE DATE IN A FULL SENTENCE. The primary line now names it too, in four words; this surface is
+    // where it is stated with its scope and its reason, for a reader who came looking.
+    expect(historical).toContain("It resumes 2026-09-01.");
+    expect(historical).toContain("Output shaping remains active.");
+
+    const live = upgradeNoticeLines({ reason: "exhausted", resetsOn: "2026-09-01", scope: "all-routes", env: PLAIN_TEXT_ENV }).join("\n");
+    expect(live).toContain("Community input optimization is paused");
+    expect(live).not.toContain("API-key");
+    expect(live).toContain("It resumes 2026-09-01.");
   });
 
   it("both scopes still name no figure, no price and no purchase path, and ONE destination", () => {

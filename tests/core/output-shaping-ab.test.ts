@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { TEST_OUTPUT_POLICY_VERSION } from "../helpers/output-calibration-fixture.js";
 import {
   addOutputShapingAbRun,
   buildCaptureUsageSidecar,
@@ -168,11 +169,16 @@ describe("buildCaptureUsageSidecar", () => {
       tokenSource: "provider-reported",
       tokenMetadataStatus: "present",
       policyNames: ["concise_response"],
+      policyVersion: TEST_OUTPUT_POLICY_VERSION,
       generatedAt: "2026-06-29T00:00:00.000Z"
     });
     expect(s.providerReported).toBe(true);
     expect(s.outputTokens).toBe(300);
-    expect(s.outputShaping).toEqual({ policyFamily: "output_shaping", policyNames: ["concise_response"] });
+    expect(s.outputShaping).toEqual({
+      policyFamily: "output_shaping",
+      policyNames: ["concise_response"],
+      policyVersion: TEST_OUTPUT_POLICY_VERSION
+    });
   });
 
   it("missing output tokens become null, not zero; no policy attribution when no policies", () => {

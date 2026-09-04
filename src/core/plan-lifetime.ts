@@ -26,9 +26,10 @@
  *
  * TOKEN SOURCE per workflow (from the repo's tier truth, `cross-surface-event.ts`
  * `NEVER_PROVIDER_REPORTED_SURFACES`): Codex / Claude Code prefer PROVIDER-REPORTED usage; Cursor is
- * LOCAL-ESTIMATE ONLY, clearly labeled (the vendor emits no provider usage, it can never be
- * provider-reported). Content-free by construction: every field is a number (token COUNT only), an enum
- * label, or an honest reason string, no field can carry prompt/response/tool content or credentials.
+ * LOCAL-ESTIMATE ONLY, clearly labeled (Compaction does not ingest or attribute Cursor's conditional
+ * `result.usage`, so its current events cannot be provider-reported). Content-free by construction:
+ * every field is a number (token COUNT only), an enum label, or an honest reason string, no field can
+ * carry prompt/response/tool content or credentials.
  *
  * PURE: a function of content-free observed usage handed to it; no IO, no cost math.
  */
@@ -55,8 +56,8 @@ export type PlanQuotaSignal = "observed" | "not-observable";
 /**
  * The honest token source for this workflow's counts (mirrors `RunFlowTokenSource` / the tier table):
  * `provider-reported` for Codex / Claude Code where real provider usage was captured; `local-estimate`
- * for Cursor (vendor emits no usage) or any workflow whose counts are only a local estimate; `unavailable`
- * when no counts exist at all.
+ * for Cursor (whose current Compaction reader does not ingest conditional vendor usage) or any workflow
+ * whose counts are only a local estimate; `unavailable` when no counts exist at all.
  */
 export type PlanLifetimeTokenSource = "provider-reported" | "local-estimate" | "unavailable";
 
@@ -116,7 +117,7 @@ export const NO_TOKEN_DATA_REASON =
 
 /** The honest reason Cursor (and any local-estimate workflow) is estimate-only, never provider-reported. */
 export const CURSOR_LOCAL_ESTIMATE_REASON =
-  "Cursor emits no provider usage, so its token counts are a content-free LOCAL ESTIMATE only - never " +
+  "Compaction does not ingest or attribute Cursor's conditional result.usage fields, so its token counts are a content-free LOCAL ESTIMATE only - never " +
   "provider-reported, never provider-priced, never a quota reading.";
 
 /** How `likely-extended` is honestly framed: an inference from observed token reduction, not a quota reading. */
@@ -364,7 +365,7 @@ function observedSourceFor(event: ActivityEvent): "provider-reported" | "local-e
 
 /**
  * Build the content-free plan-lifetime input for ONE plan-auth workflow from its activity events. Uses
- * the MOST RECENT event (append-recency; events carry no wall-clock) that carries BOTH input_before and
+ * the MOST RECENT event by append-recency that carries BOTH input_before and
  * input_after (a real observed reshaping) with a usable input source, else the workflow has no usable
  * observed reduction and the input is empty (→ the pure model emits the honest not-observable record).
  * Content-free: only COUNTS + an honest source label cross this seam; never content, never keys.

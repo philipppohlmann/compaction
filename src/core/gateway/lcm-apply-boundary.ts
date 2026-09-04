@@ -135,6 +135,10 @@ export interface GatewayLcmApplyCandidateOutcome {
   kind: "lcm-candidate" | "no-candidate" | "rejected-candidate";
   record: LcmEvidenceProjectionInput;
   proposedBodyText?: string;
+  /** The generator's own fixed reason literal, for classification into the receipt vocabulary. */
+  reason?: string;
+  /** The body-construction refusal reason, when a validated candidate produced no safe body. */
+  constructionReason?: string;
 }
 export type GatewayLcmApplyCandidateSource = (endpoint: string, bodyText: string) => Promise<GatewayLcmApplyCandidateOutcome>;
 

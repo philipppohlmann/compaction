@@ -4,6 +4,8 @@
  *
  * The product contract requires every automatic application to be user-inspectable on seven facts:
  *   1. what was optimized            → `policy_used` + estimated input before/after + removed-block count
+ *                                       (a shaping-only application states that no input component ran
+ *                                       rather than reporting a zero-removal input plan)
  *   2. why it was eligible           → `auto_apply.gates_passed` (every eligibility gate that passed)
  *   3. what evidence/status backs it → `evidence_level` (local-estimate, run-scoped, no cost/output claim)
  *   4. which policy authorized it    → the preference id + scope in `caveats`
@@ -34,7 +36,15 @@ export interface AutoApplyActivityParams {
   workflow: string;
   /** Content-free model label from the request, when known. */
   requestModel?: string;
-  plan: DedupePlan;
+  /**
+   * The deterministic INPUT plan, present whenever an input component ran.
+   *
+   * ABSENT on the gateway's in-process shaping-only fallback (Community at its optimized-input
+   * ceiling on an engine that cannot emit the shaping-only degradation itself): no input component
+   * ran there, so there is no plan to report and no input delta to state. Such a record still carries
+   * the recovery pointer and the recover/disable commands, which is the whole reason it is written.
+   */
+  plan?: DedupePlan;
   recoveryId: string;
   authorizationId: string;
   /** The authorization's scope, rendered content-free (tool + optional repo id). */
@@ -57,18 +67,34 @@ export function buildAutoApplyActivityEvent(params: AutoApplyActivityParams): Ac
   const recoveryLocation = `${GATEWAY_RECOVERY_DIR}/${params.recoveryId}.json`;
   const components = params.appliedComponents ?? ["deterministic-compaction"];
   const outputShapingApplied = components.includes("output-shaping");
-  const inputBefore = outputShapingApplied ? params.composedInputEstimate?.before : params.plan.estTokensBefore;
-  const inputAfter = outputShapingApplied ? params.composedInputEstimate?.after : params.plan.estTokensAfter;
-  if (inputBefore === undefined || inputAfter === undefined) {
-    throw new Error("a shaping application requires a composed input estimate");
+  const inputPlan = params.plan;
+  if (!inputPlan && !outputShapingApplied) {
+    // Unrepresentable: an application with neither an input plan nor an output component applied
+    // nothing, and an activity record describing no treatment is worse than none.
+    throw new Error("an automatic application with no input plan and no output shaping is invalid");
+  }
+  // INPUT COUNTS ARE OMITTED WHEN NO INPUT COMPONENT RAN. `input_before`/`input_after` are optional on
+  // the cross-surface event and the readers render an absent pair as `-`; that is the honest reading of
+  // a shaping-only fallback, whose input the gateway forwarded on the model-visible basis it arrived
+  // on. Inventing a pair here would have to pick a basis (transport vs model-visible) that this public
+  // module cannot measure, and the two are deliberately not interchangeable.
+  // The deterministic plan measures ONE layer. When the LCM compactor ran first it is handed LCM's
+  // OUTPUT, so `estTokensBefore` is already post-mutation and this event would state a reduction of
+  // zero on a turn that really reduced. The composed estimate is the end-to-end pair the apply path
+  // meters from; use it whenever a layer other than deterministic dedupe contributed.
+  const composedBasis = outputShapingApplied || components.includes("lcm-compaction");
+  const inputBefore = inputPlan ? (composedBasis ? params.composedInputEstimate?.before : inputPlan.estTokensBefore) : undefined;
+  const inputAfter = inputPlan ? (composedBasis ? params.composedInputEstimate?.after : inputPlan.estTokensAfter) : undefined;
+  if (inputPlan && (inputBefore === undefined || inputAfter === undefined)) {
+    throw new Error("a composed (LCM or output-shaping) application requires a composed input estimate");
   }
   return {
     surface: identity.surface,
     provider: identity.provider,
     model_label: params.requestModel ?? "unknown",
     policy_used: outputShapingApplied ? "cache-context-optimize" : DEDUPE_POLICY,
-    input_before: inputBefore,
-    input_after: inputAfter,
+    ...(inputBefore !== undefined ? { input_before: inputBefore } : {}),
+    ...(inputAfter !== undefined ? { input_after: inputAfter } : {}),
     token_source: {
       input: { source: "local-estimate" },
       output: {
@@ -79,16 +105,26 @@ export function buildAutoApplyActivityEvent(params: AutoApplyActivityParams): Ac
     cost_source: "unavailable",
     cost_unavailable_reason: "the gateway observes provider tokens, not billing; no cost figure exists on this path",
     claim_scope: "run-scoped",
-    evidence_level: outputShapingApplied
-      ? "pre-generation output-shaping treatment applied; composed changed-input delta is local-estimate (chars/4); output delta unavailable pending provider-reported A/B and sufficiency evaluation"
-      : "local-estimate model-visible input reduction (chars/4); run-scoped; no output-token, cost, or billing claim",
+    evidence_level: !inputPlan
+      ? "pre-generation output-shaping treatment applied; no input component ran, so no input delta is claimed; output delta unavailable pending provider-reported A/B and sufficiency evaluation"
+      : outputShapingApplied
+        ? "pre-generation output-shaping treatment applied; composed changed-input delta is local-estimate (chars/4); output delta unavailable pending provider-reported A/B and sufficiency evaluation"
+        : "local-estimate model-visible input reduction (chars/4); run-scoped; no output-token, cost, or billing claim",
     caveats: [
-      `authorized by stored preference ${params.authorizationId} (scope: ${params.authorizationScopeLine}; policy ${DEDUPE_POLICY})`,
+      `authorized by stored preference ${params.authorizationId} (scope: ${params.authorizationScopeLine}; policy ${inputPlan ? DEDUPE_POLICY : "cache-context-optimize"})`,
       `applied components: ${components.join(", ")}`,
-      `deterministic input component: removed ${params.plan.removedBlocks} exact-duplicate block(s); est. supported-field input ${params.plan.estTokensBefore} -> ${params.plan.estTokensAfter} tokens (local estimate)`,
+      // Only stated when the input component actually ran. "removed 0 exact-duplicate block(s)" reads
+      // as "it ran and found nothing", which is a different fact from "it never ran".
+      ...(inputPlan
+        ? [
+            `deterministic input component: removed ${inputPlan.removedBlocks} exact-duplicate block(s); est. supported-field input ${inputPlan.estTokensBefore} -> ${inputPlan.estTokensAfter} tokens (local estimate)`
+          ]
+        : ["no input component ran on this request; the input was forwarded unchanged"]),
       ...(outputShapingApplied
         ? [
-            `composed changed-input estimate: ${inputBefore} -> ${inputAfter} tokens (chars/4; includes attached instructions)`,
+            ...(inputBefore !== undefined && inputAfter !== undefined
+              ? [`composed changed-input estimate: ${inputBefore} -> ${inputAfter} tokens (chars/4; includes attached instructions)`]
+              : []),
             "output-shaping component: attached before generation; provider output usage is recorded on the gateway receipt; no output reduction claimed without A/B plus sufficiency evaluation"
           ]
         : []),

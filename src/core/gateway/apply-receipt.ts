@@ -88,9 +88,31 @@ export function buildApplyReceipt(params: {
   failClosedReason?: string;
   optimizationPlan?: OptimizationPlan;
   appliedComponents?: Array<"lcm-compaction" | "deterministic-compaction" | "output-shaping">;
+  /**
+   * Output-shaping provenance for the FINAL forwarded request. Distinct from `appliedComponents`, which
+   * records only what this pass mutated. See `GatewayReceipt.output_shaping_state`. Omitted ⇒ the receipt
+   * carries no field and readers fail closed.
+   */
+  outputShapingState?: "attached-this-pass" | "already-active" | "absent";
+  outputShapingPolicyVersion?: string;
+  outputShapingRegime?: GatewayReceipt["output_shaping_regime"];
+  /** Device-local keyed hash of the tool session id (never the id itself). See `session-correlation.ts`. */
+  sessionCorrelationId?: string;
+  /** ISO timestamp the gateway received the request. See `request_started_at` on `GatewayReceipt`. */
+  requestStartedAt?: string;
+  /** Fixed-vocabulary LCM outcome (content-free). See `lcm-outcome.ts`. */
+  lcmOutcome?: { kind: string; reason: string };
   composedInputEstimate?: { before: number; after: number };
   /** Set when the Community optimized-input allowance is why input optimization did not run this turn. */
   allowancePause?: GatewayReceipt["allowance_pause"];
+  /** Set on a turn that DEBITED the allowance: what was left afterwards, out of the period total. */
+  allowanceSnapshot?: GatewayReceipt["allowance_snapshot"];
+  /**
+   * The upstream billing route this turn was forwarded on. Recorded because the per-turn line's
+   * list-price cost clause is only defensible on the route that is billed per token; see
+   * `upstream_route_type` on `GatewayReceipt`. Omitting it suppresses the clause (fail-closed).
+   */
+  upstreamRouteType?: GatewayReceipt["upstream_route_type"];
   now?: () => string;
   id?: () => string;
 }): GatewayReceipt {
@@ -100,7 +122,11 @@ export function buildApplyReceipt(params: {
     mode: "apply",
     upstreamStatus: params.upstreamStatus,
     usage: params.usage,
+    ...(params.outputShapingState ? { outputShapingState: params.outputShapingState } : {}),
+    ...(params.outputShapingPolicyVersion ? { outputShapingPolicyVersion: params.outputShapingPolicyVersion } : {}),
+    ...(params.outputShapingRegime ? { outputShapingRegime: params.outputShapingRegime } : {}),
     ...(params.requestModel ? { requestModel: params.requestModel } : {}),
+    ...(params.requestStartedAt ? { requestStartedAt: params.requestStartedAt } : {}),
     ...(params.proofRunId ? { proofRunId: params.proofRunId } : {}),
     ...(params.proofVariant ? { proofVariant: params.proofVariant } : {}),
     ...(params.now ? { now: params.now } : {}),
@@ -150,12 +176,40 @@ export function buildApplyReceipt(params: {
   const failReason = params.failClosedReason ?? plan?.failClosedReason;
   const optimizationPlan = params.optimizationPlan;
   const shapingApplied = params.appliedComponents?.includes("output-shaping") === true;
-  const inputBefore = shapingApplied ? params.composedInputEstimate?.before : plan?.estTokensBefore;
-  const inputAfter = shapingApplied
+  const lcmApplied = params.appliedComponents?.includes("lcm-compaction") === true;
+
+  /**
+   * WHICH MEASUREMENT IS THE INPUT BASIS.
+   *
+   * `plan` measures ONE layer: deterministic dedupe. On a turn where the LCM compactor ran first, the
+   * deterministic layer is handed LCM's OUTPUT, so `plan.estTokensBefore` is a POST-mutation figure and
+   * both ends of the receipt can describe the same already-compacted body, hiding the actual reduction.
+   * The pipeline already computes the authoritative
+   * end-to-end pair (pre-mutation model-visible input -> final forwarded body) in `composedInputEstimate`
+   * and meters from it; the receipt was simply reading a different number than the meter.
+   *
+   * So: use the composed estimate whenever ANY layer other than deterministic dedupe contributed, and
+   * the single-layer plan otherwise (where the two are identical anyway). This changes no metering
+   * semantics and adds no parallel accounting — it points the receipt at the figure the apply path
+   * already treats as authoritative.
+   */
+  const composedBasis = shapingApplied || lcmApplied;
+  const inputBefore = composedBasis ? params.composedInputEstimate?.before : plan?.estTokensBefore;
+  const inputAfter = composedBasis
     ? params.composedInputEstimate?.after
     : params.applied
       ? plan?.estTokensAfter
       : plan?.estTokensBefore;
+
+  /**
+   * The reduction percent must be derived from the SAME basis as before/after, or the receipt states a
+   * percentage its own two numbers contradict. Output shaping still publishes none: it ADDS input
+   * characters to buy output tokens, so a "model-visible input reduction" is not the fact it produced.
+   */
+  const composedReductionPercent =
+    inputBefore !== undefined && inputAfter !== undefined && inputBefore > 0
+      ? Math.round((1 - inputAfter / inputBefore) * 1000) / 10
+      : 0;
 
   return {
     ...base,
@@ -180,7 +234,10 @@ export function buildApplyReceipt(params: {
           estimated_input_tokens_before: inputBefore,
           estimated_input_tokens_after: inputAfter,
           ...(!shapingApplied
-            ? { estimated_model_visible_input_reduction_percent: params.applied || isDryRun ? plan!.reductionPercent : 0 }
+            ? {
+                estimated_model_visible_input_reduction_percent:
+                  params.applied || isDryRun ? (composedBasis ? composedReductionPercent : plan!.reductionPercent) : 0
+              }
             : {}),
           token_source_before: "local-estimate",
           token_source_after: "local-estimate"
@@ -189,7 +246,12 @@ export function buildApplyReceipt(params: {
     ...(params.recoveryId ? { recovery_id: params.recoveryId } : {}),
     ...(params.authorizationId ? { authorization_id: params.authorizationId } : {}),
     ...(params.appliedComponents ? { applied_components: params.appliedComponents } : {}),
+    ...(params.outputShapingState ? { output_shaping_state: params.outputShapingState } : {}),
+    ...(params.sessionCorrelationId ? { session_correlation_id: params.sessionCorrelationId } : {}),
+    ...(params.lcmOutcome ? { lcm_outcome: params.lcmOutcome } : {}),
     ...(params.allowancePause ? { allowance_pause: params.allowancePause } : {}),
+    ...(params.allowanceSnapshot ? { allowance_snapshot: params.allowanceSnapshot } : {}),
+    ...(params.upstreamRouteType ? { upstream_route_type: params.upstreamRouteType } : {}),
     ...(failReason ? { fail_closed_reason: failReason } : {}),
     ...(optimizationPlan
       ? {

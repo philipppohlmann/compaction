@@ -5,6 +5,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { ACTIVE_USAGE_METER_VERSION } from "../../src/core/usage/usage-event.js";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
 import { currentPeriodId } from "../../src/core/entitlement/lease.js";
 import { meterConfirmedApply } from "../../src/core/usage/usage-metering.js";
@@ -100,9 +101,10 @@ describe.runIf(CLI_BUILT)("`compaction usage reconcile` output honesty", () => {
           provider: "openai",
           periodId: currentPeriodId(),
           allowanceTokens: 2_000_000,
-          receiptId: `rec-${i}`,
-          meterVersion: "optimized-input-v1",
+          recoveryId: `rec-${i}`,
+          meterVersion: ACTIVE_USAGE_METER_VERSION,
           meteredOptimizedInputTokens: 1234,
+          estimatedInputTokensBefore: 1734,
           estimatedInputTokensAfter: 500,
           preMutationBody: "x".repeat(100)
         },
@@ -322,9 +324,10 @@ describe.runIf(CLI_BUILT)("reconciliation NEVER blocks `compaction lease`", () =
         provider: "openai",
         periodId: currentPeriodId(),
         allowanceTokens: 2_000_000,
-        receiptId: "rec-block",
-        meterVersion: "optimized-input-v1",
+        recoveryId: "rec-block",
+        meterVersion: ACTIVE_USAGE_METER_VERSION,
         meteredOptimizedInputTokens: 10,
+        estimatedInputTokensBefore: 15,
         estimatedInputTokensAfter: 5,
         preMutationBody: "x"
       },

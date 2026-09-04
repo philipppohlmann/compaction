@@ -20,6 +20,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ACTIVE_USAGE_METER_VERSION } from "../../src/core/usage/usage-event.js";
 import {
   communityRuntimeReady,
   describeRepairActions,
@@ -220,9 +221,10 @@ describe("ensureCommunityRuntime - a committed usage handover and the lease that
           provider: "openai",
           periodId: currentPeriodId(),
           allowanceTokens: 2_000_000,
-          receiptId: `rec-${i}`,
-          meterVersion: "optimized-input-v1",
+          recoveryId: `rec-${i}`,
+          meterVersion: ACTIVE_USAGE_METER_VERSION,
           meteredOptimizedInputTokens: 1000,
+          estimatedInputTokensBefore: 1500,
           estimatedInputTokensAfter: 500,
           preMutationBody: "x".repeat(100)
         },

@@ -15,9 +15,10 @@
  * - **Codex** (`~/.codex/hooks.json` or repo `.codex/hooks.json`): a PER-PROMPT `UserPromptSubmit` hook.
  *   Shape: `{ hooks: { UserPromptSubmit: [ { hooks: [ { type: "command", command, timeout } ] } ] } }` -
  *   the SAME nested group/hooks shape as Claude Code.
- * - **Cursor** (`~/.cursor/hooks.json`): a SESSION-LEVEL `sessionStart` hook (fires once per session; there
- *   is no per-prompt injecting hook on Cursor). Shape: `{ version: 1, hooks: { sessionStart: [ { command } ] } }` -
- *   FLAT entries (no inner `hooks` array, no `type`).
+ * - **Cursor** (`~/.cursor/hooks.json`): Compaction's supported floor is a SESSION-LEVEL `sessionStart`
+ *   hook (fires once per session). Cursor also exposes `beforeSubmitPrompt`; see the release-acceptance
+ *   distinction on `installCursorShapingHook`. Shape: `{ version: 1, hooks: { sessionStart:
+ *   [ { command } ] } }` - FLAT entries (no inner `hooks` array, no `type`).
  */
 
 /** The runtime command each installed shaping hook runs. `<tool>` distinguishes the stdin/stdout schema. */
@@ -182,23 +183,17 @@ export const CURSOR_HOOKS_SCHEMA_VERSION = 1;
  * overwrites the user's). Idempotent. Refuses (throws) rather than clobber a malformed
  * `hooks` / `hooks.sessionStart`.
  *
- * WHY `sessionStart` AND NOT A PER-PROMPT HOOK — corrected 2026-08-04 against the Cursor app bundle.
- * This comment used to assert "Cursor has no per-prompt injecting hook". That is FALSE: Cursor has
- * `beforeSubmitPrompt` (which its own compatibility map aliases to Claude Code's `UserPromptSubmit`),
- * and its response schema accepts `additional_context`. The real reasons to keep `sessionStart` as the
- * load-bearing mechanism are narrower and worth writing down so the next reader does not "fix" it:
+ * WHY `sessionStart` REMAINS THE SUPPORTED FLOOR — verified against installed Cursor vendor artifacts.
+ * Cursor exposes `beforeSubmitPrompt`; `BeforeSubmitPromptRequestResponse` includes
+ * `additional_context`, hook output validation accepts the field, and the bridge transports it as
+ * `additionalContext`. That proves the vendor capability surface. It does not, by itself, prove or
+ * disprove downstream model application across every supported IDE/CLI path.
  *
- *  1. The IDE's `beforeSubmitPrompt` → `additional_context` path is behind an experiment gate
- *     (`enable_hook_additional_context`). When the gate is off the returned context is DROPPED with
- *     only a structured-log warning — no user-visible failure and no fallback. `sessionStart` has no
- *     such gate.
- *  2. The `cursor-agent` CLI's interactive turn loop reads only `continue` and `user_message` from a
- *     `beforeSubmitPrompt` response; it never consumes `additional_context`. `sessionStart` IS
- *     consumed there.
- *
- * So a per-prompt hook is a legitimate future REFINEMENT — it would bring the task-aware hold to
- * Cursor instead of blanket session shaping — but only layered ON TOP of this floor, never replacing
- * it, because it silently degrades on two of the paths users actually run.
+ * Reliable live behavior across those paths has not yet passed release acceptance, and IDE delivery
+ * remains behind the `enable_hook_additional_context` experiment gate. Compaction 0.6.8 therefore
+ * conservatively installs `sessionStart`: the already-supported coarse session instruction, with no
+ * per-turn task-aware hold in this shipped Cursor path. A per-prompt refinement requires separate
+ * end-to-end acceptance; it is not blocked by an absent vendor hook.
  */
 export function installCursorShapingHook(input: CursorHooksConfig): SubscriptionInstallResult<CursorHooksConfig> {
   const config = clone(input);

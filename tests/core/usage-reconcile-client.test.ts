@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { ACTIVE_USAGE_METER_VERSION } from "../../src/core/usage/usage-event.js";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
 import { currentPeriodId } from "../../src/core/entitlement/lease.js";
 import { meterConfirmedApply } from "../../src/core/usage/usage-metering.js";
@@ -85,6 +86,7 @@ function ok(accepted: number, extra: Record<string, unknown> = {}) {
   };
 }
 
+/** A LEGACY (schema v1) stored line — the shape a journal written before the rename holds. */
 function entry(overrides: Partial<UsageJournalEntry> = {}): UsageJournalEntry {
   return {
     schema_version: 1,
@@ -99,7 +101,7 @@ function entry(overrides: Partial<UsageJournalEntry> = {}): UsageJournalEntry {
     route_type: "api-key",
     workflow: "codex",
     provider: "openai",
-    meter_version: "optimized-input-v1",
+    meter_version: ACTIVE_USAGE_METER_VERSION,
     optimized_input_tokens: 10,
     estimated_input_tokens_after: 5,
     device_event_signature: "sig",
@@ -107,6 +109,12 @@ function entry(overrides: Partial<UsageJournalEntry> = {}): UsageJournalEntry {
     entry_hash: "1".repeat(64),
     ...overrides
   };
+}
+
+/** A CURRENT (schema v2) stored line — the same fields with the recovery id under its true name. */
+function entryV2(overrides: Partial<UsageJournalEntry> = {}): UsageJournalEntry {
+  const { receipt_id: legacyKey, schema_version: _v1, ...common } = entry();
+  return { schema_version: 2, recovery_id: legacyKey as string, ...common, ...overrides };
 }
 
 describe("entriesToReconcile (pure selection — no I/O, no fetch)", () => {
@@ -221,6 +229,49 @@ describe("reconcileUsage (upload)", () => {
     }
   });
 
+  it("uploads each entry in ITS OWN shape — a v2 entry carries `recovery_id` and no `receipt_id`", async () => {
+    const fake = startFakeService(() => ok(2));
+    const url = await fake.start();
+    try {
+      // A MIXED batch is the normal case for a device whose journal spans the rename. Entries are
+      // uploaded verbatim, so each one must present the key it was actually SIGNED over — rewriting
+      // either into the other's shape would make its signature unverifiable server-side.
+      await reconcileUsage(url, "cmpd_test_token", [
+        entry(),
+        entryV2({ event_id: "00000000-0000-0000-0000-00000000000b", entry_hash: "2".repeat(64) })
+      ]);
+      const sent = fake.received[0] as { entries: Array<Record<string, unknown>> };
+      expect(sent.entries[0].schema_version).toBe(1);
+      expect(sent.entries[0].receipt_id).toBe("r");
+      expect(sent.entries[0]).not.toHaveProperty("recovery_id");
+      expect(sent.entries[1].schema_version).toBe(2);
+      expect(sent.entries[1].recovery_id).toBe("r");
+      expect(sent.entries[1]).not.toHaveProperty("receipt_id");
+    } finally {
+      await fake.stop();
+    }
+  });
+
+  it("a 400 from a server that predates the v2 shape LOSES NOTHING: no watermark, no dropped entry", async () => {
+    // THE DEPLOY-ORDER CASE. The control-plane API is deployed; until the founder redeploys it, a
+    // v2-shaped upload is refused wholesale (`.strict()` rejects the unknown key, and the route
+    // parses the WHOLE body). That must be a retryable no-op, not a silent loss of consumption: the
+    // entries stay in the journal, the watermark does not move, and they reconcile after redeploy.
+    const fake = startFakeService(() => ({ status: 400, body: { error: "validation_error" } }));
+    const url = await fake.start();
+    try {
+      await expect(reconcileUsage(url, "cmpd_test_token", [entryV2()])).rejects.toMatchObject({
+        code: "http_error"
+      });
+      // Nothing was reported as confirmed, so `recordWatermark` has nothing to advance to.
+      await expect(reconcileUsage(url, "cmpd_test_token", [entryV2()])).rejects.toMatchObject({
+        partial: undefined
+      });
+    } finally {
+      await fake.stop();
+    }
+  });
+
   it("surfaces coded errors rather than silently succeeding", async () => {
     const cases: Array<[number, unknown, string]> = [
       [401, { error: "unauthorized" }, "unauthorized"],
@@ -295,9 +346,10 @@ describe("reconcileStoredUsage (the shared orchestration both triggers use)", ()
           provider: "openai",
           periodId: currentPeriodId(),
           allowanceTokens: 2_000_000,
-          receiptId: `rec-${i}`,
-          meterVersion: "optimized-input-v1",
+          recoveryId: `rec-${i}`,
+          meterVersion: ACTIVE_USAGE_METER_VERSION,
           meteredOptimizedInputTokens: 1000,
+          estimatedInputTokensBefore: 1500,
           estimatedInputTokensAfter: 500,
           preMutationBody: "x".repeat(100)
         },
@@ -317,6 +369,8 @@ describe("reconcileStoredUsage (the shared orchestration both triggers use)", ()
 
       // The uploaded entries are exactly what the journal holds — the client invents nothing.
       const { entries } = await readUsageJournal(env);
+      expect(entries.map((entry) => entry.schema_version)).toEqual([3, 3]);
+      expect(entries.map((entry) => entry.estimated_input_tokens_before)).toEqual([1500, 1500]);
       const sent = (fake.received[0] as { entries: Array<{ event_id: string }> }).entries;
       expect(sent.map((e) => e.event_id)).toEqual(entries.map((e) => e.event_id));
     } finally {
@@ -335,9 +389,10 @@ describe("reconcileStoredUsage (the shared orchestration both triggers use)", ()
         provider: "openai",
         periodId: currentPeriodId(),
         allowanceTokens: 2_000_000,
-        receiptId: "rec-immutable",
-        meterVersion: "optimized-input-v1",
+        recoveryId: "rec-immutable",
+        meterVersion: ACTIVE_USAGE_METER_VERSION,
         meteredOptimizedInputTokens: 1000,
+        estimatedInputTokensBefore: 1500,
         estimatedInputTokensAfter: 500,
         preMutationBody: "x"
       },
@@ -407,9 +462,10 @@ describe("partial multi-chunk failure is reported HONESTLY (finding 4)", () => {
           provider: "openai",
           periodId: currentPeriodId(),
           allowanceTokens: 2_000_000,
-          receiptId: `rec-${i}`,
-          meterVersion: "optimized-input-v1",
+          recoveryId: `rec-${i}`,
+          meterVersion: ACTIVE_USAGE_METER_VERSION,
           meteredOptimizedInputTokens: 1000,
+          estimatedInputTokensBefore: 1500,
           estimatedInputTokensAfter: 500,
           preMutationBody: "x"
         },
@@ -442,9 +498,10 @@ describe("partial multi-chunk failure is reported HONESTLY (finding 4)", () => {
           provider: "openai",
           periodId: currentPeriodId(),
           allowanceTokens: 2_000_000,
-          receiptId: `rec-${i}`,
-          meterVersion: "optimized-input-v1",
+          recoveryId: `rec-${i}`,
+          meterVersion: ACTIVE_USAGE_METER_VERSION,
           meteredOptimizedInputTokens: 1000,
+          estimatedInputTokensBefore: 1500,
           estimatedInputTokensAfter: 500,
           preMutationBody: "x"
         },
@@ -511,7 +568,7 @@ describe("a SECOND reconcile advances the watermark", () => {
   const dirs: string[] = [];
   afterEach(() => dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true })));
 
-  async function meter(env: NodeJS.ProcessEnv, receiptId: string): Promise<void> {
+  async function meter(env: NodeJS.ProcessEnv, recoveryId: string): Promise<void> {
     const result = await meterConfirmedApply(
       {
         routeType: "api-key",
@@ -519,9 +576,10 @@ describe("a SECOND reconcile advances the watermark", () => {
         provider: "openai",
         periodId: currentPeriodId(),
         allowanceTokens: 2_000_000,
-        receiptId,
-        meterVersion: "optimized-input-v1",
+        recoveryId,
+        meterVersion: ACTIVE_USAGE_METER_VERSION,
         meteredOptimizedInputTokens: 1000,
+        estimatedInputTokensBefore: 1500,
         estimatedInputTokensAfter: 500,
         preMutationBody: "x"
       },

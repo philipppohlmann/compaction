@@ -30,7 +30,7 @@ function cursorEvent(): ActivityEvent {
     run_id: "cursor-1",
     token_source: {
       input: { source: "local-estimate" },
-      output: { source: "unavailable", unavailable_reason: "Cursor emits no usage" }
+      output: { source: "unavailable", unavailable_reason: "Compaction does not ingest Cursor's conditional result.usage" }
     },
     input_before: 820,
     cost_source: "unavailable",
@@ -79,8 +79,8 @@ describe("activity view - populated render", () => {
     // cursor input local-estimate tier; output unavailable (never a fabricated count).
     expect(table).toContain("820 measured (local-estimate)");
     expect(table).toContain("unavailable (unavailable)");
-    // No fabricated wall-clock: the honesty note explicitly says events carry no wall-clock time.
-    expect(table).toContain("no wall-clock time");
+    // No fabricated wall-clock: the table states the ordering it actually uses.
+    expect(table).toContain("Ordered by append recency");
   });
 
   it("shows an input before→after delta ONLY when both counts are present (no implied reduction)", () => {
@@ -125,7 +125,7 @@ describe("activity view - --json", () => {
     expect(json.activity).toHaveLength(2);
     expect(json.meta.total_events).toBe(2);
     expect(json.meta.surface_filter).toBeNull();
-    expect(json.meta.ordering).toContain("no wall-clock");
+    expect(json.meta.ordering).toContain("append-recency");
     expect(json.activity[1].output_source).toBe("unavailable");
     expect(json.activity[1].output_tokens).toBeNull();
   });

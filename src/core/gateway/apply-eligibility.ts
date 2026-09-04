@@ -7,11 +7,10 @@
  * optimization algorithm and mutates nothing, so it holds no static edge into a private module. The
  * in-process composition that DOES mutate lives in `apply-composition.ts` and consumes these gates.
  */
-import { join } from "node:path";
 import {
   AUTO_APPLY_ELIGIBILITY_GATES,
-  DEFAULT_POLICY_PREFERENCES_DIRECTORY,
   REJECTED_GLOBAL_TOOL_VALUES,
+  authorizationStoreDirectory,
   gatesAreEngineEvaluable,
   readPolicyPreferences,
   type PolicyPreference
@@ -42,13 +41,36 @@ function endpointMatchesTool(endpoint: string, tool: string): boolean {
   return suffixes.some((suffix) => path.endsWith(suffix));
 }
 
+/**
+ * The stored authorization for this scope, read from the DEVICE store and nowhere else
+ * (`authorizationStoreDirectory`). Two defects are closed here, and both matter for the same reason:
+ * this function's answer is the difference between forwarding a request unchanged and mutating it.
+ *
+ * IT NO LONGER DEPENDS ON THE WORKING DIRECTORY. The lookup used to read `<cwd>/.compaction`, which
+ * turned a device-level opt-in into an accidental per-directory one: the same machine, install, lease
+ * and engine engaged apply from `$HOME` and fell back to record-only inside a project, because that is
+ * where the file happened to have been written.
+ *
+ * AND NO WORKING DIRECTORY CAN SUPPLY ONE. `<cwd>/.compaction/policy-preferences.json` is a file a
+ * repository can commit; cloning it is not authorizing it. Reading it — even only as a fallback when
+ * the device store is empty — would let checked-out content arm input mutation on a device whose owner
+ * never opted in. There is deliberately no `cwd` parameter left to reintroduce that: the caller cannot
+ * pass a directory that grants anything.
+ *
+ * Widening WHERE it reads from did not widen WHAT matches. An authorization still has to be enabled,
+ * `auto-when-gates-pass`, on the deterministic policy, for this exact tool, and — when the record pins
+ * one — for this exact repo. `scope.repo` NARROWS a device authorization to a single repo; it is the
+ * only repo-shaped concept on this path, and it can only ever subtract. An unreadable or non-JSON store
+ * throws to the caller, which fails closed to record-only.
+ */
 export async function findStoredAuthorization(params: {
   scope: ApplyRequestScope;
-  cwd: string;
+  /** Env the device store is resolved from (`COMPACTION_CONFIG_DIR`). Defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv;
 }): Promise<PolicyPreference | undefined> {
   const tool = params.scope.tool?.trim();
   if (!tool || REJECTED_GLOBAL_TOOL_VALUES.includes(tool.toLowerCase())) return undefined;
-  const { preferences } = await readPolicyPreferences(join(params.cwd, DEFAULT_POLICY_PREFERENCES_DIRECTORY));
+  const { preferences } = await readPolicyPreferences(authorizationStoreDirectory(params.env));
   return preferences
     .filter(
       (preference) =>

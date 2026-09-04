@@ -7,31 +7,19 @@ import { captureClaudeCodeFromHook } from "../../src/cli/commands/capture-claude
 import { createUsageMetadata } from "../../src/core/usage-metadata.js";
 import { buildGatewayReceipt, type GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import { RECEIPT_LINE_ENV } from "../../src/core/gateway/receipt-line.js";
-import { updateCalibrationFromAbSummary } from "../../src/core/output-shaping-calibration-store.js";
 import { stopShaping } from "../../src/core/subscription-shaping-state.js";
-import {
-  addOutputShapingAbRun,
-  initOutputShapingAbExperiment,
-  summarizeOutputShapingAb,
-  type OutputShapingAbRun
-} from "../../src/core/output-shaping-ab.js";
+import { seedOutputCalibration } from "../helpers/output-calibration-fixture.js";
 import type { OpenAiUsageBreakdown } from "../../src/core/gateway/openai-usage.js";
 
-/** Fold a real provider-reported output-shaping A/B into the LEARNING calibration store in a temp config dir. */
+/** Seed one exact engine-confirmed cohort in a temp config dir. */
 async function writeCalibration(configDir: string, controlOut: number, treatmentOut: number): Promise<void> {
-  const run = (arm: "control" | "treatment", outputTokens: number): OutputShapingAbRun => ({
-    arm,
-    outputTokens,
-    inputTokens: 1000,
-    providerReported: true,
-    tokenSource: "provider-reported",
-    ...(arm === "treatment"
-      ? { policyFamily: "output_shaping" as const, policyNames: ["concise_response"], evalMarkersPreserved: true }
-      : {})
+  await seedOutputCalibration({ COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv, {
+    provider: "anthropic",
+    model: "claude-x",
+    regime: "default-shapeable",
+    control: [controlOut, controlOut, controlOut],
+    treatment: [treatmentOut, treatmentOut, treatmentOut]
   });
-  let exp = initOutputShapingAbExperiment({ experimentId: "cal", taskShape: "code" });
-  for (const r of [run("control", controlOut), run("treatment", treatmentOut)]) exp = addOutputShapingAbRun(exp, r);
-  await updateCalibrationFromAbSummary(summarizeOutputShapingAb(exp), { COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv);
 }
 
 /**
@@ -188,8 +176,14 @@ describe("Claude Code Stop hook - per-turn receipt line", () => {
     const configDir = await mkdtemp(path.join(tmpdir(), "cc-hook-cal-"));
     // control 1000 / treatment 600 → r=0.4; this turn's output is 412 → saved = round(412*0.4/0.6)=275.
     await writeCalibration(configDir, 1000, 600);
-    // The arrow now requires PER-TURN evidence that this turn was shaped, not just an active hook.
-    await recordShapingOutcome("shape", { COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv);
+    // The arrow now requires PER-TURN evidence that this turn was shaped, not just an active hook — and
+    // that evidence is keyed by the session id on the Stop payload below, so it must be recorded under
+    // THAT session or the hook reads nothing.
+    await recordShapingOutcome(
+      { tool: "claude-code", sessionId: "s-shaped" },
+      "shape",
+      { COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv
+    );
     const lines: string[] = [];
     await captureClaudeCodeFromHook(
       {},
@@ -223,7 +217,11 @@ describe("Claude Code Stop hook - per-turn receipt line", () => {
     const cwd = await tempCwd();
     const configDir = await mkdtemp(path.join(tmpdir(), "cc-hook-held-"));
     await writeCalibration(configDir, 1000, 600);
-    await recordShapingOutcome("hold-planning", { COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv);
+    await recordShapingOutcome(
+      { tool: "claude-code", sessionId: "s-held" },
+      "hold-planning",
+      { COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv
+    );
     const lines: string[] = [];
     await captureClaudeCodeFromHook(
       {},

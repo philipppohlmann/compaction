@@ -17,9 +17,10 @@ const CLI = resolve("dist/cli/index.js");
 
 let home: string;
 
-async function run(args: string[], opts: { env?: NodeJS.ProcessEnv; input?: string } = {}) {
+async function run(args: string[], opts: { env?: NodeJS.ProcessEnv; input?: string; cwd?: string } = {}) {
   const child = execFileAsync("node", [CLI, ...args], {
-    env: { ...process.env, HOME: home, ...opts.env }
+    env: { ...process.env, HOME: home, ...opts.env },
+    ...(opts.cwd ? { cwd: opts.cwd } : {})
   });
   if (opts.input !== undefined) {
     child.child.stdin?.end(opts.input);
@@ -113,28 +114,94 @@ describe("hooks install --tool cursor", () => {
 });
 
 describe("hooks shape <tool> runtime - auto-apply (default-ON), kill-switch, holds planning, content-free, fail-open", () => {
-  const codexPrompt = JSON.stringify({ prompt: "fix the failing test in utils.ts" });
+  // Codex 0.153 supplies exact lifecycle identity on UserPromptSubmit. The hook now validates that
+  // identity before opening a run or persisting a shaping decision; prompt-only stdin is not a real
+  // Codex hook artifact and must fail closed.
+  const codexPrompt = (prompt = "fix the failing test in utils.ts") => JSON.stringify({
+    session_id: "11111111-1111-4111-8111-111111111111",
+    turn_id: "22222222-2222-4222-8222-222222222222",
+    cwd: home,
+    hook_event_name: "UserPromptSubmit",
+    prompt
+  });
   // Kill-switch env for the disabled case.
   const OFF = { COMPACTION_SHAPING_HOOKS: "0" } as NodeJS.ProcessEnv;
   // Default-ON: explicitly clear the flag so a set env var in the runner does not contaminate the assertion.
   const DEFAULT = { COMPACTION_SHAPING_HOOKS: "" } as NodeJS.ProcessEnv;
 
   it("Codex emits NOTHING when the kill-switch is thrown (COMPACTION_SHAPING_HOOKS=0)", async () => {
-    const { stdout } = await run(["hooks", "shape", "codex"], { env: OFF, input: codexPrompt });
+    const { stdout } = await run(["hooks", "shape", "codex"], { env: OFF, input: codexPrompt() });
     expect(stdout).toBe("");
   });
 
   it("Codex emits the additionalContext JSON by default (auto-apply)", async () => {
-    const { stdout } = await run(["hooks", "shape", "codex"], { env: DEFAULT, input: codexPrompt });
+    const { stdout } = await run(["hooks", "shape", "codex"], { env: DEFAULT, input: codexPrompt() });
     const parsed = JSON.parse(stdout);
     expect(parsed.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
     expect(parsed.hookSpecificOutput.additionalContext).toContain("Output-shaping policy");
   });
 
+  it("Codex UserPromptSubmit → Stop emits one settled full-turn line that watch replays byte-identically", async () => {
+    const sessionId = "33333333-3333-4333-8333-333333333333";
+    const turnId = "44444444-4444-4444-8444-444444444444";
+    const configDir = join(home, "config");
+    const rollout = join(home, "rollout.jsonl");
+    const usage = {
+      input_tokens: 427,
+      cached_input_tokens: 200,
+      cache_write_input_tokens: 0,
+      output_tokens: 41,
+      reasoning_output_tokens: 10,
+      total_tokens: 468
+    };
+    await writeFile(rollout, `${JSON.stringify({
+      ordinal: 9,
+      timestamp: "2026-09-04T07:39:18.350Z",
+      type: "token_usage_record",
+      payload: {
+        thread_id: sessionId,
+        session_id: sessionId,
+        turn_id: turnId,
+        root_turn_id: turnId,
+        response_id: "fixture-response",
+        usage: { ...usage, input_tokens: 9_999, output_tokens: 9_999 },
+        turn_token_usage: usage,
+        thread_token_usage: { ...usage, input_tokens: 8_888, output_tokens: 8_888 }
+      }
+    })}\n`, "utf8");
+    const env = { ...DEFAULT, COMPACTION_CONFIG_DIR: configDir };
+    const prompt = JSON.stringify({
+      session_id: sessionId,
+      turn_id: turnId,
+      cwd: home,
+      hook_event_name: "UserPromptSubmit",
+      prompt: "fix the failing test"
+    });
+    const shaped = await run(["hooks", "shape", "codex"], { env, input: prompt });
+    expect(JSON.parse(shaped.stdout).hookSpecificOutput.additionalContext).toContain("Output-shaping policy");
+
+    const stop = JSON.stringify({
+      session_id: sessionId,
+      turn_id: turnId,
+      transcript_path: rollout,
+      cwd: home,
+      hook_event_name: "Stop",
+      model: "gpt-5.6-sol",
+      last_assistant_message: "SECRET assistant fixture"
+    });
+    const stopped = await run(["hooks", "line", "codex"], { env, input: stop });
+    const systemMessage = JSON.parse(stopped.stdout).systemMessage as string;
+    expect(systemMessage).toBe("compaction · observed input 427 · output N/A→41 (N/A%, est.) · basic shaping");
+    expect(systemMessage).not.toMatch(/recording|reporting|47%/);
+
+    const watched = await run(["watch", "--once"], { env, cwd: home });
+    expect(watched.stdout.split("\n")).toContain(systemMessage);
+  });
+
   it("Codex HOLDS a planning turn even when active-by-default (critical safety property)", async () => {
     const { stdout } = await run(["hooks", "shape", "codex"], {
       env: DEFAULT,
-      input: JSON.stringify({ prompt: "help me decide the architecture and weigh the trade-offs" })
+      input: codexPrompt("help me decide the architecture and weigh the trade-offs")
     });
     expect(stdout).toBe("");
   });
@@ -152,7 +219,7 @@ describe("hooks shape <tool> runtime - auto-apply (default-ON), kill-switch, hol
     const secret = "sk-fake-SECRET-cli-0xCAFE";
     const { stdout } = await run(["hooks", "shape", "codex"], {
       env: DEFAULT,
-      input: JSON.stringify({ prompt: `refactor with token ${secret}` })
+      input: codexPrompt(`refactor with token ${secret}`)
     });
     expect(stdout).not.toContain(secret);
   });

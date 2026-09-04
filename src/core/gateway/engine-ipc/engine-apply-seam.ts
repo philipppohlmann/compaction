@@ -20,7 +20,11 @@
  * Content-free out: the decision carries counts/labels/ids and (only on `apply`) the replacement
  * body as a transport field, the same class of data the gateway already forwards upstream.
  */
-import type { EngineIpcReceiptArtifacts, EngineIpcUsageDebit } from "./protocol.js";
+import type {
+  EngineIpcOutputShapingState,
+  EngineIpcReceiptArtifacts,
+  EngineIpcUsageDebit
+} from "./protocol.js";
 import type { EngineRequestInput, EngineSupervisor } from "./supervisor.js";
 
 /** The seam's decision for one request. `forward-original` is the safe-degradation default. */
@@ -29,6 +33,16 @@ export type EngineApplyDecision =
       decision: "forward-original";
       /** Fixed label: why the original is forwarded (degrade reason or engine result class). */
       reason: string;
+      /**
+       * WHY LCM DID OR DID NOT CONTRIBUTE, when the engine ran the pipeline and no-opped. A fact about
+       * the request the caller's receipt should still carry; fixed vocabulary, content-free. Absent on a
+       * degrade, a refusal, or an older engine (unknown, no claim).
+       */
+      lcmOutcome?: { kind: string; reason: string };
+      /** Provenance for the unchanged body when the engine pipeline produced a no-op. */
+      outputShapingState?: EngineIpcOutputShapingState;
+      /** Exact identity paired with the no-op's already-active provenance, when known. */
+      outputShapingPolicyVersion?: string;
     }
   | {
       decision: "apply";
@@ -39,6 +53,7 @@ export type EngineApplyDecision =
       appliedComponents: string[];
       meterVersion?: string;
       meteredOptimizedInputTokens?: number;
+      estimatedInputTokensBefore?: number;
       estimatedInputTokensAfter?: number;
       /**
        * The engine's usage-debit descriptor (ids + count) for a metered apply. Forwarded so the
@@ -76,7 +91,20 @@ export async function decideEngineApply(
   const response = outcome.response;
   if (response.result !== "applied") {
     // refused | noop | error → forward the original unchanged (honest receipt is the caller's job).
-    return { decision: "forward-original", reason: `engine-result:${response.result}` };
+    // A no-op the pipeline produced still says why LCM did not contribute; carry that fact out.
+    return {
+      decision: "forward-original",
+      reason: `engine-result:${response.result}`,
+      ...(response.lcm_outcome !== undefined ? { lcmOutcome: response.lcm_outcome } : {}),
+      ...(response.result === "noop" && response.output_shaping_state !== undefined
+        ? {
+          outputShapingState: response.output_shaping_state,
+          ...(response.output_shaping_policy_version
+            ? { outputShapingPolicyVersion: response.output_shaping_policy_version }
+            : {})
+        }
+        : {})
+    };
   }
 
   const mutated = response.mutated_request_body;
@@ -92,6 +120,7 @@ export async function decideEngineApply(
     appliedComponents: response.applied_components,
     meterVersion: response.meter_version,
     meteredOptimizedInputTokens: response.metered_optimized_input_tokens,
+    estimatedInputTokensBefore: response.estimated_input_tokens_before,
     estimatedInputTokensAfter: response.estimated_input_tokens_after,
     ...(response.usage_debit ? { usageDebit: response.usage_debit } : {}),
     ...(response.receipt_artifacts ? { receiptArtifacts: response.receipt_artifacts } : {}),

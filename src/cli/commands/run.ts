@@ -221,7 +221,7 @@ function registerRunToolFrontEnds(run: Command): void {
     .command("cursor")
     .description(
       "Unified flow for Cursor: wrap a LIVE Cursor headless run (or --export saved output), compact, and " +
-        "report. Tokens are LOCAL-ESTIMATE only (Cursor emits no usage); output is counted where separable " +
+        "report. Tokens are LOCAL-ESTIMATE only because Compaction does not ingest Cursor's conditional result.usage; output is counted where separable " +
         "(use --output-format json), else UNAVAILABLE. Local only - no upload, no SQLite."
     )
     .requiredOption("--out <dir>", "Output directory for capture + compaction artifacts")
@@ -237,7 +237,7 @@ function registerRunToolFrontEnds(run: Command): void {
       if (!options.export && commandParts.length > 0) {
         console.log(chalk.cyan("compaction run cursor"));
         console.log(
-          "Preflight for a LIVE Cursor headless run. LOCAL-ESTIMATE tokens only (Cursor emits no provider usage)."
+          "Preflight for a LIVE Cursor headless run. LOCAL-ESTIMATE tokens only because Compaction does not ingest Cursor's conditional result.usage."
         );
         const ready = await gateCursorLiveRun();
         if (!ready) {
@@ -263,8 +263,8 @@ function registerRunToolFrontEnds(run: Command): void {
         tool: "cursor",
         label: "compaction run cursor",
         intro:
-          "Capturing a live Cursor headless run, then compacting + reporting. LOCAL-ESTIMATE tokens only " +
-          "(Cursor emits no provider usage). No upload, no SQLite. Review artifacts before sharing.",
+          "Capturing a live Cursor headless run, then compacting + reporting. LOCAL-ESTIMATE tokens only because " +
+          "Compaction does not ingest Cursor's conditional result.usage. No upload, no SQLite. Review artifacts before sharing.",
         options,
         commandParts,
         capture: async () => {

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ACTIVE_USAGE_METER_VERSION } from "../../src/core/usage/usage-event.js";
 import { createServer, request, type RequestOptions, type Server } from "node:http";
 import https from "node:https";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -35,8 +36,9 @@ vi.mock("../../src/core/gateway/engine-ipc/engine-apply-seam.js", () => ({
       mutatedRequestBody: JSON.stringify({ model: "claude-x", messages: [{ role: "user", content: "compacted" }] }),
       recoveryRequired: true as const,
       appliedComponents: ["deterministic-compaction"],
-      meterVersion: "optimized-input-v1",
+      meterVersion: ACTIVE_USAGE_METER_VERSION,
       meteredOptimizedInputTokens: PER_APPLY_TOKENS,
+      estimatedInputTokensBefore: PER_APPLY_TOKENS + 10,
       estimatedInputTokensAfter: 10,
       receiptArtifacts: {
         deterministic_plan: {
@@ -72,6 +74,15 @@ const { currentPeriodId } = await import("../../src/core/entitlement/lease.js");
 const BIG = "Z".repeat(700);
 const UPSTREAM_REPLY = JSON.stringify({ id: "msg_fake", usage: { input_tokens: 60, output_tokens: 4 } });
 const DEDUPABLE = JSON.stringify({ model: "claude-x", messages: [{ role: "user", content: `${BIG}\n\ntail\n\n${BIG}` }] });
+
+/**
+ * Did this forwarded body keep its INPUT byte-exact? A turn refused for want of input allowance is
+ * still SHAPED in-process (output shaping is the base capability the allowance never bought), so it
+ * is no longer byte-identical to the request — the shaping block is appended outside `messages`.
+ * What the ceiling guarantees is that no INPUT compaction was forwarded, and that is what this tests.
+ */
+const inputUnchanged = (body: string): boolean =>
+  JSON.stringify(JSON.parse(body).messages) === JSON.stringify(JSON.parse(DEDUPABLE).messages);
 
 function listen(server: Server): Promise<number> {
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve((server.address() as { port: number }).port)));
@@ -157,7 +168,7 @@ describe("concurrent metered applies cannot exceed the period allowance", () => 
         preference: "auto-when-gates-pass",
         gates_required: [...AUTO_APPLY_ELIGIBILITY_GATES]
       },
-      join(cwd, ".compaction")
+      leaseDir // the DEVICE store, the only one the gateway reads
     );
     return { port: await listen(gateway), seen, logs, env };
   }
@@ -181,9 +192,9 @@ describe("concurrent metered applies cannot exceed the period allowance", () => 
     expect(entries).toHaveLength(1);
     expect(committed).toBe(PER_APPLY_TOKENS);
 
-    // The excess applies DECLINED — they forwarded the byte-exact original, they did not partially meter.
-    expect(ctx.seen.filter((body) => body === DEDUPABLE)).toHaveLength(3);
-    expect(ctx.seen.filter((body) => body !== DEDUPABLE)).toHaveLength(1);
+    // The excess applies DECLINED — their INPUT went upstream untouched, they did not partially meter.
+    expect(ctx.seen.filter(inputUnchanged)).toHaveLength(3);
+    expect(ctx.seen.filter((body) => !inputUnchanged(body))).toHaveLength(1);
     expect(ctx.logs.join("\n")).toContain("allowance-ceiling-exceeded");
 
     // The journal is still a clean, strictly LINEAR chain (the chain guarantee is not traded away).
@@ -200,7 +211,7 @@ describe("concurrent metered applies cannot exceed the period allowance", () => 
     const { entries, skipped } = await readUsageJournal(ctx.env);
     expect(entries).toHaveLength(4);
     expect(sumOptimizedInputTokensForPeriod(entries, currentPeriodId())).toBe(4 * PER_APPLY_TOKENS);
-    expect(ctx.seen.filter((body) => body === DEDUPABLE)).toHaveLength(0); // every one was applied
+    expect(ctx.seen.filter(inputUnchanged)).toHaveLength(0); // every one was applied
     expect(ctx.logs.join("\n")).not.toContain("allowance-ceiling-exceeded");
     expect(skipped).toHaveLength(0);
     expect(verifyUsageChain(entries).valid).toBe(true);
@@ -215,7 +226,7 @@ describe("concurrent metered applies cannot exceed the period allowance", () => 
     const { entries } = await readUsageJournal(ctx.env);
     expect(sumOptimizedInputTokensForPeriod(entries, currentPeriodId())).toBe(160);
     expect(entries).toHaveLength(2);
-    expect(ctx.seen.filter((body) => body === DEDUPABLE)).toHaveLength(2);
+    expect(ctx.seen.filter(inputUnchanged)).toHaveLength(2);
     expect(verifyUsageChain(entries).valid).toBe(true);
   });
 });

@@ -3,10 +3,44 @@ import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lastReceiptLines, receiptLinesFromJsonl, runWatch, runWatchOnce } from "../../src/cli/commands/watch.js";
-import { receiptProvenOpenLabel } from "../../src/core/gateway/receipt-line.js";
+import { openLineForTurn, receiptProvenOpenLabel } from "../../src/core/gateway/receipt-line.js";
 import { DEFAULT_GATEWAY_RECEIPTS_DIR, GATEWAY_RECEIPTS_FILE, type GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import { writeProductMode } from "../../src/core/onboarding-preferences.js";
+import { loadOutputCalibrationResolver } from "../../src/core/output-shaping-savings.js";
 import { recordShapingOutcome } from "../../src/core/output-shaping-turn-state.js";
+import type { ShapingTurnScope } from "../../src/core/output-shaping-turn-state.js";
+import { provisionValidLease } from "../helpers/lease-fixture.js";
+import { seedOutputCalibration, TEST_OUTPUT_POLICY_VERSION } from "../helpers/output-calibration-fixture.js";
+
+/**
+ * Fold a real provider-reported A/B (1000 → 620 output tokens, a measured 38%) into `configDir`'s
+ * calibration store.
+ *
+ * The output figure is gated on the device's OWN measurement: the shipped 0.47 default prior renders
+ * none. These cases are about WHICH REPLAYED RECEIPT may draw an arrow, so the device has to be one
+ * that may draw an arrow at all — otherwise the negative cases below ("a receipt proving nothing
+ * renders a plain count") would pass no matter what the gate did.
+ *
+ * THE SEEDED RATE MUST NOT BE 0.47. It was: the fold reproduced the prior's own magnitude so the
+ * reconstructed pairs would not have to change. That made every `−47%` pin in this file unable to
+ * tell a device measurement from the prior leaking back through — the exact figure the withdrawal
+ * removes is the one the assertions demanded, so reverting the fix would have kept them green. 38%
+ * is a rate no default can produce, so a `−47%` anywhere below is now a FAILURE SIGNAL rather than
+ * the expected text.
+ */
+async function seedMeasuredCalibration(configDir: string): Promise<void> {
+  await seedOutputCalibration(
+    { COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv,
+    { model: "claude-sonnet-4-5", treatment: [620, 620, 620] }
+  );
+}
+
+/**
+ * `watch` is a side pane, not a hook: it is handed no tool session id, so at the CLI it fails closed and
+ * renders no output arrow. These cases exercise the RENDERING, so they inject the scope explicitly —
+ * the same one they record the decision under.
+ */
+const WATCH_SCOPE: ShapingTurnScope = { tool: "claude-code", sessionId: "watch-test-session" };
 
 /**
  * THE PER-TURN TIER LABEL MUST DESCRIBE THE TURN, NOT TODAY'S SETTING.
@@ -59,7 +93,9 @@ function shapedReceipt(id: string): GatewayReceipt {
     model_visible_bytes_changed: true,
     approval_status: "auto-applied-by-policy",
     recovery_id: "rec-1",
-    applied_components: ["output-shaping"]
+    applied_components: ["output-shaping"],
+    output_shaping_state: "attached-this-pass",
+    output_shaping_policy_version: TEST_OUTPUT_POLICY_VERSION
   };
 }
 
@@ -82,10 +118,16 @@ const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  * Follow a LIVE `compaction watch` (no `--all`, so nothing is a replay), let `append` land one or more
  * receipts, and return the canonical lines it printed for them.
  */
-async function liveWatchLines(env: NodeJS.ProcessEnv, append: () => Promise<void>): Promise<string[]> {
+async function liveWatchLines(
+  env: NodeJS.ProcessEnv,
+  append: () => Promise<void>,
+  // `null` means "no scope at all" — an explicit `undefined` would fall back to this default and
+  // silently re-run the shaped case.
+  shapingScope: ShapingTurnScope | null = WATCH_SCOPE
+): Promise<string[]> {
   const printed: string[] = [];
   const controller = new AbortController();
-  const done = runWatch(controller.signal, {}, { cwd, env, pollMs: 30, print: (l) => printed.push(l) });
+  const done = runWatch(controller.signal, {}, { cwd, env, pollMs: 30, print: (l) => printed.push(l), ...(shapingScope ? { shapingScope } : {}) });
   await delay(80);
   await append();
   await delay(200);
@@ -182,12 +224,12 @@ describe("a full apply is never relabelled as Open `basic shaping`", () => {
    * A REAL Community full apply: the input was compacted (`estimated_input_tokens_before/after`) and
    * output shaping rode the same request, which is what the composed apply pipeline produces.
    *
-   * THIS IS THE GUARD FOR THE THIRD CONJUNCT of `receiptProvenOpenLabel`. `request_mutated` and the
-   * `output-shaping` component are BOTH true on a full apply, so without the `no input before→after`
-   * condition the helper answers `basic` for it — and every surface that asks (`watch`, `status`, the
-   * Stop-hook line, the gateway's own inline line) would print `basic shaping` on a Community full
-   * apply while suppressing its measured reduction. That is the same class of false label this whole
-   * rule exists to remove, pointed the other way.
+   * THIS IS THE GUARD FOR THE INPUT-ARROW CONJUNCT of `receiptProvenOpenLabel`. Output shaping was
+   * ACTIVE on a full apply (`output_shaping_state: "attached-this-pass"`), so without the `no input
+   * before→after` condition the helper answers `basic` for it — and every surface that asks (`watch`,
+   * `status`, the Stop-hook line, the gateway's own inline line) would print `basic shaping` on a
+   * Community full apply while suppressing its measured reduction. That is the same class of false
+   * label this whole rule exists to remove, pointed the other way.
    */
   function fullApplyReceipt(id: string): GatewayReceipt {
     return {
@@ -198,6 +240,7 @@ describe("a full apply is never relabelled as Open `basic shaping`", () => {
       approval_status: "auto-applied-by-policy",
       recovery_id: "rec-full",
       applied_components: ["lcm-compaction", "deterministic-compaction", "output-shaping"],
+      output_shaping_state: "attached-this-pass",
       estimated_input_tokens_before: 41210,
       estimated_input_tokens_after: 21876,
       estimated_model_visible_input_reduction_percent: 47,
@@ -211,7 +254,7 @@ describe("a full apply is never relabelled as Open `basic shaping`", () => {
 
     // NON-VACUOUS, and pinned to the input-arrow condition alone: the SAME receipt with ONLY the two
     // before→after counts removed is exactly the case that DOES prove `basic`. So this pair fails for
-    // the missing input-arrow check and cannot pass by accident through the other two conditions.
+    // the missing input-arrow check and cannot pass by accident through the state condition.
     const withoutInputArrow = fullApplyReceipt("aaaa1111222233334444555566667777") as Partial<GatewayReceipt>;
     delete withoutInputArrow.estimated_input_tokens_before;
     delete withoutInputArrow.estimated_input_tokens_after;
@@ -256,7 +299,7 @@ describe("a full apply is never relabelled as Open `basic shaping`", () => {
 
   it("does not take the live shaped-evidence label on a full apply (real `watch` follow loop)", async () => {
     const env = { COMPACTION_CONFIG_DIR: observeCfg } as NodeJS.ProcessEnv;
-    await recordShapingOutcome("shape", env);
+    await recordShapingOutcome(WATCH_SCOPE, "shape", env);
 
     const lines = await liveWatchLines(env, () => appendReceipt(fullApplyReceipt("ffff1111222233334444555566667777")));
     expect(lines).toHaveLength(1);
@@ -267,11 +310,28 @@ describe("a full apply is never relabelled as Open `basic shaping`", () => {
     // Identical harness, identical recorded shaping outcome; only the receipt differs. Without this
     // the case above could pass simply because `lastTurnWasShaped` never became true.
     const env = { COMPACTION_CONFIG_DIR: observeCfg } as NodeJS.ProcessEnv;
-    await recordShapingOutcome("shape", env);
+    await recordShapingOutcome(WATCH_SCOPE, "shape", env);
 
     const lines = await liveWatchLines(env, () => appendReceipt(recordReceipt("aaaa9999222233334444555566667777")));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("basic shaping");
+  });
+
+  /**
+   * `watch` fails closed. It is a side pane with no tool session identity, so it cannot name the turn on
+   * screen — and the shaping evidence is now keyed by session. Without an injected scope it must decline
+   * the label rather than borrow whichever session recorded last, which is exactly what the shared global
+   * slot used to let it do.
+   */
+  it("declines the shaped label when it cannot name the session (no injected scope)", async () => {
+    const env = { COMPACTION_CONFIG_DIR: observeCfg } as NodeJS.ProcessEnv;
+    // A live, valid `shape` record exists — it just belongs to a session `watch` cannot claim to be.
+    await recordShapingOutcome(WATCH_SCOPE, "shape", env);
+
+    const lines = await liveWatchLines(env, () => appendReceipt(recordReceipt("bbbb9999222233334444555566667777")), null);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain("basic shaping");
+    expect(lines[0], "no evidence ⇒ no derived output arrow").not.toContain("→");
   });
 });
 
@@ -289,5 +349,365 @@ describe("receiptLinesFromJsonl (the shared renderer watch/status both call)", (
     // never receive it (see `WatchRenderContext.shapedEvidence`).
     const chunk = JSON.stringify(recordReceipt("2222222211112222333344445555aaaa")) + "\n";
     expect(receiptLinesFromJsonl(chunk, { productTier: "observe", shapedEvidence: true })[0]).toContain("basic shaping");
+  });
+});
+
+/**
+ * THE OUTPUT ARROW MUST SURVIVE REPLAY, ON THE SAME EVIDENCE THE LABEL USES.
+ *
+ * The estimated-output arrow was gated on `WatchRenderContext.shapedEvidence` ALONE - a LIVE session
+ * signal (`lastTurnWasShaped`) that the two replay callers never set, because both build their context
+ * in `watchRenderContext`. So `watch --once` and `status`'s "Last turns" could not render an arrow for
+ * ANY turn at ANY tier: a real full apply that the gateway's own inline line rendered as
+ * `output 617→327 (−47%, est. · default prior)` came back as a bare `output 327` the moment the same
+ * receipt was replayed. Two descriptions of one turn, and the weaker one on the surface a user checks.
+ * (That capture predates the default-prior withdrawal, hence its `est. · default prior` label; the
+ * cases below seed a real measurement so the same replay gate is exercised on a device allowed to
+ * render a figure at all.)
+ *
+ * `output_shaping_state` is FIRST-HAND, per-turn, durable proof that the turn was shaped, and unlike a
+ * session signal that proof does not decay on replay. It supersedes the `applied_components` gate #941
+ * introduced: that field records what THIS APPLY PASS MUTATED, so a turn whose policy arrived upstream
+ * from the tool's own prompt hook was genuinely shaped and still had its arrow withheld. These cases pin
+ * that the arrow rides the new proof - and, just as importantly, that a receipt proving NOTHING still
+ * renders a plain count, so the gate did not simply become permissive.
+ */
+describe("the replay output arrow rides the receipt's own shaping evidence", () => {
+  /** A real Community full apply: input compacted AND output shaped in the same pass. */
+  function fullApplyReceipt(id: string): GatewayReceipt {
+    return {
+      ...shapedReceipt(id),
+      estimated_input_tokens_before: 40203,
+      estimated_input_tokens_after: 38999,
+      estimated_model_visible_input_reduction_percent: 3,
+      applied_components: ["lcm-compaction", "output-shaping"],
+      output_shaping_state: "attached-this-pass",
+      tokens: { prompt_input: 28239, output: 327 }
+    } as GatewayReceipt;
+  }
+
+  let fullCfg: string;
+  beforeEach(async () => {
+    fullCfg = await mkdtemp(join(tmpdir(), "watch-arrow-full-"));
+    // `full` is an ENTITLEMENT statement, not a preference: `resolveOpenTier` clamps a device with no
+    // valid lease down to observe/basic, and the full-apply builder is then never reached. Provision a
+    // real dev-signed lease so these cases exercise the branch they name.
+    provisionValidLease(fullCfg, {}, { productMode: "full" });
+    await seedMeasuredCalibration(fullCfg);
+    await seedMeasuredCalibration(basicCfg);
+  });
+  afterEach(async () => {
+    await rm(fullCfg, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  });
+
+  it("`status` Last turns renders the arrow for a REPLAYED full-apply receipt", async () => {
+    await writeReceipts([fullApplyReceipt("dddddddd11112222333344445555dddd")]);
+    const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: fullCfg } });
+    // The reconstructed BEFORE is this device's MEASURED rate applied to THIS turn's own output:
+    // 327 + round(327 × 0.38 / 0.62) = 527.
+    expect(lines[0]).toContain("output 527→327 (−38%, est.)");
+    // The measured input axis and the label are unchanged by this gate.
+    expect(lines[0]).toContain("input 40,203→38,999");
+    expect(lines[0]).toContain("full apply");
+  });
+
+  it("`watch --once` renders the arrow for a REPLAYED gateway-shaped Open receipt", async () => {
+    await writeReceipts([shapedReceipt("eeeeeeee11112222333344445555eeee")]);
+    const printed: string[] = [];
+    await runWatchOnce({ once: true }, { cwd, env: { COMPACTION_CONFIG_DIR: basicCfg }, print: (l) => printed.push(l) });
+    const line = printed.find((l) => l.startsWith("compaction · ")) ?? "";
+    // 412 + round(412 × 0.38 / 0.62) = 665.
+    expect(line).toContain("output 665→412 (−38%, est.)");
+  });
+
+  /**
+   * THE CASE THAT NEARLY SHIPPED A FABRICATED SAVING.
+   *
+   * The first version of this gate accepted `isRealApply(receipt)` as proof of shaping. It is not:
+   * `isRealApply` answers "did we mutate", and the engine composes a real apply from EITHER layer
+   * (`apply-pipeline.ts`: `shapedChanged = deterministicPlan.changed || outputShapingPlan?.changed`).
+   * An input-only apply is therefore a real apply on which output shaping never ran -- and every
+   * `lcm-compaction` turn in the 0.6.7 founder journey has exactly this receipt, because the
+   * task-aware gate holds shaping back on tool-call turns while input compaction still fires.
+   *
+   * Under that gate this receipt rendered `output 617→327 (−47%, est. …)`: a
+   * reconstructed BEFORE for a saving that did not happen. The input axis is real and must survive;
+   * the output axis must be a plain count.
+   */
+  it("an INPUT-ONLY apply renders NO output arrow — a real apply is not proof that output was shaped", async () => {
+    const inputOnly = {
+      ...fullApplyReceipt("cccc000011112222333344445555dddd"),
+      applied_components: ["lcm-compaction"],
+      // Shaping genuinely did not run on this turn — the engine measured the FINAL request and said so.
+      output_shaping_state: "absent"
+    } as GatewayReceipt;
+    await writeReceipts([inputOnly]);
+    const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: fullCfg } });
+    // The measured input reduction is real and stays.
+    expect(lines[0]).toContain("input 40,203→38,999");
+    // The counterfactual output axis is not earned: plain count, no arrow, no estimate label.
+    expect(lines[0]).toContain("output 327");
+    expect(lines[0], "no reconstructed BEFORE for a turn output shaping never touched").not.toContain("→327");
+    expect(lines[0]).not.toContain("est.");
+    expect(lines[0]).not.toContain("default prior");
+  });
+
+  /**
+   * THE CASE #941 COULD NOT SEE. `applied_components: ["lcm-compaction"]` with NO `output-shaping` —
+   * because the tool's own prompt hook attached the policy upstream, so the planner correctly attached
+   * nothing. The turn IS shaped: the engine measured the final model-visible request and recorded
+   * `already-active`. Under the #941 gate this rendered a bare `output 327`; it is the ordinary shape of
+   * an LCM turn (all five 0.6.7 Founder Journey turns, 261/261 replayable captures).
+   */
+  it("an ALREADY-ACTIVE turn renders the arrow even though applied_components omits output-shaping", async () => {
+    const alreadyActive = {
+      ...fullApplyReceipt("aaaa999911112222333344445555bbbb"),
+      applied_components: ["lcm-compaction"],
+      output_shaping_state: "already-active"
+    } as GatewayReceipt;
+    await writeReceipts([alreadyActive]);
+    const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: fullCfg } });
+    expect(lines[0]).toContain("output 527→327 (−38%, est.)");
+    expect(lines[0]).toContain("input 40,203→38,999");
+  });
+
+  /**
+   * LEGACY RECEIPTS FAIL CLOSED. The final model-visible request is not retained anywhere (recovery
+   * stores `original_body` only), so a receipt written before this field CANNOT be classified after the
+   * fact. No arrow, and explicitly NO fallback to `isRealApply` — this receipt is a real apply.
+   */
+  it("a LEGACY receipt with no output_shaping_state renders NO arrow (unknown is not `already-active`)", async () => {
+    const legacy = { ...fullApplyReceipt("bbbb999911112222333344445555cccc") } as Partial<GatewayReceipt>;
+    delete legacy.output_shaping_state;
+    // It IS a real apply and it DOES carry the old component evidence — neither may license the arrow.
+    expect(legacy.request_mutated).toBe(true);
+    expect(legacy.applied_components).toContain("output-shaping");
+    await writeReceipts([legacy as GatewayReceipt]);
+    const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: fullCfg } });
+    expect(lines[0]).toContain("output 327");
+    expect(lines[0]).not.toContain("→327");
+    expect(lines[0]).not.toContain("est.");
+    // The measured input axis is untouched by the output gate.
+    expect(lines[0]).toContain("input 40,203→38,999");
+  });
+
+  it("a receipt that proves NO shaping still renders a plain count on replay (the gate did not go permissive)", async () => {
+    await writeReceipts([recordReceipt("ffffffff11112222333344445555ffff")]);
+    const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: fullCfg } });
+    expect(lines[0]).toContain("output 412");
+    expect(lines[0]).not.toContain("→412");
+    expect(lines[0]).not.toContain("est.");
+  });
+
+  it("a DEVICE-MEASURED rate replaces the prior on the same replayed receipt (label changes, gate does not)", async () => {
+    // Replace the setup cohort with one exact engine-confirmed 20% cohort.
+    await rm(join(fullCfg, "shaping-calibration.json"), { force: true });
+    await seedOutputCalibration(
+      { COMPACTION_CONFIG_DIR: fullCfg } as NodeJS.ProcessEnv,
+      { model: "claude-sonnet-4-5", treatment: [800, 800, 800] }
+    );
+    await writeReceipts([fullApplyReceipt("aaaabbbb11112222333344445555cccc")]);
+    const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: fullCfg } });
+    // 20% measured: 327 / (1 − 0.2) = 409.
+    expect(lines[0]).toContain("output 409→327 (−20%, est.)");
+    expect(lines[0], "a measured rate must never carry the default-prior marker").not.toContain("default prior");
+  });
+
+  it("replay and the LIVE path describe the same receipt identically", async () => {
+    // The property the whole gate exists for: one receipt, one description, whichever surface renders it.
+    const receipt = fullApplyReceipt("bbbbcccc11112222333344445555dddd");
+    await writeReceipts([]);
+    const live = await liveWatchLines({ COMPACTION_CONFIG_DIR: fullCfg }, () => appendReceipt(receipt), null);
+    await writeReceipts([receipt]);
+    const { lines: replayed } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: fullCfg } });
+    expect(live).toHaveLength(1);
+    expect(replayed[0]).toBe(live[0]);
+  });
+});
+
+/**
+ * THE OPEN LABEL RIDES THE SAME EVIDENCE THE ARROW RIDES.
+ *
+ * `receiptProvenOpenLabel` used to read `request_mutated` + an `output-shaping` entry in
+ * `applied_components` — "did THIS PASS mutate" — after the arrow beside it had already moved to
+ * `output_shaping_state`. On the ordinary Open `already-active` turn (policy attached upstream by the
+ * tool's own prompt hook, so the planner correctly attached nothing) the line therefore drew a savings
+ * arrow with NO label naming what produced it: the stronger claim shown, the weaker one withheld.
+ *
+ * The state is authoritative whenever it is present. `absent` never takes a label — not from the
+ * receipt and not from live session state — and a legacy receipt with no state fails closed exactly as
+ * the arrow does.
+ */
+describe("the Open label reads output_shaping_state, the same evidence as the arrow", () => {
+  /** The ordinary Open LCM turn: policy already on the request upstream, this pass attached none. */
+  function alreadyActiveOpenReceipt(id: string): GatewayReceipt {
+    return {
+      ...shapedReceipt(id),
+      applied_components: ["lcm-compaction"],
+      output_shaping_state: "already-active"
+    };
+  }
+
+  /** The engine measured the final request and shaping was NOT on it. */
+  function absentOpenReceipt(id: string): GatewayReceipt {
+    return {
+      ...recordReceipt(id),
+      output_shaping_state: "absent"
+    };
+  }
+
+  // BOTH tier dirs get a real fold, because these cases contrast an arrow against its ABSENCE. The
+  // output arrow now requires this device's own measurement, so on an unmeasured device every line
+  // below renders a plain count — the `absent` receipt and the `already-active` receipt alike — and
+  // each `not.toContain("→")` would hold for the wrong reason, proving nothing about the evidence
+  // gate it is named for. `observeCfg` is seeded too so the tier-invariance case still compares two
+  // devices that differ ONLY in product mode.
+  beforeEach(async () => {
+    await seedMeasuredCalibration(observeCfg);
+    await seedMeasuredCalibration(basicCfg);
+  });
+
+  it("proves `basic` for an already-active receipt whose applied_components omits output-shaping", () => {
+    const receipt = alreadyActiveOpenReceipt("aaaa0000111122223333444455550000");
+    expect(receipt.applied_components).not.toContain("output-shaping");
+    expect(receiptProvenOpenLabel(receipt)).toBe("basic");
+  });
+
+  it("labels an already-active Open turn `basic shaping` AND draws the arrow on replay", async () => {
+    await writeReceipts([alreadyActiveOpenReceipt("bbbb0000111122223333444455550000")]);
+    const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: basicCfg } });
+    expect(lines).toHaveLength(1);
+    const line = lines[0] as string;
+    // Label and arrow name the same event: a number without a method is the state this pins against.
+    expect(line).toContain("basic shaping");
+    // 412 + round(412 × 0.38 / 0.62) = 665.
+    expect(line).toContain("output 665→412 (−38%, est.)");
+    expect(line).not.toContain("apply off");
+  });
+
+  it("renders the already-active Open turn identically whatever the device says today", async () => {
+    await writeReceipts([alreadyActiveOpenReceipt("cccc0000111122223333444455550000")]);
+    const asObserve = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: observeCfg } });
+    const asBasic = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: basicCfg } });
+    expect(asBasic.lines).toEqual(asObserve.lines);
+    expect(asBasic.lines[0]).toContain("basic shaping");
+  });
+
+  it("proves nothing and draws nothing for an explicit `absent` receipt on replay", async () => {
+    const receipt = absentOpenReceipt("dddd0000111122223333444455550000");
+    expect(receiptProvenOpenLabel(receipt)).toBeUndefined();
+    await writeReceipts([receipt]);
+    const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: basicCfg } });
+    expect(lines).toHaveLength(1);
+    const line = lines[0] as string;
+    expect(line).not.toContain("basic shaping");
+    // `absent` says the policy was not on the request; it does not establish "no model-visible
+    // mutation", so `apply off` stays underivable here too.
+    expect(line).not.toContain("apply off");
+    expect(line).toContain("output 412");
+    expect(line).not.toContain("→");
+    expect(line).not.toContain("est.");
+  });
+
+  it("does not label a LEGACY receipt (no state) from `applied_components` alone", () => {
+    // It carries the old mutation evidence and no state: the label fails closed like the arrow does.
+    const legacy = { ...shapedReceipt("eeee0000111122223333444455550000") } as Partial<GatewayReceipt>;
+    delete legacy.output_shaping_state;
+    expect(legacy.request_mutated).toBe(true);
+    expect(legacy.applied_components).toContain("output-shaping");
+    expect(receiptProvenOpenLabel(legacy as GatewayReceipt)).toBeUndefined();
+  });
+
+  /**
+   * `openLineForTurn` — the one rule `watch` (replay + live) and the Stop hook share. The state is
+   * authoritative when present; the live fallback exists for the receipt that recorded none.
+   */
+  describe("openLineForTurn: an explicit state is never overridden by live session evidence", () => {
+    it("never labels an explicit `absent` receipt `basic shaping` from live evidence", () => {
+      expect(openLineForTurn(absentOpenReceipt("ffff0000111122223333444455550000"), true)).toBe("unlabeled");
+    });
+
+    it("CONTROL: the same live evidence DOES label a legacy receipt that recorded no state", () => {
+      // Differs from the case above in the receipt only, so a green result cannot come from the live
+      // fallback being dead.
+      expect(openLineForTurn(recordReceipt("0000ffff111122223333444455550000"), true)).toBe("basic");
+    });
+
+    it("labels an already-active receipt `basic` with no live evidence at all (replay)", () => {
+      expect(openLineForTurn(alreadyActiveOpenReceipt("1111ffff111122223333444455550000"), false)).toBe("basic");
+    });
+
+    it("still never labels an input-apply receipt, whatever the state says", () => {
+      const fullApply = {
+        ...alreadyActiveOpenReceipt("2222ffff111122223333444455550000"),
+        estimated_input_tokens_before: 41210,
+        estimated_input_tokens_after: 21876
+      } as GatewayReceipt;
+      expect(openLineForTurn(fullApply, true)).toBe("unlabeled");
+    });
+  });
+
+  /**
+   * THE COALESCED LIVE DRAIN. `runWatch` resolves `lastTurnWasShaped` once per drain and hands it to
+   * every receipt appended since the last poll. An earlier receipt that explicitly says `absent` must
+   * not inherit `true` from the later shaped turn and draw an arrow over a saving that did not occur.
+   */
+  describe("a coalesced live drain does not let `absent` inherit a later turn's shaping", () => {
+    it("shared renderer: [absent, already-active] under live shaped-evidence → arrow and label on the second only", async () => {
+      const env = { COMPACTION_CONFIG_DIR: basicCfg };
+      const calibrationResolver = await loadOutputCalibrationResolver(env);
+      const chunk =
+        JSON.stringify(absentOpenReceipt("3333ffff111122223333444455550000")) +
+        "\n" +
+        JSON.stringify(alreadyActiveOpenReceipt("4444ffff111122223333444455550000")) +
+        "\n";
+      const lines = receiptLinesFromJsonl(chunk, { productTier: "basic", shapedEvidence: true, calibrationResolver, env });
+      expect(lines).toHaveLength(2);
+      const [absentLine, activeLine] = lines as [string, string];
+      expect(absentLine).toContain("id 3333ffff");
+      expect(absentLine).not.toContain("→");
+      expect(absentLine).not.toContain("est.");
+      expect(absentLine).not.toContain("basic shaping");
+      expect(activeLine).toContain("id 4444ffff");
+      expect(activeLine).toContain("output 665→412 (−38%, est.)");
+      expect(activeLine).toContain("basic shaping");
+    });
+
+    it("real `watch` follow loop: two receipts landing in one poll are described by their own state", async () => {
+      const env = { COMPACTION_CONFIG_DIR: basicCfg } as NodeJS.ProcessEnv;
+      await recordShapingOutcome(WATCH_SCOPE, "shape", env);
+
+      const lines = await liveWatchLines(env, async () => {
+        // One append, so both receipts are drained together with the same session evidence.
+        const dir = join(cwd, DEFAULT_GATEWAY_RECEIPTS_DIR);
+        await mkdir(dir, { recursive: true });
+        await appendFile(
+          join(dir, GATEWAY_RECEIPTS_FILE),
+          `${JSON.stringify(absentOpenReceipt("5555ffff111122223333444455550000"))}\n${JSON.stringify(
+            alreadyActiveOpenReceipt("6666ffff111122223333444455550000")
+          )}\n`,
+          "utf8"
+        );
+      });
+      expect(lines).toHaveLength(2);
+      const absentLine = lines.find((l) => l.includes("id 5555ffff")) ?? "";
+      const activeLine = lines.find((l) => l.includes("id 6666ffff")) ?? "";
+      expect(absentLine).not.toBe("");
+      expect(absentLine).not.toContain("→");
+      expect(absentLine).not.toContain("basic shaping");
+      expect(activeLine).toContain("→412");
+      expect(activeLine).toContain("basic shaping");
+    });
+
+    it("CONTROL: live evidence labels a legacy receipt and keeps its unavailable shaped axis", async () => {
+      const env = { COMPACTION_CONFIG_DIR: basicCfg } as NodeJS.ProcessEnv;
+      await recordShapingOutcome(WATCH_SCOPE, "shape", env);
+      const lines = await liveWatchLines(env, () => appendReceipt(recordReceipt("7777ffff111122223333444455550000")));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("basic shaping");
+      // The live signal proves shaping, but this legacy receipt has no exact policy version/regime.
+      // It cannot borrow a numeric cohort, and it must not erase the shaped axis either.
+      expect(lines[0]).toContain("output N/A→412 (N/A%, est.)");
+    });
   });
 });

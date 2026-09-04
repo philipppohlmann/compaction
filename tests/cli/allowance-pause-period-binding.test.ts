@@ -51,7 +51,7 @@ function previousPeriodId(): string {
 describe("a pause bound to the CURRENT verified lease period", () => {
   it("is promoted to current state and rendered", async () => {
     const env = provisionValidLease(configDir) as NodeJS.ProcessEnv;
-    writePause({ reason: "insufficient", period_id: currentPeriodId(), resets_on: periodEndUtc(currentPeriodId()), scope: "api-key-route" });
+    writePause({ reason: "insufficient", period_id: currentPeriodId(), resets_on: periodEndUtc(currentPeriodId()), scope: "all-routes" });
 
     const pause = await lastTurnAllowancePause({ cwd, env });
     expect(pause?.reason).toBe("insufficient");
@@ -131,7 +131,7 @@ describe("with NO verified lease period (Open tier: no authority to bind to)", (
   });
 
   it("ignores a pause carrying no reset date at all — nothing establishes that it is still true", async () => {
-    writePause({ reason: "insufficient", scope: "api-key-route" });
+    writePause({ reason: "insufficient", scope: "all-routes" });
     expect(await lastTurnAllowancePause({ cwd, env: openEnv() })).toBeUndefined();
   });
 

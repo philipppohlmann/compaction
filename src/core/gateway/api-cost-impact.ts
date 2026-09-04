@@ -16,6 +16,10 @@
  *    `economic_route: "api-billing"`. There is NO field on the result that can carry a plan-lifetime /
  *    plan-quota / plan-auth figure. It can NEVER be generalized to Codex / Claude Code / Cursor plan-auth
  *    usage. The types are the structural guarantee.
+ *  - A GATEWAY RECEIPT IS NOT BY ITSELF ROUTE B. The gateway forwards on either the user's own provider
+ *    key OR a Claude Code SUBSCRIPTION session, and a subscription turn is billed no per-token amount at
+ *    all. `applyInputCostReductionUsd` therefore checks the receipt's recorded `upstream_route_type` and
+ *    refuses anything but `api-key` — the boundary this docblock has always asserted, now a check.
  *  - `invoice_confirmed` is ALWAYS `"unavailable"`. Provider-priced ≠ invoice-confirmed. Never claim a
  *    billing-confirmed / invoice savings figure from token receipts.
  *  - Missing provider usage / cache / pricing / model → the WHOLE cost impact is `unavailable` WITH a
@@ -31,7 +35,7 @@ const TOKENS_PER_MILLION = 1_000_000;
 
 /**
  * The provider-PRICED cost reduction (USD) of an APPLY receipt's model-visible input compaction, for the
- * per-turn receipt line's `−$X (est)` value clause. It is COMPUTED, never hardcoded:
+ * per-turn receipt line's `−$X (list price)` value clause. It is COMPUTED, never hardcoded:
  *
  *   costReductionUsd = (estimated_input_tokens_before − estimated_input_tokens_after) / 1e6 × inputPerMillionUsd(model)
  *
@@ -40,7 +44,7 @@ const TOKENS_PER_MILLION = 1_000_000;
  * table (`pricing.ts`). Change the price table → this number changes (proved by a test), so it can never be
  * a hardcoded constant.
  *
- * Honesty / claim boundary (matches the `(est)` label the line renders):
+ * Honesty / claim boundary (matches the `(list price)` label the line renders):
  *  - This is an ESTIMATE basis: the token delta is a local chars/4 estimate and the price is a published
  *    list price, NOT an invoice. The un-compacted request was ALSO never actually sent (no per-turn
  *    counterfactual), so this is what the applied reduction WOULD save at list price — never billing-confirmed.
@@ -51,6 +55,17 @@ const TOKENS_PER_MILLION = 1_000_000;
  * Content-free: consumes only the receipt's numeric before/after and the content-free model label.
  */
 export function applyInputCostReductionUsd(receipt: GatewayReceipt): number | undefined {
+  // ROUTE B ONLY, ENFORCED RATHER THAN DOCUMENTED. This module's whole claim boundary is that it
+  // answers a question about PAID API traffic; the check that made it true was missing, so a Claude
+  // Code SUBSCRIPTION turn — which the gateway forwards on a flat-fee session and which is billed no
+  // per-token amount whatsoever — rendered a published-per-token figure as money saved. Priced at a
+  // rate the user is not charged, that is not a smaller bill; it is a number with no basis.
+  //
+  // FAIL-CLOSED ON AN UNKNOWN ROUTE. A receipt written before `upstream_route_type` existed records
+  // none, and nothing in a replay can recover it. Those receipts lose the clause: showing an
+  // unverifiable dollar figure for precisely the records whose route is unknown is the defect, not
+  // the mitigation. The other axes (input reduction, output count) are route-independent and stay.
+  if (receipt.upstream_route_type !== "api-key") return undefined;
   if (receipt.request_mutated !== true) return undefined;
   const before = receipt.estimated_input_tokens_before;
   const after = receipt.estimated_input_tokens_after;

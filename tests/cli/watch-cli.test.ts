@@ -1,18 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { appendFile, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { appendFile, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { promisify } from "node:util";
 import { recordShapingOutcome } from "../../src/core/output-shaping-turn-state.js";
-import { updateCalibrationFromAbSummary } from "../../src/core/output-shaping-calibration-store.js";
-import {
-  addOutputShapingAbRun,
-  initOutputShapingAbExperiment,
-  summarizeOutputShapingAb,
-  type OutputShapingAbRun
-} from "../../src/core/output-shaping-ab.js";
-import { join } from "node:path";
+import type { ShapingTurnScope } from "../../src/core/output-shaping-turn-state.js";
+
+/**
+ * `watch` is a side pane, not a hook: it is handed no tool session id, so at the CLI it fails closed and
+ * renders no output arrow. These cases exercise the RENDERING, so they inject the scope explicitly —
+ * the same one they record the decision under.
+ */
+const WATCH_SCOPE: ShapingTurnScope = { tool: "claude-code", sessionId: "watch-test-session" };
+import { TEST_OUTPUT_POLICY_VERSION, seedOutputCalibration } from "../helpers/output-calibration-fixture.js";
+import { join, resolve } from "node:path";
 import { mkdtempSync, rmSync } from "node:fs";
 import {
   receiptLinesFromJsonl,
+  lastReceiptLines,
   lastTurnAllowancePause,
   runWatch,
   runWatchOnce,
@@ -24,6 +29,9 @@ import { DEFAULT_GATEWAY_RECEIPTS_DIR, GATEWAY_RECEIPTS_FILE, type GatewayReceip
 import { currentPeriodId, periodEndUtc } from "../../src/core/entitlement/lease.js";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
 import { proUrl } from "../../src/core/pro-destination.js";
+import { RUN_BOUNDARY_SCHEMA, startUserRun, endUserRun } from "../../src/core/gateway/run-boundary.js";
+import { appendActivityEvent, DEFAULT_ACTIVITY_DIRECTORY } from "../../src/core/activity-store.js";
+import { computeActivityEventId, type ActivityEvent } from "../../src/core/activity-event.js";
 
 /**
  * `compaction watch` core. Drives the REAL formatter through a temp receipts.jsonl with real appends:
@@ -75,6 +83,8 @@ afterEach(async () => {
 });
 
 const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+const execFileAsync = promisify(execFile);
+const CLI = resolve("dist/cli/index.js");
 
 function collect(): { print: (line: string) => void; lines: string[] } {
   const lines: string[] = [];
@@ -92,6 +102,83 @@ describe("receiptLinesFromJsonl", () => {
       "compaction · observed input 1,000 · output 50 · id aaaaaaaa",
       "compaction · observed input 2,000 · output 60 · id bbbbbbbb"
     ]);
+  });
+
+  it("the compiled watch entrypoint rejects traversal correlation and malformed versioned run state", async () => {
+    const config = join(dir, "nested", "config");
+    const runs = join(config, "runs");
+    await mkdir(runs, { recursive: true });
+
+    const traversalCorrelation = "../../outside-run-store";
+    const traversal = JSON.parse(receiptJson("traversal-receipt", 10, 1)) as GatewayReceipt;
+    traversal.session_correlation_id = traversalCorrelation;
+    traversal.request_started_at = "2026-07-30T10:00:00.000Z";
+    const outsidePath = join(dir, "nested", "outside-run-store.json");
+    const outsideRaw = JSON.stringify({
+      schema: RUN_BOUNDARY_SCHEMA,
+      runs: [{
+        session_correlation_id: traversalCorrelation,
+        run_seq: 1,
+        started_at: "2026-07-30T09:59:00.000Z",
+        turn_correlation_id: "b".repeat(32)
+      }]
+    });
+    await writeFile(outsidePath, outsideRaw, "utf8");
+
+    const canonicalCorrelation = "a".repeat(32);
+    const malformed = JSON.parse(receiptJson("malformed-store", 20, 2)) as GatewayReceipt;
+    malformed.session_correlation_id = canonicalCorrelation;
+    malformed.request_started_at = "2026-07-30T10:00:00.000Z";
+    await writeFile(
+      join(runs, `${canonicalCorrelation}.json`),
+      JSON.stringify({ schema: RUN_BOUNDARY_SCHEMA, runs: [null] }),
+      "utf8"
+    );
+
+    const malformedTimeCorrelation = "c".repeat(32);
+    const malformedTime = JSON.parse(receiptJson("bad-time-receipt", 30, 3)) as GatewayReceipt;
+    malformedTime.session_correlation_id = malformedTimeCorrelation;
+    malformedTime.request_started_at = "not-a-canonical-time";
+    await writeFile(join(runs, `${malformedTimeCorrelation}.json`), JSON.stringify({
+      schema: RUN_BOUNDARY_SCHEMA,
+      runs: [{
+        session_correlation_id: malformedTimeCorrelation,
+        run_seq: 1,
+        started_at: "2026-07-30T09:59:00.000Z",
+        turn_correlation_id: "d".repeat(32)
+      }]
+    }), "utf8");
+
+    const symlinkCorrelation = "e".repeat(32);
+    const symlinked = JSON.parse(receiptJson("symlink-receipt", 40, 4)) as GatewayReceipt;
+    symlinked.session_correlation_id = symlinkCorrelation;
+    symlinked.request_started_at = "2026-07-30T10:00:00.000Z";
+    const symlinkOutsidePath = join(dir, "nested", "symlink-outside.json");
+    await writeFile(symlinkOutsidePath, JSON.stringify({
+      schema: RUN_BOUNDARY_SCHEMA,
+      runs: [{
+        session_correlation_id: symlinkCorrelation,
+        run_seq: 1,
+        started_at: "2026-07-30T09:59:00.000Z",
+        turn_correlation_id: "f".repeat(32)
+      }]
+    }), "utf8");
+    await symlink(symlinkOutsidePath, join(runs, `${symlinkCorrelation}.json`));
+    await writeFile(
+      file,
+      `${JSON.stringify(traversal)}\n${JSON.stringify(malformed)}\n${JSON.stringify(malformedTime)}\n${JSON.stringify(symlinked)}\n`,
+      "utf8"
+    );
+
+    const { stdout } = await execFileAsync("node", [CLI, "watch", "--once", "--all"], {
+      cwd: dir,
+      env: { ...process.env, COMPACTION_CONFIG_DIR: config }
+    });
+    expect(stdout).toContain("id traversa");
+    expect(stdout).toContain("id malforme");
+    expect(stdout).toContain("id bad-time");
+    expect(stdout).toContain("id symlink-");
+    expect(await readFile(outsidePath, "utf8")).toBe(outsideRaw);
   });
 });
 
@@ -116,6 +203,67 @@ describe("runWatch - live follow", () => {
       "compaction · observed input 10,000 · output 100 · id cccccccc",
       "compaction · observed input 20,000 · output 200 · id dddddddd"
     ]);
+  });
+
+  it("withholds an exact Codex gateway micro-receipt until Stop, then emits only the settled aggregate", async () => {
+    const sessionCorrelation = "a".repeat(32);
+    const turnCorrelation = "b".repeat(32);
+    const startedAt = "2026-07-30T09:59:00.000Z";
+    const stoppedAt = "2026-07-30T10:01:00.000Z";
+    expect(startUserRun(sessionCorrelation, startedAt, cleanEnv, turnCorrelation)).toBeDefined();
+
+    const { print, lines } = collect();
+    const controller = new AbortController();
+    const done = runWatch(controller.signal, {}, { cwd: dir, print, pollMs: 30, env: cleanEnv });
+    await delay(80);
+    const micro = JSON.parse(receiptJson("codex-micro", 10, 1)) as GatewayReceipt;
+    micro.session_correlation_id = sessionCorrelation;
+    micro.request_started_at = "2026-07-30T10:00:00.000Z";
+    await appendFile(file, `${JSON.stringify(micro)}\n`, "utf8");
+    await delay(150); // More than four polling intervals: the receipt was observable before Stop.
+    expect(lines.filter((line) => line.startsWith("compaction · "))).toEqual([]);
+
+    // Snapshot uses the same exact run identity and must not expose the in-flight micro-result either.
+    const beforeStopSnapshot: string[] = [];
+    await runWatchOnce({ once: true }, { cwd: dir, env: cleanEnv, print: (line) => beforeStopSnapshot.push(line) });
+    expect(beforeStopSnapshot.filter((line) => line.startsWith("compaction · "))).toEqual([]);
+
+    expect(endUserRun(sessionCorrelation, stoppedAt, cleanEnv, turnCorrelation)).toBeDefined();
+    const eventBase: ActivityEvent = {
+      surface: "codex",
+      provider: "openai",
+      workflow_id: "codex-stop",
+      session_id: `codex-session-${sessionCorrelation}`,
+      run_id: `codex-stop-${turnCorrelation}`,
+      input_before: 10,
+      output_after: 1,
+      token_source: {
+        input: { source: "provider-reported" },
+        output: { source: "provider-reported" }
+      },
+      claim_scope: "run-scoped",
+      evidence_level: "exact correlated gateway run",
+      approval_status: "not-required",
+      recovery: { original_retained: false },
+      sync_status: "local-only",
+      activity_kind: "codex-stop",
+      recorded_at: stoppedAt,
+      run_started_at: startedAt,
+      measurement_source: "gateway-run"
+    };
+    const event: ActivityEvent = { ...eventBase, activity_event_id: computeActivityEventId(eventBase) };
+    expect((await appendActivityEvent(event, join(dir, DEFAULT_ACTIVITY_DIRECTORY))).appended).toBe(true);
+    await delay(180);
+    controller.abort();
+    await done;
+
+    const turns = lines.filter((line) => line.startsWith("compaction · "));
+    expect(turns).toEqual(["compaction · input 10 · output 1"]);
+    expect(turns.join("\n")).not.toContain("id codex-mi");
+
+    const afterStopSnapshot: string[] = [];
+    await runWatchOnce({ once: true }, { cwd: dir, env: cleanEnv, print: (line) => afterStopSnapshot.push(line) });
+    expect(afterStopSnapshot.filter((line) => line.startsWith("compaction · "))).toEqual(turns);
   });
 
   it("ignores pre-existing receipts by default (only new after start)", async () => {
@@ -143,25 +291,17 @@ describe("runWatch - live follow", () => {
     // test is non-vacuous — with the historical guard removed it FAILS (verified by disabling it).
     // Seeded through the real API; an earlier hand-written fixture used the wrong filename and shape,
     // produced no rate, and made this test pass either way.
-    const run = (arm: "control" | "treatment", outputTokens: number): OutputShapingAbRun => ({
-      arm,
-      outputTokens,
-      inputTokens: 1000,
-      providerReported: true,
-      tokenSource: "provider-reported",
-      ...(arm === "treatment"
-        ? { policyFamily: "output_shaping" as const, policyNames: ["concise_response"], evalMarkersPreserved: true }
-        : {})
+    await seedOutputCalibration(env as NodeJS.ProcessEnv, {
+      model: "m",
+      control: [1000, 1000, 1000],
+      treatment: [600, 600, 600]
     });
-    let exp = initOutputShapingAbExperiment({ experimentId: "watch-cal", taskShape: "code" });
-    for (const r of [run("control", 1000), run("treatment", 600)]) exp = addOutputShapingAbRun(exp, r);
-    await updateCalibrationFromAbSummary(summarizeOutputShapingAb(exp), env as NodeJS.ProcessEnv);
-    await recordShapingOutcome("shape", env as NodeJS.ProcessEnv);
+    await recordShapingOutcome(WATCH_SCOPE, "shape", env as NodeJS.ProcessEnv);
     await appendFile(file, receiptJson("aaaabbbb11112222333344445555aaaa", 9000, 500), "utf8");
 
     const { print, lines } = collect();
     const controller = new AbortController();
-    const done = runWatch(controller.signal, { all: true }, { cwd: dir, print, pollMs: 30, env });
+    const done = runWatch(controller.signal, { all: true }, { cwd: dir, print, pollMs: 30, env, shapingScope: WATCH_SCOPE });
     await delay(150);
     controller.abort();
     await done;
@@ -224,6 +364,9 @@ describe("runWatch - live follow", () => {
     const header = (await watchHeaderLines(false)).join("\n");
     expect(header).toContain("Content-free");
     expect(header).toContain("Ctrl-C to stop");
+    expect(header).toContain("settled Codex Stop turns, exact Gateway-backed Claude Stop aggregates");
+    expect(header).toContain("positively reconciled hook-only task-notification continuations");
+    expect(header).not.toContain("Interactive Codex turns settle after Stop; other turns");
   });
 });
 
@@ -238,22 +381,28 @@ describe("receiptLinesFromJsonl - tier + per-turn evidence", () => {
     tokens: { prompt_input: 100, output: 500 },
     content_uploaded: false
   });
+  const shapedRecord = JSON.stringify({
+    ...JSON.parse(record),
+    model: "gpt-5",
+    output_shaping_state: "attached-this-pass",
+    output_shaping_policy_version: TEST_OUTPUT_POLICY_VERSION
+  });
 
   it("HISTORICAL receipts never carry the arrow, even with a rate available", () => {
     // `shapedEvidence` omitted = historical. The current shaping decision says nothing about a receipt
     // from three days ago — the same reason the ceiling clause stays off replayed lines.
     const lines = receiptLinesFromJsonl(record, {
       productTier: "basic",
-      reduction: { availability: "measured", reductionPct: 40 } as never
+      calibrationResolver: () => ({ availability: "measured", reductionPct: 40 } as never)
     });
     expect(lines[0]).not.toContain("→");
     expect(lines[0]).toContain("output 500");
   });
 
   it("a LIVE batch with evidence carries the arrow", () => {
-    const lines = receiptLinesFromJsonl(record, {
+    const lines = receiptLinesFromJsonl(shapedRecord, {
       productTier: "basic",
-      reduction: { availability: "measured", reductionPct: 40 } as never,
+      calibrationResolver: () => ({ availability: "measured", reductionPct: 40 } as never),
       shapedEvidence: true
     });
     expect(lines[0]).toContain("→500");
@@ -262,7 +411,7 @@ describe("receiptLinesFromJsonl - tier + per-turn evidence", () => {
   it("evidence FALSE suppresses the arrow even on a live batch (a held turn)", () => {
     const lines = receiptLinesFromJsonl(record, {
       productTier: "basic",
-      reduction: { availability: "measured", reductionPct: 40 } as never,
+      calibrationResolver: () => ({ availability: "measured", reductionPct: 40 } as never),
       shapedEvidence: false
     });
     expect(lines[0]).not.toContain("→");
@@ -334,6 +483,81 @@ describe("runWatchOnce - snapshot mode (prints last N and EXITS, no follow)", ()
     expect(lines.filter((l) => l.startsWith("compaction · "))).toHaveLength(4);
   });
 
+  it("coalesces cumulative Claude Stop snapshots and suppresses only their exact gateway micro-receipts", async () => {
+    const correlation = "a".repeat(32);
+    const runId = `claude-stop-${"b".repeat(32)}`;
+    const startedAt = "2026-07-30T09:59:00.000Z";
+    const parentStoppedAt = "2026-07-30T10:00:30.000Z";
+    const finalStoppedAt = "2026-07-30T10:01:00.000Z";
+    const claudeEvent = (input: number, output: number, recordedAt: string): ActivityEvent => {
+      const base: ActivityEvent = {
+        surface: "claude_code",
+        provider: "anthropic",
+        model_label: "claude-x",
+        workflow_id: "claude-stop",
+        session_id: `claude-session-${correlation}`,
+        run_id: runId,
+        input_before: input,
+        output_after: output,
+        token_source: {
+          input: { source: "provider-reported" },
+          output: { source: "provider-reported" }
+        },
+        policy_used: TEST_OUTPUT_POLICY_VERSION,
+        claim_scope: "run-scoped",
+        evidence_level: "exact correlated gateway run",
+        approval_status: "not-required",
+        recovery: { original_retained: false },
+        sync_status: "local-only",
+        activity_kind: "claude-stop",
+        recorded_at: recordedAt,
+        run_started_at: startedAt,
+        measurement_source: "gateway-run",
+        output_shaping_state: "active",
+        output_estimate_state: "unseeded",
+        apply_posture: "basic"
+      };
+      return { ...base, activity_event_id: computeActivityEventId(base) };
+    };
+    expect((await appendActivityEvent(
+      claudeEvent(100, 20, parentStoppedAt),
+      join(dir, DEFAULT_ACTIVITY_DIRECTORY)
+    )).appended).toBe(true);
+    expect((await appendActivityEvent(
+      claudeEvent(300, 30, finalStoppedAt),
+      join(dir, DEFAULT_ACTIVITY_DIRECTORY)
+    )).appended).toBe(true);
+
+    const exactMicro = JSON.parse(receiptJson("claude-micro", 100, 20)) as GatewayReceipt;
+    exactMicro.session_correlation_id = correlation;
+    exactMicro.request_started_at = "2026-07-30T10:00:00.000Z";
+    const adjacent = JSON.parse(receiptJson("adjacent-receipt", 50, 5)) as GatewayReceipt;
+    adjacent.session_correlation_id = correlation;
+    adjacent.request_started_at = "2026-07-30T10:02:00.000Z";
+    await appendFile(file, `${JSON.stringify(exactMicro)}\n${JSON.stringify(adjacent)}\n`, "utf8");
+
+    const { print, lines } = collect();
+    await runWatchOnce({ once: true, lines: 2 }, { cwd: dir, env: cleanEnv, print });
+    const turns = lines.filter((line) => line.startsWith("compaction · "));
+    expect(turns).toEqual([
+      "compaction · observed input 50 · output 5 · id adjacent",
+      "compaction · observed input 300 · output N/A→30 (N/A%, est.) · basic shaping"
+    ]);
+    expect(turns.join("\n")).not.toContain("claude-");
+    expect(turns.join("\n")).not.toContain("47%");
+
+    const status = await lastReceiptLines(2, { cwd: dir, env: cleanEnv });
+    expect(status.lines).toEqual(turns);
+
+    // `--all` remains the explicit physical diagnostic view; it must not hide the micro receipt.
+    const diagnostic: string[] = [];
+    await runWatchOnce(
+      { once: true, all: true },
+      { cwd: dir, env: cleanEnv, print: (line) => diagnostic.push(line) }
+    );
+    expect(diagnostic.join("\n")).toContain("id claude-m");
+  });
+
   it("no receipts store yet → an honest note, still exits", async () => {
     const fresh = await mkdtemp(join(tmpdir(), "watch-once-empty-"));
     try {
@@ -370,8 +594,9 @@ describe("the allowance ceiling notice on watch", () => {
 
   beforeEach(() => {
     configDir = mkdtempSync(join(tmpdir(), "watch-ceiling-"));
-    // An issuer-exhausted lease. The pause covers API-key routed turns only: subscription-route full
-    // apply consumes no allowance, so the header must say so rather than claim a global stop.
+    // An issuer-exhausted lease. The pause covers INPUT optimization on every upstream route, and
+    // nothing else: output shaping owes the allowance nothing, so the header must say what kept
+    // running rather than claim a global stop.
     leaseEnv = provisionValidLease(configDir, { allowance_tokens: 0 }, { productMode: "full" }) as NodeJS.ProcessEnv;
     leaseEnv.COMPACTION_LEASE_DEV_ROOT = undefined;
   });
@@ -391,17 +616,19 @@ describe("the allowance ceiling notice on watch", () => {
   it("`watch --once` renders the SAME fact (a snapshot at the ceiling must not be silent)", async () => {
     const { print, lines } = collect();
     await runWatchOnce({ once: true }, { cwd: dir, print, env: leaseEnv });
-    expect(lines.join("\n")).toContain("Community input optimization on API-key routed turns is paused");
+    expect(lines.join("\n")).toContain("Community input optimization is paused");
     expect(lines.join("\n")).toContain(`It resumes ${periodEndUtc(currentPeriodId())}`);
   });
 
-  it("both headers scope the pause to API-key turns and say subscription turns are unaffected", async () => {
-    // `watch` renders this notice globally, with no way to know which route the next turn takes. An
-    // unqualified "Community full apply is paused" is false for a subscription user whose apply is
-    // running normally — and an exhausted API allowance never stops that route.
+  it("both headers name what stopped and what did not, without narrowing to one route", async () => {
+    // `watch` renders this notice globally, with no way to know which route the next turn takes — and
+    // it no longer needs to: the allowance governs Hybrid input optimization on every route, so the
+    // unqualified sentence is the true one. What it must still say is that output shaping is running,
+    // because that is the capability the ceiling did NOT take away.
     const header = [...(await watchHeaderLines(false, leaseEnv)), ...(await watchOnceHeaderLines(leaseEnv))].join("\n");
-    expect(header).toContain("Community input optimization on API-key routed turns is paused");
-    expect(header).toContain("Subscription-routed turns are unaffected");
+    expect(header).toContain("Community input optimization is paused");
+    expect(header).toContain("Output shaping remains active");
+    expect(header).not.toContain("Subscription-routed turns are unaffected");
   });
 
   it("both headers stay silent for a device with no ceiling", async () => {
@@ -442,7 +669,7 @@ describe("the allowance ceiling notice on watch", () => {
  *    whole pushed the first line of `watch` past a 120 ms budget — two live-follow tests caught it).
  */
 describe("lastTurnAllowancePause", () => {
-  const PAUSE = { reason: "insufficient" as const, resets_on: "2099-01-01", scope: "api-key-route" as const };
+  const PAUSE = { reason: "insufficient" as const, resets_on: "2099-01-01", scope: "all-routes" as const };
 
   /** A receipt line carrying (or not carrying) an allowance pause. */
   function pausedReceipt(id: string, pause?: typeof PAUSE): string {

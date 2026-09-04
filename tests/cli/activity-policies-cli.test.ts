@@ -13,7 +13,7 @@
  * ALL SYNTHETIC + CWD-SCOPED. dist is built by `pretest`.
  */
 import { execFile } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -41,7 +41,7 @@ async function seedTwoEvents(cwd: string): Promise<void> {
     import { appendActivityEvent } from ${JSON.stringify(STORE)};
     await appendActivityEvent(buildMeasureOnlyActivityEvent({
       surface: 'cursor', provider: 'cursor', model_label: 'unknown', run_id: 'cursor-1',
-      token_source: { input: { source: 'local-estimate' }, output: { source: 'unavailable', unavailable_reason: 'Cursor emits no usage' } },
+      token_source: { input: { source: 'local-estimate' }, output: { source: 'unavailable', unavailable_reason: "Compaction does not ingest Cursor's conditional result.usage" } },
       input_before: 820, cost_source: 'unavailable', cost_unavailable_reason: 'no cost', claim_scope: 'run-scoped'
     }, { original_retained: true, location: '.compaction/runs/cursor-1/t.json' }));
     await appendActivityEvent(buildMeasureOnlyActivityEvent({
@@ -153,5 +153,61 @@ describe("compaction policies (CLI)", () => {
     const id = await savePreference(cwd);
     const result = await run(cwd, ["policies", "enable", id]);
     expect(result.code).not.toBe(0);
+  });
+});
+
+/**
+ * THE EMPTY STATE CARRIES THE RECOVERY PATH.
+ *
+ * An authorization is stored per DEVICE. Before 0.6.7 it was written into whatever directory
+ * `init --authorize-auto-apply` happened to run in, so a user who authorized that way sees apply stop
+ * after upgrading and runs `policies list` to find out why — standing in the very project whose
+ * `.compaction/policy-preferences.json` is still sitting on disk. "Nothing saved" is true and useless
+ * to them. This pins that the empty listing explains the device scope and names the one command that
+ * fixes it, because the populated listing (which also explains it) is the branch they will never see.
+ */
+describe("compaction policies list - the empty state tells a stranded user how to recover", () => {
+  let deviceDir: string;
+  let projectDir: string;
+
+  beforeEach(async () => {
+    deviceDir = await mkdtemp(join(tmpdir(), "policies-empty-device-"));
+    projectDir = await mkdtemp(join(tmpdir(), "policies-empty-project-"));
+    // The pre-0.6.7 authorization, exactly where that version put it — present, enabled, and inert.
+    await mkdir(join(projectDir, ".compaction"), { recursive: true });
+    await writeFile(
+      join(projectDir, ".compaction", "policy-preferences.json"),
+      JSON.stringify({
+        preferences: [
+          {
+            id: "pref-41b78feb6a5e8e3baa0ca817",
+            scope: { tool: "claude-code", policy_type: "deterministic-dedupe" },
+            preference: "auto-when-gates-pass",
+            enabled: true,
+            gates_required: ["scope-match", "supported-shape", "deterministic-policy", "original-retainable", "change-produced"]
+          }
+        ]
+      }),
+      "utf8"
+    );
+  });
+
+  afterEach(async () => {
+    for (const d of [deviceDir, projectDir]) await rm(d, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  });
+
+  it("names the device scope and the exact re-authorize command, and still lists nothing", async () => {
+    const { stdout } = await execFileAsync("node", [resolve("dist/cli/index.js"), "policies", "list"], {
+      cwd: projectDir,
+      env: { ...process.env, COMPACTION_CONFIG_DIR: deviceDir, FORCE_COLOR: "0" }
+    });
+    // The project file is real and visible to the user; it must still authorize nothing.
+    expect(stdout).toContain("No auto-apply preferences saved on this device");
+    expect(stdout).not.toContain("pref-41b78feb6a5e8e3baa0ca817");
+    // …and the user is told why, where authorizations live, and what to run.
+    expect(stdout).toContain("stored per DEVICE");
+    expect(stdout).toContain(deviceDir);
+    expect(stdout).toContain("inside a project grants nothing");
+    expect(stdout).toContain("compaction init --authorize-auto-apply claude-code");
   });
 });

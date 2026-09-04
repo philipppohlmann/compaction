@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * Output-shaping policy family, deterministic, rule-based (public CLI/SDK code, engine-free).
  *
@@ -92,8 +94,19 @@ export const OUTPUT_SHAPING_HONESTY_NOTE =
 export interface OutputShapingResult {
   /** The content-free instruction block to prepend to the request/system prompt BEFORE generation. */
   instructions: string;
+  /** Stable identity of the exact UTF-8 instruction bytes emitted for this policy selection. */
+  policyVersion: string;
   /** Attribution for the applied policies (content-free; for recording / reporting). */
   applied: OutputShapingAttribution[];
+}
+
+/**
+ * Version the model-visible treatment itself, not a friendly policy name. Any byte change produces a
+ * different identity, so calibration collected for an older instruction block cannot silently apply.
+ */
+export function outputShapingPolicyVersion(instructions: string): string {
+  const digest = createHash("sha256").update(instructions, "utf8").digest("hex");
+  return `output-shaping.v1.sha256.${digest}`;
 }
 
 export interface BuildOutputShapingOptions {
@@ -129,6 +142,7 @@ export function buildOutputShapingPolicy(opts: BuildOutputShapingOptions = {}): 
 
   return {
     instructions,
+    policyVersion: outputShapingPolicyVersion(instructions),
     applied: selected.map((p) => ({ policy_name: p.policy_name, policy_family: p.policy_family, risk_level: p.risk_level }))
   };
 }

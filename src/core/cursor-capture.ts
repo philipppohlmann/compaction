@@ -5,8 +5,9 @@
  * json`) and normalizes its output to an `AgentTrace`.
  *
  * HONESTY (the defining rails of this module):
- * - **NO provider-reported tokens.** Cursor's CLI emits no usage; tokens here are **LOCAL-ESTIMATE
- *   only** (chars/4), never provider-reported, never billing-confirmed.
+ * - **NO provider-reported tokens from Compaction today.** Cursor's CLI can conditionally expose
+ *   `result.usage`, but this parser does not ingest or attribute those fields. Tokens here are
+ *   **LOCAL-ESTIMATE only** (chars/4), never provider-reported, never billing-confirmed.
  * - **Input** is locally estimated from the prompt extracted from the wrapped invocation (where
  *   available). **Output** is locally estimated from the headless **`result`** field when the output
  *   can be safely separated (`--output-format json`); when it cannot, output is **UNAVAILABLE** (left
@@ -131,7 +132,7 @@ function addMessage(messages: TraceMessage[], role: TraceMessage["role"], conten
 }
 
 const CURSOR_LOCAL_ESTIMATE_NOTE =
-  "Cursor CLI emits no provider usage; tokens are LOCAL-ESTIMATE only (chars/4) - never provider-reported, never billing-confirmed.";
+  "Compaction does not ingest Cursor's conditional result.usage fields; tokens are LOCAL-ESTIMATE only (chars/4) - never provider-reported, never billing-confirmed.";
 
 /** Build an `AgentTrace` + LOCAL-ESTIMATE usage from captured Cursor headless output. */
 export function normalizeCursorAgentOutput(params: {
@@ -191,7 +192,7 @@ export function normalizeCursorAgentOutput(params: {
   if (outputUnavailableReason) {
     warnings.push(
       `Output tokens UNAVAILABLE: ${outputUnavailableReason}. ` +
-        "Provider-reported output is unavailable (Cursor emits no usage)."
+        "Provider-reported output is unavailable in Compaction because its Cursor parser does not ingest the CLI's conditional result.usage fields."
     );
   }
 

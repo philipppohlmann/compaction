@@ -18,6 +18,45 @@ async function writeJsonlFile(path: string, lines: unknown[]): Promise<void> {
 }
 
 describe("ClaudeCodeAdapter", () => {
+  it("keeps absent provider usage unavailable instead of synthesizing reported zeroes", async () => {
+    const sessionPath = tempJsonlPath("no-usage-test");
+    await writeJsonlFile(sessionPath, [{
+      type: "user",
+      uuid: "no-usage-user",
+      sessionId: "no-usage-session",
+      timestamp: "2026-09-04T10:00:00.000Z",
+      message: { role: "user", content: "fixture content" }
+    }]);
+    const { usage } = await new ClaudeCodeAdapter().normalize({ sourcePath: sessionPath });
+    expect(usage.input_tokens).toBeUndefined();
+    expect(usage.output_tokens).toBeUndefined();
+    expect(usage.total_tokens).toBeUndefined();
+    expect(usage.provider_reported_tokens).toBe(false);
+    expect(usage.limitations.join("\n")).toContain("token axes remain unavailable");
+  });
+
+  it("preserves explicitly provider-reported zero input/output as legitimate counts", async () => {
+    const sessionPath = tempJsonlPath("reported-zero-test");
+    await writeJsonlFile(sessionPath, [{
+      type: "assistant",
+      uuid: "reported-zero-assistant",
+      sessionId: "reported-zero-session",
+      timestamp: "2026-09-04T10:00:00.000Z",
+      message: {
+        id: "reported-zero-request",
+        role: "assistant",
+        model: "claude-opus-5",
+        content: [{ type: "text", text: "fixture content" }],
+        usage: { input_tokens: 0, output_tokens: 0 }
+      }
+    }]);
+    const { usage } = await new ClaudeCodeAdapter().normalize({ sourcePath: sessionPath });
+    expect(usage.input_tokens).toBe(0);
+    expect(usage.output_tokens).toBe(0);
+    expect(usage.total_tokens).toBe(0);
+    expect(usage.provider_reported_tokens).toBe(true);
+  });
+
   it("normalizes fixture session with correct source, message counts, role mapping, and UsageMetadata aggregation", async () => {
     const adapter = new ClaudeCodeAdapter();
     const result = await adapter.normalize({ sourcePath: FIXTURE_PATH });

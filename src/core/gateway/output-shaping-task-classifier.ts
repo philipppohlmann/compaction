@@ -6,11 +6,24 @@
  * established as safe on the pure-planning / no-oracle regime, where the model's own prose is the
  * only state it carries forward. This classifier holds shaping on that regime and shapes the rest.
  *
- * Measured boundary (2026-07-24): shaping the code-output / verifier-in-loop turns preserved task
- * completion at ~55-61% output reduction; the no-oracle multi-step planning regime is untested, so
- * the conservative bias is to HOLD whenever the turn reads as planning/reasoning or the client has
- * explicitly asked the model to reason (extended thinking). Holding never hurts quality; it only
- * forgoes savings on that turn.
+ * Measured boundary (every figure below is recorded in `docs/ops/evidence-matrix.md`): on code-output
+ * turns, eval-gated A/Bs preserved task completion at 53.3% output reduction (`exp-cc-output-004`,
+ * Claude Code) and at 59.0% / 47.5% (`exp-cc-output-006`, Claude Code / Codex — the same coding family
+ * on two providers). There is NO single number: across ~7 families the reduction spans ~0-88% and
+ * tracks CONTROL VERBOSITY. Codex's already-terse SQL answer leaves nothing to trim (0.0%,
+ * `exp-cc-output-007`) and a verbose explanatory answer reaches ~88% (`exp-cc-output-008`), so the
+ * magnitude is prompt- and model-specific and is not generalized. The no-oracle multi-step planning
+ * regime is untested, so the conservative bias is to HOLD whenever the turn reads as planning/reasoning
+ * or the client has explicitly asked the model to reason (extended thinking). Holding never hurts
+ * quality; it only forgoes savings on that turn.
+ *
+ * `isExtendedThinkingEnabled` is a GATEWAY-ONLY hold IN PRACTICE. It reads `thinking` / `reasoning` /
+ * `reasoning_effort` off the request body, and the hook path never carries any of them:
+ * `subscription-shaping-runtime.ts` synthesizes its classifier input as
+ * `JSON.stringify({ messages: [{ role: "user", content: prompt }] })` from the prompt alone, so no
+ * reasoning field ever reaches this module there and only the planning-request test below can hold a
+ * hook-path turn. Do not read a hook-path `shape` decision as evidence that the client had extended
+ * thinking off.
  *
  * Content-free: this module reads request bytes locally to decide, and returns ONLY a decision plus
  * a fixed signal label. It never returns, logs, or embeds prompt/response content.
@@ -53,15 +66,11 @@ const PLANNING_REQUEST =
  * "Per turn" is the whole point, and the reason two adjacent-looking fields are deliberately NOT
  * treated as extended thinking:
  *
- *   - `thinking: { type: "adaptive" }` - Claude Code's session default. Measured across a real
- *     10-turn session it was identical on every turn, from "reply OK" to a multi-file edit: the
- *     model decides per turn whether to think, the request does not. It is a capability flag, not
- *     a task signal.
- *   - `output_config.effort` - likewise a session-level setting, constant across that same
- *     session.
+ *   - `thinking: { type: "adaptive" }` - a session capability flag. The model decides per turn
+ *     whether to think; the request does not opt this particular turn into extended reasoning.
+ *   - `output_config.effort` - likewise a session-level setting rather than a task signal.
  *
- * Holding on either would suppress shaping on ~100% of real Claude Code traffic, which is the
- * same "refuses everything" failure this module's gate exists to avoid - just relocated. The
+ * Holding on either would suppress shaping for every request that inherits the setting. The
  * per-turn task signal is the planning-request classifier below, which does vary by turn.
  *
  * `thinking: { type: "enabled" }` IS a genuine per-turn opt-in (the caller sets it with a budget),

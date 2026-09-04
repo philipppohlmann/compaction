@@ -92,9 +92,11 @@ scoped, fail-closed verdict, never a universal "no context is lost" claim.
 - **Payload size limits.** Requests above a configured byte limit are rejected
   with `413`-style `payload_too_large` (the scaffold enforces a small local
   limit; a real backend would set production limits).
-- **Auth (hosted mode).** LOCAL mode (default) has no auth. HOSTED mode
-  (`COMPACTION_API_MODE=hosted`) requires an API key on EVERY route except
-  `/healthz`, checked constant-time and fail-closed BEFORE any body parse. The key
+- **Auth (hosted mode).** LOCAL mode (default) has no auth. Protected HOSTED-mode
+  routes (`COMPACTION_API_MODE=hosted`) require an API key, checked constant-time
+  and fail-closed BEFORE any body parse. The liveness probes (`/health`, with
+  `/healthz` retained as a compatibility alias) and `/readyz` are unauthenticated.
+  The key
   may be presented as `X-Compaction-Api-Key`, `X-Api-Key`, or
   `Authorization: Bearer` (all equivalent; the custom headers compose with Cloud
   Run IAM, which occupies `Authorization`). Deploy itself is out of scope here.
@@ -249,10 +251,11 @@ gate refuses any document claiming it).
 contract_version, generated_at, contract, … }` — `status: "empty"` with
 `contract: null` and an honest note when nothing has been ingested.
 
-### `GET /healthz`
+### `GET /health`
 
 Unauthenticated liveness probe (Cloud Run-shaped). No body is read; response is
-`200 { ok: true, env }` — content-free.
+`200 { ok: true, env }` — content-free. `GET /healthz` is retained as an identical
+compatibility alias. Non-GET requests to either path return `405`.
 
 ### `GET /v0/status`
 

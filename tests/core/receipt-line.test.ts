@@ -6,8 +6,7 @@ import {
   communityFullApplyReceiptLine,
   isReceiptLineEnabled,
   RECEIPT_LINE_ENV,
-  CALIBRATED_ESTIMATE_MARKER,
-  DEFAULT_PRIOR_MARKER
+  CALIBRATED_ESTIMATE_MARKER
 } from "../../src/core/gateway/receipt-line.js";
 import { buildGatewayReceipt } from "../../src/core/gateway/receipt.js";
 import { buildApplyReceipt } from "../../src/core/gateway/apply-receipt.js";
@@ -27,17 +26,13 @@ function assertContentFreeShape(line: string): void {
   // Allowed characters only: letters (labels), digits, comma/period, the arrow, %, parens, dashes, the $,
   // the tilde + colon of the out-saved clause, spaces, and the middot separator. No slashes, quotes, etc.
   expect(line).toMatch(/^[A-Za-z0-9,.→%()~:$−\-\s·]+$/);
-  // Every non-prefix segment must be a KNOWN clause shape. The default-prior output label
-  // `est. · default prior` (G7) embeds the SAME ` · ` used as the clause separator, so the naive split
-  // cuts it in two; rejoin that one known trailing fragment before validating.
-  const segments = line.split(" · ").reduce<string[]>((acc, seg) => {
-    if (acc.length > 0 && seg === "default prior)") acc[acc.length - 1] = `${acc[acc.length - 1]} · ${seg}`;
-    else acc.push(seg);
-    return acc;
-  }, []);
+  // Every non-prefix segment must be a KNOWN clause shape. A plain split on the separator is enough
+  // again: the one label that embedded a ` · ` of its own (`est. · default prior`) is gone, and the
+  // rejoining hack it needed went with it. No clause may reintroduce the separator inside itself.
+  const segments = line.split(" · ");
   expect(segments[0]).toBe("compaction");
   const known =
-    /^(observed input [\d,]+|input [\d,]+(→[\d,]+ \(−\d+%\))?|output [\d,]+(→[\d,]+ \(−\d+%, est\.( · default prior)?\))?|−\$[\d,]+\.\d{2} \(list price\)|apply off|basic shaping|full apply|id [0-9a-f]{8})$/;
+    /^(observed input [\d,]+|input [\d,]+(→[\d,]+ \(−\d+%\))?|output [\d,]+(→[\d,]+ \(−\d+%, est\.\))?|−\$[\d,]+\.\d{2} \(list price\)|apply off|basic shaping|full apply|id [0-9a-f]{8})$/;
   for (const seg of segments.slice(1)) {
     expect(seg, `segment "${seg}" is not a known content-free clause`).toMatch(known);
   }
@@ -256,6 +251,9 @@ describe("receiptLineFromGatewayReceipt - from a real apply receipt", () => {
       activation: applyActivation,
       plan,
       applied: true,
+      // The BILLED route. The cost clause is route-gated: see the route-gate suite in
+      // tests/core/receipt-line-cost-clause.test.ts.
+      upstreamRouteType: "api-key",
       id: fixedId,
       now: fixedNow
     });
@@ -420,33 +418,52 @@ describe("receiptLineOutputOnly - out-saved clause (labeled est, never a per-tur
   });
 });
 
-describe("output-arrow PROVENANCE labels (G7): default prior vs device measurement render differently", () => {
+describe("output-arrow PROVENANCE: a default prior renders no per-run figure at all", () => {
   /**
-   * E8 — the SHIPPED default-prior marker is the real user-facing text, never a placeholder. A
-   * `TBD-…` marker reaching a user is the exact defect this pins against; it also pins the exact G7
-   * string so a silent reword is caught.
+   * E8 — the shipped estimate marker is the real user-facing text, never a placeholder.
+   *
+   * The second marker this block used to pin (`est. · default prior`) is GONE. It was an accurate
+   * disclosure printed beside a fully specific `777→412 (−47%)` on turn one of a fresh install, and a
+   * specific pair reads as counted whatever the words next to it say. The rule "a default prior must
+   * never read as measured evidence" is now carried by the ARROW's absence rather than by a label.
    */
-  it("the shipped DEFAULT_PRIOR_MARKER is the real G7 label, not a `TBD-` placeholder", () => {
-    expect(DEFAULT_PRIOR_MARKER).toBe("est. · default prior");
-    expect(DEFAULT_PRIOR_MARKER).not.toMatch(/TBD/i);
-    expect(DEFAULT_PRIOR_MARKER.startsWith("TBD-")).toBe(false);
+  it("the shipped estimate marker is the real label, not a `TBD-` placeholder", () => {
     expect(CALIBRATED_ESTIMATE_MARKER).toBe("est.");
+    expect(CALIBRATED_ESTIMATE_MARKER).not.toMatch(/TBD/i);
   });
 
-  /** A DEFAULT-PRIOR turn renders the provenance suffix, so it can never read as measured evidence. */
-  it("basis `default-prior` → `output B→A (−PP%, est. · default prior)`", () => {
+  /** The defect this branch fixes: a default-prior basis yields a plain count, no arrow, no percent. */
+  it("basis `default-prior` → a plain `output N`, no arrow and no percent", () => {
     const line = receiptLineOutputOnly({
       outputTokens: 512,
       providerReported: false,
       shapingActive: true,
       estimatedSaved: { calibrated: true, tokensSaved: 140, basis: "default-prior" }
     });
-    expect(line).toBe("compaction · output 652→512 (−21%, est. · default prior)");
+    expect(line).toBe("compaction · output 512");
     assertContentFreeShape(line as string);
   });
 
-  /** A DEVICE-MEASURED turn renders the plain calibrated `est.` — the same magnitude, a different label. */
-  it("basis `measured` → `output B→A (−PP%, est.)` (no `default prior` suffix)", () => {
+  /**
+   * Separate from the exact-string pin above so it cannot go silently dead behind it: NOTHING that
+   * reads as a counted reduction survives on a default-prior line — no arrow glyph, no percent, and
+   * no leftover provenance wording either.
+   */
+  it("a default-prior line carries no reduction glyph, percent, or prior wording", () => {
+    const line = receiptLineOutputOnly({
+      outputTokens: 512,
+      providerReported: false,
+      shapingActive: true,
+      estimatedSaved: { calibrated: true, tokensSaved: 140, basis: "default-prior" }
+    }) as string;
+    expect(line).not.toContain("→");
+    expect(line).not.toMatch(/−\d+%/);
+    expect(line).not.toContain("default prior");
+    expect(line).not.toContain("est.");
+  });
+
+  /** A DEVICE-MEASURED turn is UNCHANGED: it keeps the arrow it earned. */
+  it("basis `measured` → `output B→A (−PP%, est.)`", () => {
     const line = receiptLineOutputOnly({
       outputTokens: 512,
       providerReported: false,
@@ -454,28 +471,29 @@ describe("output-arrow PROVENANCE labels (G7): default prior vs device measureme
       estimatedSaved: { calibrated: true, tokensSaved: 140, basis: "measured" }
     });
     expect(line).toBe("compaction · output 652→512 (−21%, est.)");
-    expect(line).not.toContain("default prior");
     assertContentFreeShape(line as string);
   });
 
   /**
-   * F7 (the defect): the two provenances used to render IDENTICALLY because only the reduction % reached
-   * the line. With the SAME magnitude (same tokensSaved), the two lines must now differ ONLY in the label.
+   * The founder rule, stated as a comparison: with the SAME magnitude handed in, a measured device
+   * shows a figure and an unmeasured one shows none. It is the EVIDENCE that decides, not the number.
    */
-  it("a default-prior turn and a measured turn with the SAME magnitude render DIFFERENTLY", () => {
+  it("same magnitude, different evidence: measured renders a figure, the prior renders none", () => {
     const common = { outputTokens: 512, providerReported: false, shapingActive: true } as const;
     const prior = receiptLineOutputOnly({ ...common, estimatedSaved: { calibrated: true, tokensSaved: 140, basis: "default-prior" } });
     const measured = receiptLineOutputOnly({ ...common, estimatedSaved: { calibrated: true, tokensSaved: 140, basis: "measured" } });
     expect(prior).not.toBe(measured);
-    // Both carry the SAME arrow + percent — only the provenance label differs (no magnitude change).
-    expect(prior).toContain("652→512 (−21%");
     expect(measured).toContain("652→512 (−21%");
-    expect(prior).toContain("est. · default prior");
-    expect(measured).not.toContain("default prior");
+    expect(prior).not.toContain("652");
+    expect(prior).not.toContain("−21%");
   });
 
-  /** Absent basis falls back to the generic `est.` — never silently to the `default prior` label. */
-  it("absent basis → generic `est.` (a real prior always carries its own basis from the source)", () => {
+  /**
+   * Absent basis still renders the arrow. Every producer of a prior sets `"default-prior"` explicitly
+   * (shared exact resolver → `loadCalibrationReduction` → `estimatePerTurnOutputSaved`), so absence means a
+   * caller passing its own measurement, not a prior arriving unlabelled.
+   */
+  it("absent basis → the arrow renders with the generic `est.`", () => {
     const line = receiptLineOutputOnly({
       outputTokens: 512,
       providerReported: false,
@@ -483,7 +501,6 @@ describe("output-arrow PROVENANCE labels (G7): default prior vs device measureme
       estimatedSaved: { calibrated: true, tokensSaved: 140 }
     });
     expect(line).toBe("compaction · output 652→512 (−21%, est.)");
-    expect(line).not.toContain("default prior");
   });
 });
 
@@ -699,6 +716,109 @@ describe("communityFullApplyReceiptLine - DEFINED but emitted ONLY on a real ful
   });
 });
 
+/**
+ * THE HEALTHY-TURN ALLOWANCE COUNTDOWN. Before this, a Community device learned the state of its
+ * allowance exactly once — the turn it ran out, in a clause that also asked it to upgrade. The
+ * countdown reports the same allowance on every healthy metered turn, as `REMAINING/TOTAL left`.
+ *
+ * TWO RULES THE SHAPE ENCODES:
+ *  - Both figures are read OFF THE RECEIPT, never from current device state, so a replayed receipt
+ *    renders the balance of the turn it describes and the statusline render loop performs no file
+ *    read and no network call.
+ *  - The denominator is the period TOTAL. The lease's `allowance_tokens` is already net of
+ *    server-recorded consumption, so dividing by it would render a full tank on a half-spent period.
+ */
+describe("communityFullApplyReceiptLine - healthy allowance countdown", () => {
+  const applyActivation: ApplyActivation = {
+    mode: "apply",
+    requested: true,
+    activation: "explicit-mode",
+    policy: "deterministic-dedupe"
+  };
+  const plan: DedupePlan = {
+    policy: "deterministic-dedupe",
+    shape: "chat-messages",
+    supported: true,
+    changed: true,
+    removedBlocks: 1,
+    charsBefore: 164840,
+    charsAfter: 87504,
+    estTokensBefore: 41210,
+    estTokensAfter: 21876,
+    reductionPercent: 47
+  };
+  const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens: 286, model: "gpt-4o" };
+
+  function applyLine(
+    allowanceSnapshot?: Parameters<typeof buildApplyReceipt>[0]["allowanceSnapshot"],
+    extra: Partial<Parameters<typeof buildApplyReceipt>[0]> = {}
+  ): string | undefined {
+    const receipt = buildApplyReceipt({
+      provider: "openai",
+      endpoint: "/v1/chat/completions",
+      upstreamStatus: 200,
+      usage,
+      activation: applyActivation,
+      plan,
+      applied: true,
+      id: fixedId,
+      now: fixedNow,
+      ...(allowanceSnapshot ? { allowanceSnapshot } : {}),
+      ...extra
+    });
+    return communityFullApplyReceiptLine(receipt);
+  }
+
+  it("renders `REMAINING/TOTAL left` on a healthy metered turn", () => {
+    const line = applyLine({ remaining_tokens: 1_823_400, period_total_tokens: 2_000_000, period_id: "2026-08" });
+    // A REPORT, not a pitch. Pinned as a WHOLE CLAUSE rather than a substring, so the countdown cannot
+    // acquire a CTA, a price, or an adjective without this failing. (The line's own cost clause is a
+    // separate axis and is asserted elsewhere.)
+    const clauses = (line ?? "").split(" \u00b7 ");
+    expect(clauses).toContain("1.82M/2M left");
+    // Its position is between the entitlement label and the id — the ceiling clause's slot on a paused turn.
+    expect(clauses.indexOf("1.82M/2M left")).toBeGreaterThan(clauses.indexOf("full apply"));
+    expect(line).not.toContain("Upgrade");
+    expect(line).not.toContain("paused");
+  });
+
+  it("TRUNCATES rather than rounds up — a remainder is never shown as more headroom than the device has", () => {
+    // 1,899,999 rounds to 1.9M but truncates to 1.89M. Rounding up would overstate the balance.
+    expect(applyLine({ remaining_tokens: 1_899_999, period_total_tokens: 2_000_000 })).toContain("1.89M/2M left");
+    expect(applyLine({ remaining_tokens: 949_999, period_total_tokens: 2_000_000 })).toContain("949.9K/2M left");
+    expect(applyLine({ remaining_tokens: 730, period_total_tokens: 2_000_000 })).toContain("730/2M left");
+    // Exhausted-but-not-yet-paused still reports honestly rather than hiding the zero.
+    expect(applyLine({ remaining_tokens: 0, period_total_tokens: 2_000_000 })).toContain("0/2M left");
+  });
+
+  it("NO snapshot (a v1 lease carries no total) → no countdown clause, and the rest of the line is unchanged", () => {
+    const line = applyLine();
+    expect(line).not.toContain("left");
+    // The absence is a MISSING CLAUSE, not a degraded line: the evidence axes still render.
+    expect(line).toContain("input 41,210→21,876 (−47%)");
+    expect(line).toContain("full apply");
+  });
+
+  it("an INCOHERENT pair renders nothing rather than a clamped number that still looks authoritative", () => {
+    // A remainder above the total, or a zero total, is a lease the server should never have signed.
+    // `2.1M/2M left` would be worse than silence, and so would a silently clamped `2M/2M left`.
+    expect(applyLine({ remaining_tokens: 2_100_000, period_total_tokens: 2_000_000 })).not.toContain("left");
+    expect(applyLine({ remaining_tokens: 0, period_total_tokens: 0 })).not.toContain("left");
+    expect(applyLine({ remaining_tokens: -1, period_total_tokens: 2_000_000 })).not.toContain("left");
+  });
+
+  it("a PAUSE on the same receipt supersedes the countdown — one line never both counts down and pauses", () => {
+    // Defence in depth. The gateway declines to record a snapshot on a paused turn, and a paused turn
+    // compacts no input so this builder would decline anyway; this pins the RENDERER's own rule, so the
+    // invariant survives a future caller that assembles a receipt some other way.
+    const line = applyLine(
+      { remaining_tokens: 1_823_400, period_total_tokens: 2_000_000 },
+      { allowancePause: { reason: "metered-balance-exhausted", period_id: "2026-08" } }
+    );
+    expect(line).not.toContain("1.82M/2M left");
+  });
+});
+
 describe("receiptLineOutputOnly - Open tier label on the hook-only path", () => {
   it("basic tier → `output N · basic shaping` on the hook-only path", () => {
     const line = receiptLineOutputOnly({
@@ -752,8 +872,8 @@ describe("isReceiptLineEnabled - kill switch", () => {
  *
  * `request_mutated: true` plus a before/after pair is NOT evidence of input compaction: output shaping
  * mutates the request too, and writes that same pair — for a body it made BIGGER. Reading it as an input
- * apply is what shipped `input 75,777→75,883 (−0%)` on a shaping-only turn and `input 926→1,032 (−-11%)`
- * on a real captured one. The axis now follows `applied_components`, which is the engine's own statement
+ * apply can turn shaping-only growth into a false input-savings axis. The axis follows
+ * `applied_components`, which is the engine's own statement
  * of what it did.
  *
  * Both renderers are asserted on every case: they are separate builders and a rule enforced in only one
@@ -788,13 +908,13 @@ describe("input savings axis: only when an input-compaction component actually r
     const r = receipt({
       request_mutated: true,
       applied_components: ["output-shaping"],
-      estimated_input_tokens_before: 75_777,
-      estimated_input_tokens_after: 75_883
+      estimated_input_tokens_before: 1_500,
+      estimated_input_tokens_after: 1_600
     });
     for (const line of bothLines(r)) {
       expect(hasInputAxis(line), line).toBe(false);
-      expect(line).not.toContain("75,777");
-      expect(line).not.toContain("75,883");
+      expect(line).not.toContain("1,500");
+      expect(line).not.toContain("1,600");
       // The turn is still described: the plain provider-reported count survives, and so does its output.
       expect(line).toContain("input 1,001");
       expect(line).toContain("output 47");
@@ -805,11 +925,11 @@ describe("input savings axis: only when an input-compaction component actually r
     const r = receipt({
       request_mutated: true,
       applied_components: ["lcm-compaction", "output-shaping"],
-      estimated_input_tokens_before: 75_777,
-      estimated_input_tokens_after: 51_720
+      estimated_input_tokens_before: 1_500,
+      estimated_input_tokens_after: 1_000
     });
     for (const line of bothLines(r)) {
-      expect(line).toContain("input 75,777→51,720 (−32%)");
+      expect(line).toContain("input 1,500→1,000 (−33%)");
     }
   });
 
@@ -863,19 +983,19 @@ describe("input savings axis: only when an input-compaction component actually r
       applied_components: ["output-shaping"],
       estimated_input_tokens_before: 75_777,
       estimated_input_tokens_after: 75_883,
-      allowance_pause: { reason: "insufficient", resets_on: "2026-09-01", scope: "api-key-route" }
+      allowance_pause: { reason: "insufficient", resets_on: "2026-09-01", scope: "all-routes" }
     });
     for (const line of [
-      communityFullApplyReceiptLine(r, undefined, { reason: "insufficient", resetsOn: "2026-09-01", scope: "api-key-route" }) ?? "",
-      receiptLineFromGatewayReceipt(r, undefined, undefined, undefined, undefined, {
+      communityFullApplyReceiptLine(r, undefined, { reason: "insufficient", resetsOn: "2026-09-01", scope: "all-routes" }) ?? "",
+      receiptLineFromGatewayReceipt(r, undefined, undefined, undefined, {
         reason: "insufficient",
         resetsOn: "2026-09-01",
-        scope: "api-key-route"
+        scope: "all-routes"
       }) ?? ""
     ]) {
       expect(line).toContain("input paused");
       expect(hasInputAxis(line), line).toBe(false);
-      expect(line).toContain("Community limit reached");
+      expect(line).toContain("Community limit resets 2026-09-01");
     }
   });
 });

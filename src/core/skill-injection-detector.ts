@@ -17,19 +17,9 @@ import type { AgentTrace, TraceMessage, WasteFinding } from "./types.js";
  * because the identification gate requires the literal skill-injection prefix and a
  * parseable skill name.
  *
- * Open questions resolved against a real --include-subagents capture
- * (ae4dce14-e4ef-4d50-a852-f531fc53b490, 131 injection messages):
- * - Q5 (threshold reuse): the smallest captured injection body is 1,267 chars / 317 est
- *   tokens, every body is well above the existing 800-char / 200-token tool-output
- *   thresholds, so those thresholds are effectively moot for this policy. This detector
- *   therefore applies no size threshold (full exact-key dedup is the rule).
- * - Q2 (owning-agent-id recoverability): capture prefixes SUBAGENT message ids
- *   `agent-<agentId>-<uuid>`, so for the 108 subagent injections the owning agent id IS
- *   recoverable from `messageId` alone. The 23 ROOT-agent injections (start-cycle,
- *   complete-cycle, next-cycles) carry a bare UUID with NO agent prefix, so root-agent
- *   identity is NOT encoded in `messageId`. Report-only does not act on this; at the later
- *   apply rung a small additive provenance field would be needed to record root-agent
- *   identity + replaced-position for the bare-UUID copies.
+ * This detector intentionally applies no size threshold: full exact-key repetition is the
+ * reportable property. Message-id shape is not used as ownership evidence, and this report-only
+ * rung does not infer an owning agent or mutate any message.
  */
 
 const SKILL_INJECTION_PREFIX = "Base directory for this skill:";

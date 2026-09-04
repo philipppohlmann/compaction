@@ -15,21 +15,24 @@
  *  - No import-time I/O: everything happens inside `readLeaseVerdict` / helpers, called by explicit
  *    surfaces (tier read, `compaction lease status`), never at module load (package-smoke offline).
  *
- * CONTENT-FREE: the verdict carries fixed labels + counts only — never `lease_id`, `account_id`,
- * email, or a remaining-token figure to a receipt/log. The `allowanceTokens`/`periodId` on a VALID
- * verdict are for the gate's non-debitable quota snapshot (the IPC boundary), never a rendered value.
+ * CONTENT-FREE: the verdict carries fixed labels + counts only — never `lease_id`, `account_id`, or
+ * an email. `allowanceTokens`/`periodAllowanceTokens`/`periodId` are counts and a calendar month, and
+ * they ARE rendered: `compaction usage` prints the remaining line, and a metered apply carries a
+ * post-debit snapshot onto its receipt so the per-turn line can show the countdown. A token count is
+ * a product allowance unit, not request content; what stays off a receipt is the lease's identity.
  *
  * TWO SEPARATE QUESTIONS, TWO SEPARATE FIELDS (load-bearing).
  * `allowance_tokens` in the signed lease answers two different things — "is this device ENTITLED to
- * the private engine?" and "how much METERED api-key headroom is left?" — and this reader used to
+ * the private engine?" and "how much optimized-input headroom is left?" — and this reader used to
  * collapse them, ending the verification chain with a terminal `allowance-exhausted` verdict at
- * `allowance_tokens <= 0`. That is the right answer for the metered route and the WRONG answer for
- * the subscription route, whose full apply consumes no allowance at all: every caller that asks "is
- * this lease valid?" (the tier clamp, the gateway's entitlement gate, `mode full`) then withdrew full
- * apply from traffic that owes the allowance nothing. So the two questions are now two fields. The
+ * `allowance_tokens <= 0`. That conflates a SPENT allowance with an ABSENT entitlement: a spent
+ * period pauses input optimization while output shaping — which owes the allowance nothing — keeps
+ * running, so every caller that asks "is this lease valid?" (the tier clamp, the gateway's
+ * entitlement gate, `mode full`) withdrew the whole capability instead. Two questions, two fields. The
  * LABEL is the entitlement decision alone — signature, device binding, period, expiry. The spent
- * balance rides a VALID verdict as `meteredBalanceExhausted`, a FACT the route interprets, and the
- * only route that interprets it as a refusal is the metered one.
+ * balance rides a VALID verdict as `meteredBalanceExhausted`, a FACT the apply path interprets — and
+ * it interprets it the same way on every upstream route, because the allowance pays for use of the
+ * Hybrid Engine rather than for the provider billing route.
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -55,8 +58,8 @@ function credentialsFilePath(env: ConfigDirEnv = process.env): string {
  * (never lease/account/allowance content).
  *
  * There is deliberately no `allowance-exhausted` label. A spent balance is not a statement about
- * whether this device is entitled to the private engine — it is a statement about the metered
- * api-key route's remaining headroom, and it rides `meteredBalanceExhausted` on a VALID verdict.
+ * whether this device is entitled to the private engine — it is a statement about this period's
+ * remaining optimized-input headroom, and it rides `meteredBalanceExhausted` on a VALID verdict.
  */
 export type LeaseVerdictLabel =
   | "lease-valid"
@@ -71,11 +74,32 @@ export interface LeaseVerdict {
   /** Present ONLY when `label === "lease-valid"`: which trust root verified it (dev-signed is loud). */
   trust?: LeaseTrustSource;
   /**
-   * Present ONLY when valid: allowance carried in the lease (gate quota snapshot; never rendered).
+   * Present ONLY when valid: the REMAINDER the lease was signed with — the period limit minus the
+   * consumption the SERVER had recorded when it issued. It is the ceiling input optimization is
+   * measured against (`readPeriodConsumption` subtracts the local unreconciled tally from it), and it
+   * is reported by `compaction usage`.
+   *
    * MAY BE ZERO — a valid lease with no metered headroom left is still a valid entitlement, and the
-   * zero is exactly the snapshot the metered route must refuse on.
+   * zero is exactly the snapshot input optimization must pause on, whichever route carries the turn.
+   *
+   * NOT A DENOMINATOR. It is already net of server-recorded consumption, so `remaining / this` reads
+   * as a full tank on a half-spent period. The denominator is `periodAllowanceTokens` below.
    */
   allowanceTokens?: number;
+  /**
+   * The period's TOTAL allowance before any consumption, present only on a `lease-valid` verdict
+   * whose lease was issued at schema v2. A v1 lease carries no total, so this is absent and a surface
+   * that wants a denominator must render without one rather than substituting `allowanceTokens`.
+   *
+   * WHY IT IS SIGNED RATHER THAN DERIVED: the server's consumption sum is ACCOUNT-scoped, so another
+   * device's debits shrink `allowanceTokens` here invisibly and `allowanceTokens + this device's
+   * journal` under-reports the period total by exactly the other devices' usage — a countdown built
+   * that way would silently shrink its own denominator. See `period_allowance_tokens` in `lease.ts`.
+   *
+   * REPORTING-ONLY, and deliberately so: nothing is enforced against it. The ceiling is
+   * `allowanceTokens` and the journal, exactly as before this field existed.
+   */
+  periodAllowanceTokens?: number;
   /**
    * The lease period id (`YYYY-MM`), present on `lease-valid`. It is the gate's quota snapshot AND
    * what lets a surface name the honest allowance RESET date (`periodEndUtc`) when the balance is
@@ -87,40 +111,42 @@ export interface LeaseVerdict {
    *
    * Present on `lease-valid` only: the ISSUER signed this lease with no optimized-input allowance left
    * for the period (server-authoritative as of issue — see the check that sets it). Its ONLY sanctioned
-   * use is letting a surface say something true about WHICH traffic a spent allowance pauses, and when
-   * it comes back. It does not authorize, refuse, or gate anything.
+   * use is letting a surface say something true about WHAT a spent allowance pauses (input
+   * optimization, not output shaping) and when it comes back. It does not authorize, refuse, or gate
+   * anything.
    *
    * SANCTIONED READERS — the COMPLETE list, mirrored by `SANCTIONED_READERS` in
    * `tests/security/metered-balance-is-not-a-gate.test.ts`. That test parses the entries below and
    * fails if the two lists drift, so THIS LIST AND THAT ONE MUST BE UPDATED IN LOCKSTEP. Every entry is
    * reporting-only; none of them refuses, authorizes, or clamps anything:
-   *   - `src/core/onboarding-preferences.ts` — sets the `api-key-route` pause scope on `resolveOpenTier`;
+   *   - `src/core/onboarding-preferences.ts` — sets the `all-routes` pause scope on `resolveOpenTier`;
    *     changes no tier.
    *   - `src/cli/commands/lease.ts` — `lease status` copy: a valid lease whose metered balance is spent.
-   *   - `src/cli/commands/mode.ts` — `mode full` copy: enables the mode, scopes the promise to the route.
+   *   - `src/cli/commands/mode.ts` — `mode full` copy: enables the mode, states the ceiling.
    *   - `src/cli/commands/usage.ts` — REPORTING-ONLY. It chooses which remaining-line to print, and that
    *     line's number, label and copy prefix: a server-signed zero is definitive, so it is reported
    *     rather than deferred to the journal-integrity fallback. It refuses nothing and takes no action.
    *
    * WHERE THE METERED BALANCE GATE ACTUALLY LIVES — two places, neither of them here:
-   *   1. `gateway/server.ts`, inside the `routeType === METERED_ROUTE_TYPE` branch, which reads the
-   *      integrity-gated journal tally and declines at/over the ceiling (pre-dispatch);
+   *   1. `gateway/server.ts`, which reads the integrity-gated journal tally and pauses input
+   *      optimization at/over the ceiling (pre-dispatch), on every route;
    *   2. `usage/usage-journal.ts`'s `appendUsageEvent` ceiling, re-evaluated against a fresh tally
    *      under the append lock — the AUTHORITATIVE check, and the only one that bounds concurrency.
-   * Both work off `allowanceTokens` and the journal, and both are route-gated by their caller. Neither
-   * needs this boolean, and adding a third gate that reads it would not make the ceiling stronger.
+   * Both work off `allowanceTokens` and the journal. Neither needs this boolean, and adding a third
+   * gate that reads it would not make the ceiling stronger.
    *
    * WHY THE PROHIBITION, stated so the reasoning survives the commit: this field replaced a terminal
-   * `allowance-exhausted` VERDICT, whose whole defect was that a lease reader decided the balance
-   * question for BOTH routes at once. Route-blind callers (the tier clamp, the gateway's entitlement
-   * gate) read that decision and withdrew full apply from subscription traffic, which consumes no
-   * allowance at all — re-coupling exactly what the two routes keep separate. A verdict field
-   * cannot know its reader's route. Wiring an enforcement path to this boolean recreates the defect
-   * under a new name, however locally reasonable the call site looks.
+   * `allowance-exhausted` VERDICT, whose whole defect was that a LEASE READER answered a question that
+   * belongs to the apply path. Callers asking a different question entirely (the tier clamp, the
+   * gateway's entitlement gate, `mode full`) read that verdict and withdrew the whole capability —
+   * including the output shaping the allowance never bought, which must keep running on a spent
+   * period. Wiring an enforcement path to this boolean recreates the defect under a new name, however
+   * locally reasonable the call site looks.
    *
-   * A caller that asks only `label === "lease-valid"` gets the ENTITLEMENT answer, which is the same on
-   * both routes. A caller that needs to gate on the balance must first know its route, and must use the
-   * two checks above.
+   * A caller that asks only `label === "lease-valid"` gets the ENTITLEMENT answer. A caller that needs
+   * to gate INPUT optimization on the balance must use the two checks above, which are evaluated
+   * against the journal at dispatch time rather than against a snapshot signed when the lease was
+   * issued.
    *
    * `tests/security/metered-balance-is-not-a-gate.test.ts` enforces the file-level half of this rule;
    * read its docblock for what it does and does not catch. In particular it checks WHICH files mention
@@ -180,16 +206,15 @@ export function readLeaseVerdict(env: ConfigDirEnv = process.env, now: Date = ne
     return { label: "lease-expired" };
   }
 
-  // METERED BALANCE — reported, NOT decided. A zero/negative allowance means the metered api-key
-  // route has no headroom left this period; ceiling behavior there is refuse/degrade, never
-  // auto-purchase. The number is SERVER-AUTHORITATIVE as of issue: the issuer subtracts the
+  // METERED BALANCE — reported, NOT decided. A zero/negative allowance means this period has no
+  // optimized-input headroom left; ceiling behavior is pause/degrade, never auto-purchase. The number is SERVER-AUTHORITATIVE as of issue: the issuer subtracts the
   // consumption the server has recorded for the period before signing, so a device that deleted its
   // local journal still receives the reduced figure. Per-turn spend within the lease's life is
   // tracked separately by the local journal; this is the outer bound the server put in the signature.
   //
-  // It is NOT a verdict, because it is not the same fact on both routes: subscription full
-  // apply consumes no allowance, so refusing the ENTITLEMENT here would switch off apply for traffic
-  // that owes the allowance nothing. The route decides; this reader only states.
+  // It is NOT a verdict, because it is not the same fact about both capabilities: OUTPUT SHAPING
+  // consumes no allowance on any route, so refusing the ENTITLEMENT here would switch off shaping too
+  // — the base capability that owes the allowance nothing. The apply site decides; this reader states.
   //
   // The period rides the verdict so the ceiling is EXPLAINABLE, not just refused: the reset date a
   // surface names is derived from this (`periodEndUtc`). It is necessarily the current period — the
@@ -199,6 +224,9 @@ export function readLeaseVerdict(env: ConfigDirEnv = process.env, now: Date = ne
     trust: sig.trust,
     allowanceTokens: lease.allowance_tokens,
     periodId: lease.period_id,
+    // Only when the issuer actually signed one (v2). Defaulting a missing total to the remainder
+    // would manufacture a denominator the signature does not cover and show a permanently full tank.
+    ...(lease.period_allowance_tokens !== undefined ? { periodAllowanceTokens: lease.period_allowance_tokens } : {}),
     ...(lease.allowance_tokens <= 0 ? { meteredBalanceExhausted: true } : {})
   };
 }
@@ -207,8 +235,8 @@ export function readLeaseVerdict(env: ConfigDirEnv = process.env, now: Date = ne
  * Convenience: whether this device currently holds a VALID full-apply ENTITLEMENT lease.
  *
  * Entitlement only — a valid lease whose metered balance is spent still answers `true`, because the
- * device is still entitled to the private engine and subscription-route full apply still runs on it
- * A caller gating METERED apply must additionally consult the balance, on its route.
+ * device is still entitled to the private engine and its output shaping keeps running on a spent
+ * period. A caller gating INPUT optimization must additionally consult the balance.
  */
 export function hasValidFullApplyLease(env: ConfigDirEnv = process.env, now: Date = new Date()): boolean {
   return readLeaseVerdict(env, now).label === "lease-valid";

@@ -3,8 +3,8 @@
  * table / JSON view of recent runs. Pure functions, the command reads the store and calls these.
  *
  * Rendering invariants:
- * - Events carry no timestamp, so no "time" column is fabricated: runs are ordered by append
- *   recency and numbered (#1 = most recent), with a note stating the ordering.
+ * - Runs are ordered by append recency and numbered (#1 = most recent); optional host timestamps are
+ *   used by the merged watch feed, not fabricated into this table.
  * - Token counts render at the event's own axis tier verbatim; a tier is never upgraded.
  * - Output is a measured token count, never a savings; no cost, billing, or projection here.
  * - An input before→after delta is shown only when both counts are present (a real reshaping);
@@ -14,7 +14,7 @@ import type { ActivityEvent } from "./activity-event.js";
 
 /** One rendered, content-free row. All labels are honest; nothing is inferred. */
 export interface ActivityRow {
-  /** 1 = most recent (append recency; events carry no wall-clock). */
+  /** 1 = most recent by append recency. */
   position: number;
   activity_event_id: string;
   surface: string;
@@ -122,7 +122,7 @@ export interface ActivityJson {
     shown: number;
     limit: number;
     surface_filter: string | null;
-    ordering: "append-recency (events carry no wall-clock time); position 1 = most recent";
+    ordering: "append-recency; position 1 = most recent";
     labels: "token counts are shown at each event's own axis tier (local-estimate | provider-reported | unavailable); output is a measured token count, never a savings figure; no cost or billing figure is shown";
   };
   skipped_note?: string;
@@ -139,7 +139,7 @@ export function buildActivityJson(
       shown: rows.length,
       limit: meta.limit,
       surface_filter: meta.surface ?? null,
-      ordering: "append-recency (events carry no wall-clock time); position 1 = most recent",
+      ordering: "append-recency; position 1 = most recent",
       labels:
         "token counts are shown at each event's own axis tier (local-estimate | provider-reported | unavailable); output is a measured token count, never a savings figure; no cost or billing figure is shown"
     },
@@ -178,7 +178,7 @@ export function formatActivityTable(
   const surfaceNote = meta.surface ? ` (surface "${meta.surface}")` : "";
   const preamble = [
     `Recent activity${surfaceNote}: showing ${rows.length} of ${meta.totalEvents} recorded run(s).`,
-    `Ordered by append recency (activity events carry no wall-clock time); #1 = most recent.`,
+    `Ordered by append recency; #1 = most recent.`,
     `Token counts are local estimates unless labeled provider-reported; output is a measured count, not a savings figure.`
   ];
   const lines = [pad(header), pad(header.map((_, col) => "-".repeat(widths[col]))), ...table.map(pad)];

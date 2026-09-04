@@ -5,9 +5,9 @@ import { describe, expect, it } from "vitest";
 /**
  * `LeaseVerdict.meteredBalanceExhausted` IS A REPORTING FACT, NOT A GATE INPUT.
  *
- * It replaced a terminal `allowance-exhausted` VERDICT whose defect was that a lease reader decided the
- * balance question for BOTH routes at once: route-blind callers acted on it and withdrew full apply from
- * subscription traffic, which consumes no allowance. The field is the same
+ * It replaced a terminal `allowance-exhausted` VERDICT whose defect was that a LEASE READER answered a
+ * question belonging to the apply path: callers acted on it and withdrew the whole capability, output
+ * shaping included, though shaping owes the allowance nothing. The field is the same
  * information with the decision removed. Wiring an enforcement path to it recreates the defect under a
  * new name, which is why the set of modules allowed to READ it is closed rather than open.
  *
@@ -40,9 +40,9 @@ import { describe, expect, it } from "vitest";
  * cheap textual path:
  *  - `tests/core/allowance-ceiling-surface.test.ts` — an issuer-exhausted lease keeps `tier === "full"`,
  *    and `effectiveOpenTier` agrees with `resolveOpenTier().tier` (catches 1 and 3 at the clamp).
- *  - `tests/core/subscription-apply-independent-of-allowance.test.ts` — end-to-end through the real
- *    gateway: subscription applies and api-key refuses on the SAME exhausted device (catches 1, 2 and 3
- *    wherever they would actually change behavior).
+ *  - `tests/core/allowance-binds-on-every-route.test.ts` — end-to-end through the real gateway: an
+ *    exhausted device pauses INPUT optimization and keeps OUTPUT shaping on both the api-key and the
+ *    subscription route (catches 1, 2 and 3 wherever they would actually change behavior).
  *  - `tests/core/usage-metering.test.ts` — the under-lock ceiling still refuses at exactly zero.
  *
  * If this fails, do NOT add the new file to the allowlist reflexively. Ask first whether the new reader
@@ -65,9 +65,9 @@ const DECLARATION_SITE = "src/core/entitlement/lease-store.ts";
  * own docblock names` (below) parses that list and fails if the two drift. Update both in lockstep.
  */
 const SANCTIONED_READERS: Record<string, string> = {
-  "src/core/onboarding-preferences.ts": "scopes the pause notice to `api-key-route`; changes no tier",
+  "src/core/onboarding-preferences.ts": "sets the `all-routes` pause scope on the notice; changes no tier",
   "src/cli/commands/lease.ts": "`lease status` copy — a valid lease whose metered balance is spent",
-  "src/cli/commands/mode.ts": "`mode full` copy — enables the mode and scopes the promise to the route",
+  "src/cli/commands/mode.ts": "`mode full` copy — enables the mode and states the ceiling",
   "src/cli/commands/usage.ts":
     "`usage` chooses WHICH remaining-line to print, and its number, label and copy prefix: a " +
     "server-signed zero is definitive, so it is reported rather than deferred to the journal-integrity " +

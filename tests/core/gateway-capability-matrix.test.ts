@@ -222,7 +222,7 @@ describe("plan-auth is the DEFAULT keyless path - separate from cache proof / li
     }
   });
 
-  it("Cursor: cache proof honestly blocked (vendor gap) but Cursor stays installable + plan-auth-ready", () => {
+  it("Cursor: cache proof honestly blocked by routing while Cursor stays installable + plan-auth-ready", () => {
     const row = capabilityForWorkflow(computeCapabilityMatrix(), "cursor")!;
     expect(row.installable).toBe(true);
     expect(row.planAuthReady).toBe(true);
@@ -230,7 +230,9 @@ describe("plan-auth is the DEFAULT keyless path - separate from cache proof / li
     // The cache-proof reason reframes to being about CACHE PROOF, not the workflow being unavailable.
     expect(row.reasons.cacheProofSupported).toMatch(/cache proof is unavailable/i);
     expect(row.reasons.cacheProofSupported).toMatch(/workflow (itself )?is not unavailable/i);
-    expect(row.reasons.cacheProofSupported).toMatch(/emits no provider usage \(vendor gap\)/);
+    expect(row.reasons.cacheProofSupported).toMatch(/cannot be routed through the Gateway/);
+    expect(row.reasons.cacheProofSupported).toMatch(/conditionally include result\.usage/);
+    expect(row.reasons.cacheProofSupported).toMatch(/Compaction does not ingest or attribute/);
   });
 
   it("the custom OpenAI-compatible app is NOT a plan-auth workflow (routing path; no shim/hook)", () => {

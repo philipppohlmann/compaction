@@ -1,21 +1,13 @@
 /**
- * CLI e2e: `compaction savings` must LEARN from an unfavourable A/B, not discard it.
+ * CLI e2e: `compaction savings` remains an observed A/B VIEW, never a calibration producer.
  *
- * This exists because of a defect that a unit test could not catch.
- * `foldAbSummary` was fixed to accept non-favourable measurements, and unit tests proved it did — but the
- * only production caller returned BEFORE the fold whenever `measuredPerTurnReduction` reported
- * `unavailable`, and one of its `unavailable` reasons is "delta <= 0". So the survivorship filter simply
- * moved up one layer and the calibrated rate a real user's receipt line depends on stayed a mean over wins.
- *
- * The lesson generalises: a fold gate and a display gate look independent and are not. These tests drive
- * the REAL command end-to-end so the two cannot silently diverge again.
- *
- * Every experiment here is built through the real `output-shaping-ab` API rather than hand-written JSON —
- * a hand-rolled fixture with a wrong field shape passes vacuously against any implementation.
+ * Public experiment artifacts can contain a legacy marker or hand-authored directives, but they cannot
+ * prove the private control-first full-content evaluation gate passed. The command may display their
+ * observed provider-reported measurements; it must never auto-fold them into shared calibration.
  */
 import { describe, expect, it } from "vitest";
 import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
@@ -24,11 +16,7 @@ import {
   type OutputShapingAbExperiment,
   type OutputShapingAbRun
 } from "../../src/core/output-shaping-ab.js";
-import {
-  calibratedRate,
-  calibrationStorePath,
-  type OutputShapingCalibration
-} from "../../src/core/output-shaping-calibration-store.js";
+import { calibrationStorePath } from "../../src/core/output-shaping-calibration-store.js";
 
 const CLI = resolve("dist/cli/index.js");
 
@@ -69,30 +57,19 @@ function runCli(args: string[], configDir: string): Promise<{ stdout: string; co
   });
 }
 
-function readCalibration(configDir: string): OutputShapingCalibration | undefined {
-  const path = calibrationStorePath({ COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv);
-  if (!existsSync(path)) return undefined;
-  return JSON.parse(readFileSync(path, "utf8")) as OutputShapingCalibration;
+function calibrationExists(configDir: string): boolean {
+  return existsSync(calibrationStorePath({ COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv));
 }
 
-describe("compaction savings — the calibration learning loop folds ALL clean measurements", () => {
-  it("folds an UNFAVOURABLE A/B into the store, and still reports no rate", async () => {
+describe("compaction savings — observed public A/B artifacts never enter shared calibration", () => {
+  it("reports an UNFAVOURABLE A/B without creating a calibration store", async () => {
     const dir = mkdtempSync(join(tmpdir(), "savings-learn-bad-"));
     try {
       // Shaping made output WORSE (1000 → 1200). A real, clean, provider-reported measurement.
       const file = experimentFile(dir, "e-worse", 1000, 1200);
       const { stdout } = await runCli(["savings", "--experiment", file], dir);
 
-      // It reached the store — this is the assertion the pre-fix code failed.
-      const cal = readCalibration(dir);
-      expect(cal, "an unfavourable A/B must still be recorded, not silently dropped").toBeDefined();
-      expect(cal?.sampleCount).toBe(1);
-      expect(cal?.experimentIds).toEqual(["e-worse"]);
-
-      // And the derived rate is still refused — the guard is downstream, not an upstream filter.
-      expect(calibratedRate(cal as OutputShapingCalibration).calibrated).toBe(false);
-
-      // The display gate is unchanged: no saving is reported, because there is none.
+      expect(calibrationExists(dir)).toBe(false);
       expect(stdout).toContain("unavailable-until-measured");
       expect(stdout).not.toMatch(/−\d+(\.\d+)?%/);
     } finally {
@@ -100,40 +77,28 @@ describe("compaction savings — the calibration learning loop folds ALL clean m
     }
   });
 
-  it("an unfavourable A/B DRAGS DOWN a rate an earlier favourable one established", async () => {
+  it("a second public A/B cannot mutate or create calibration either", async () => {
     const dir = mkdtempSync(join(tmpdir(), "savings-learn-drag-"));
     try {
       // A 40% win first.
       await runCli(["savings", "--experiment", experimentFile(dir, "e-win", 1000, 600)], dir);
-      const afterWin = readCalibration(dir);
-      const rateAfterWin = calibratedRate(afterWin as OutputShapingCalibration);
-      expect(rateAfterWin.calibrated).toBe(true);
-      expect(rateAfterWin.rate).toBeCloseTo(0.4, 5);
+      expect(calibrationExists(dir)).toBe(false);
 
       // Then a null result. Under the pre-fix code this never reached the store and the rate stayed 0.4.
       await runCli(["savings", "--experiment", experimentFile(dir, "e-null", 1000, 1000)], dir);
-      const afterNull = readCalibration(dir);
-      const rateAfterNull = calibratedRate(afterNull as OutputShapingCalibration);
-
-      expect(afterNull?.sampleCount).toBe(2);
-      expect(rateAfterNull.calibrated).toBe(true);
-      expect(rateAfterNull.rate as number).toBeLessThan(rateAfterWin.rate as number);
-      // totals control = 1000*6 + 1000*6 = 12000, treatment = 600*6 + 1000*6 = 9600 → 2400/12000 = 0.2
-      expect(rateAfterNull.rate).toBeCloseTo(0.2, 5);
+      expect(calibrationExists(dir)).toBe(false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("a favourable A/B still calibrates and is still reported (no regression)", async () => {
+  it("a favourable A/B remains visible as an observed measurement without calibrating", async () => {
     const dir = mkdtempSync(join(tmpdir(), "savings-learn-good-"));
     try {
       const { stdout } = await runCli(["savings", "--experiment", experimentFile(dir, "e-good", 1000, 600)], dir);
-      const cal = readCalibration(dir);
-      expect(cal?.sampleCount).toBe(1);
-      expect(calibratedRate(cal as OutputShapingCalibration).rate).toBeCloseTo(0.4, 5);
-      expect(stdout).toContain("Calibration updated");
+      expect(calibrationExists(dir)).toBe(false);
       expect(stdout).toContain("Measured per-turn output-token reduction");
+      expect(stdout).toContain("1,000 → 600");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -58,7 +58,7 @@ function typeLevelGuardrails(): void {
     claim_scope: "run-scoped",
     token_source: {
       input: { source: "local-estimate" },
-      output: { source: "unavailable", unavailable_reason: "Cursor emits no provider usage; output not separable" }
+      output: { source: "unavailable", unavailable_reason: "Compaction does not ingest Cursor's conditional result.usage; output not separable" }
     }
   };
   const browserPlanEfficiency: CrossSurfaceEvent = {
@@ -442,7 +442,7 @@ describe("buildCursorRunCrossSurfaceEvent - the first cross_surface_event writer
     input_tokens: 12,
     output_tokens: 34,
     input_reduction_label: "estimated",
-    notes: ["Cursor CLI emits no provider usage; tokens are LOCAL-ESTIMATE only (chars/4)."]
+    notes: ["Compaction does not ingest Cursor's conditional result.usage; tokens are LOCAL-ESTIMATE only (chars/4)."]
   };
   const bothUnavailable: RunFlowTokenReport = {
     tool: "cursor",
@@ -495,10 +495,12 @@ describe("buildCursorRunCrossSurfaceEvent - the first cross_surface_event writer
     expect(validateCrossSurfaceEvent(event).problems).toEqual([]);
   });
 
-  it("cost is UNAVAILABLE with the exact reason (Cursor emits no cost data); caveats carry the report notes", () => {
+  it("cost is UNAVAILABLE with the exact parser/cost reason; caveats carry the report notes", () => {
     const event = buildCursorRunCrossSurfaceEvent({ runId: "run-d3-4", tokenReport: bothAvailable });
     expect(event.cost_source).toBe("unavailable");
-    expect(event.cost_unavailable_reason).toBe("Cursor emits no usage or cost data; no cost figure exists for this run");
+    expect(event.cost_unavailable_reason).toBe(
+      "Compaction does not ingest Cursor's conditional result.usage, and no per-run cost or billing figure is available; no cost figure exists for this run"
+    );
     expect(event.caveats).toEqual(bothAvailable.notes);
   });
 

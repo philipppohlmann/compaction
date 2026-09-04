@@ -17,6 +17,7 @@ import {
   validateCrossSurfaceEvent,
   type CrossSurfaceEvent
 } from "./cross-surface-event.js";
+import type { CalibrationState } from "./output-shaping-calibration-store.js";
 
 /** Whether/how the user approved what Compaction did on this run (exact values). */
 export const ACTIVITY_APPROVAL_STATUSES = [
@@ -84,6 +85,22 @@ export interface ActivityExtension {
   recovery?: ActivityRecovery;
   /** Default: "local-only" (applied by the store when absent). */
   sync_status?: ActivitySyncStatus;
+  /** Closed subtype for a settled interactive whole-run Stop receipt. */
+  activity_kind?: "codex-stop" | "claude-stop";
+  /** Host-recorded UTC time. Optional for backward compatibility with older activity events. */
+  recorded_at?: string;
+  /** Start of the exact hook-opened turn interval; used only to suppress its gateway micro-events. */
+  run_started_at?: string;
+  /** Positive-only proof: present only when shaping was active on this exact turn. */
+  output_shaping_state?: "active";
+  /** Positive estimated saving derived only from exact-key measured calibration. */
+  estimated_output_tokens_saved?: number;
+  output_estimate_basis?: "measured";
+  output_estimate_state?: CalibrationState;
+  /** Proven posture of this settled event; absence means no label is claimed. */
+  apply_posture?: "basic" | "full";
+  /** Which local evidence produced the settled counts. */
+  measurement_source?: "gateway-run" | "codex-rollout" | "claude-transcript";
 }
 
 /**
@@ -171,6 +188,12 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.trim() !== "");
 }
 
+function isCanonicalUtcTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
 function validateAutoApply(value: unknown, problems: string[]): void {
   if (value === undefined) return;
   if (!isPlainObject(value)) {
@@ -250,6 +273,128 @@ export function validateActivityEvent(value: unknown): ActivityEventValidation {
   }
   validateAutoApply(event.auto_apply, problems);
   validateRecovery(event.recovery, problems);
+  if (event.activity_kind !== undefined && event.activity_kind !== "codex-stop" && event.activity_kind !== "claude-stop") {
+    problems.push('activity_kind: must be "codex-stop" | "claude-stop" when present');
+  }
+  for (const field of ["recorded_at", "run_started_at"] as const) {
+    if (event[field] !== undefined && !isCanonicalUtcTimestamp(event[field])) {
+      problems.push(`${field}: must be a canonical UTC ISO timestamp when present`);
+    }
+  }
+  if (event.output_shaping_state !== undefined && event.output_shaping_state !== "active") {
+    problems.push('output_shaping_state: must be the positive-only value "active" when present');
+  }
+  if (event.output_estimate_basis !== undefined && event.output_estimate_basis !== "measured") {
+    problems.push('output_estimate_basis: only exact-key "measured" calibration is permitted');
+  }
+  if (
+    event.output_estimate_state !== undefined &&
+    !["unseeded", "calibrating", "calibrated", "measured-no-effect"].includes(String(event.output_estimate_state))
+  ) {
+    problems.push("output_estimate_state: invalid calibration lifecycle state");
+  }
+  if (
+    event.estimated_output_tokens_saved !== undefined &&
+    (!Number.isSafeInteger(event.estimated_output_tokens_saved) || (event.estimated_output_tokens_saved as number) <= 0)
+  ) {
+    problems.push("estimated_output_tokens_saved: must be a positive safe integer when present");
+  }
+  if (event.estimated_output_tokens_saved !== undefined) {
+    if (event.output_shaping_state !== "active") problems.push("estimated_output_tokens_saved: requires positive shaping proof");
+    if (event.output_estimate_basis !== "measured") problems.push("estimated_output_tokens_saved: requires measured calibration basis");
+    if (event.output_estimate_state !== "calibrated") problems.push("estimated_output_tokens_saved: requires calibrated state");
+  }
+  if (event.apply_posture !== undefined && event.apply_posture !== "basic" && event.apply_posture !== "full") {
+    problems.push("apply_posture: must be basic | full when present");
+  }
+  if (
+    event.measurement_source !== undefined &&
+    event.measurement_source !== "gateway-run" &&
+    event.measurement_source !== "codex-rollout" &&
+    event.measurement_source !== "claude-transcript"
+  ) {
+    problems.push("measurement_source: must be gateway-run | codex-rollout | claude-transcript when present");
+  }
+  if (event.activity_kind === "codex-stop") {
+    if (event.surface !== "codex") problems.push('activity_kind codex-stop: surface must be "codex"');
+    if (typeof event.recorded_at !== "string") problems.push("activity_kind codex-stop: recorded_at is required");
+    if (typeof event.run_started_at !== "string") problems.push("activity_kind codex-stop: run_started_at is required");
+    if (typeof event.session_id !== "string" || !/^codex-session-[0-9a-f]{32}$/.test(event.session_id)) {
+      problems.push("activity_kind codex-stop: session_id must be a device-local hash");
+    }
+    if (typeof event.run_id !== "string" || !/^codex-stop-[0-9a-f]{32}$/.test(event.run_id)) {
+      problems.push("activity_kind codex-stop: run_id must be a device-local hash");
+    }
+    if (event.measurement_source !== "gateway-run" && event.measurement_source !== "codex-rollout") {
+      problems.push("activity_kind codex-stop: measurement_source is required");
+    }
+    if (
+      typeof event.run_started_at === "string" &&
+      typeof event.recorded_at === "string" &&
+      event.run_started_at > event.recorded_at
+    ) {
+      problems.push("activity_kind codex-stop: run_started_at must not follow recorded_at");
+    }
+    if (event.output_estimate_state !== undefined && event.output_shaping_state !== "active") {
+      problems.push("activity_kind codex-stop: calibration state requires positive shaping proof");
+    }
+    if (event.apply_posture === "full" && event.measurement_source !== "gateway-run") {
+      problems.push("activity_kind codex-stop: full posture requires exact gateway-run evidence");
+    }
+  } else if (event.activity_kind === "claude-stop") {
+    if (event.surface !== "claude_code") problems.push('activity_kind claude-stop: surface must be "claude_code"');
+    if (typeof event.recorded_at !== "string") problems.push("activity_kind claude-stop: recorded_at is required");
+    if (typeof event.run_started_at !== "string") problems.push("activity_kind claude-stop: run_started_at is required");
+    if (typeof event.session_id !== "string" || !/^claude-session-[0-9a-f]{32}$/.test(event.session_id)) {
+      problems.push("activity_kind claude-stop: session_id must be a device-local hash");
+    }
+    if (typeof event.run_id !== "string" || !/^claude-stop-[0-9a-f]{32}$/.test(event.run_id)) {
+      problems.push("activity_kind claude-stop: run_id must be a device-local hash");
+    }
+    if (event.measurement_source !== "gateway-run" && event.measurement_source !== "claude-transcript") {
+      problems.push("activity_kind claude-stop: measurement_source must be gateway-run | claude-transcript");
+    }
+    if (
+      typeof event.run_started_at === "string" &&
+      typeof event.recorded_at === "string" &&
+      event.run_started_at > event.recorded_at
+    ) {
+      problems.push("activity_kind claude-stop: run_started_at must not follow recorded_at");
+    }
+    if (event.output_estimate_state !== undefined && event.output_shaping_state !== "active") {
+      problems.push("activity_kind claude-stop: calibration state requires positive shaping proof");
+    }
+    if (event.measurement_source === "claude-transcript") {
+      if (event.input_after !== undefined) {
+        problems.push("activity_kind claude-stop: transcript usage cannot claim post-compaction input");
+      }
+      if (
+        event.output_before !== undefined ||
+        event.output_estimate !== undefined ||
+        event.estimated_output_tokens_saved !== undefined ||
+        event.output_estimate_basis !== undefined
+      ) {
+        problems.push("activity_kind claude-stop: transcript usage cannot claim a numerical output counterfactual");
+      }
+      if (event.apply_posture === "full") {
+        problems.push("activity_kind claude-stop: full posture requires exact gateway-run evidence");
+      }
+      if (event.output_shaping_state === "active" && typeof event.output_after !== "number") {
+        problems.push("activity_kind claude-stop: transcript shaping proof requires observed output");
+      }
+    }
+  } else if (
+    event.recorded_at !== undefined ||
+    event.run_started_at !== undefined ||
+    event.output_shaping_state !== undefined ||
+    event.estimated_output_tokens_saved !== undefined ||
+    event.output_estimate_basis !== undefined ||
+    event.output_estimate_state !== undefined ||
+    event.apply_posture !== undefined ||
+    event.measurement_source !== undefined
+  ) {
+    problems.push("Stop settlement fields require activity_kind=codex-stop|claude-stop");
+  }
   return { problems };
 }
 

@@ -52,7 +52,8 @@ export type EconomicRoute = "plan-lifetime" | "api-billing";
 
 /**
  * The strength of proof this scope can reach by default (the weakest honest level from existing truth):
- *  - `local-estimate`     , only a local estimate exists (e.g. Cursor: vendor emits no provider usage).
+ *  - `local-estimate`     , only a local estimate exists (e.g. Cursor: Compaction does not ingest the
+ *                           CLI's conditional `result.usage`).
  *  - `provider-reported`  , the adapter yields provider usage/cache (Codex/Claude via routing).
  *  - `provider-priced-api`, capability marked only where api-billing + provider usage exists (the cost
  *                            number lives in `api-cost-impact.ts`). Route-B only; a plan-lifetime scope can never carry it.
@@ -162,7 +163,7 @@ export const COST_UNAVAILABLE_PLAN_AUTH_REASON =
 
 /** The honest reason a local-estimate scope (e.g. Cursor) is estimate-only. */
 export const LOCAL_ESTIMATE_REASON =
-  "the vendor emits no provider usage for this workflow, so only a content-free local estimate is possible; " +
+  "the current Compaction adapter does not ingest attributable provider usage for this workflow, so only a content-free local estimate is possible; " +
   "no provider-reported, provider-priced, plan-quota, or invoice evidence exists for this scope.";
 
 /**

@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { ACTIVE_USAGE_METER_VERSION } from "../../src/core/usage/usage-event.js";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
 import { currentPeriodId } from "../../src/core/entitlement/lease.js";
 import { meterConfirmedApply } from "../../src/core/usage/usage-metering.js";
@@ -47,9 +48,10 @@ describe("reconciled usage is NOT charged twice", () => {
           provider: "openai",
           periodId: currentPeriodId(),
           allowanceTokens: allowance,
-          receiptId: `rec-${i}`,
-          meterVersion: "optimized-input-v1",
+          recoveryId: `rec-${i}`,
+          meterVersion: ACTIVE_USAGE_METER_VERSION,
           meteredOptimizedInputTokens: tokens,
+          estimatedInputTokensBefore: tokens + tokens / 2,
           estimatedInputTokensAfter: tokens / 2,
           preMutationBody: "x"
         },
@@ -114,9 +116,10 @@ describe("reconciled usage is NOT charged twice", () => {
         provider: "openai",
         periodId: period,
         allowanceTokens: 1_000_000, // the renewed, already-net allowance
-        receiptId: "rec-after",
-        meterVersion: "optimized-input-v1",
+        recoveryId: "rec-after",
+        meterVersion: ACTIVE_USAGE_METER_VERSION,
         meteredOptimizedInputTokens: 900_000,
+        estimatedInputTokensBefore: 900_100,
         estimatedInputTokensAfter: 100,
         preMutationBody: "x"
       },
@@ -135,9 +138,10 @@ describe("reconciled usage is NOT charged twice", () => {
         provider: "openai",
         periodId: currentPeriodId(),
         allowanceTokens: 600_000,
-        receiptId: "rec-over",
-        meterVersion: "optimized-input-v1",
+        recoveryId: "rec-over",
+        meterVersion: ACTIVE_USAGE_METER_VERSION,
         meteredOptimizedInputTokens: 200_000, // 500_000 already used; 200_000 does not fit
+        estimatedInputTokensBefore: 200_100,
         estimatedInputTokensAfter: 100,
         preMutationBody: "x"
       },
@@ -165,9 +169,10 @@ describe("watermark fail-safe direction (never grants more than the signed lease
           provider: "openai",
           periodId: currentPeriodId(),
           allowanceTokens: 2_000_000,
-          receiptId: `rec-${i}`,
-          meterVersion: "optimized-input-v1",
+          recoveryId: `rec-${i}`,
+          meterVersion: ACTIVE_USAGE_METER_VERSION,
           meteredOptimizedInputTokens: 1000,
+          estimatedInputTokensBefore: 1500,
           estimatedInputTokensAfter: 500,
           preMutationBody: "x"
         },
@@ -267,7 +272,7 @@ describe("sumUnreconciledOptimizedInputTokensForPeriod (pure)", () => {
       route_type: "api-key",
       workflow: "codex",
       provider: "openai",
-      meter_version: "optimized-input-v1",
+      meter_version: ACTIVE_USAGE_METER_VERSION,
       optimized_input_tokens: tokens,
       estimated_input_tokens_after: 1,
       device_event_signature: "s",

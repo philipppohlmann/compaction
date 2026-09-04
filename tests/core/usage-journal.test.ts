@@ -1,15 +1,22 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
+  ACTIVE_USAGE_METER_VERSION,
   USAGE_EVENT_SCHEMA_VERSION,
-  USAGE_METER_VERSION,
+  USAGE_EVENT_SCHEMA_VERSION_V2,
+  USAGE_EVENT_SCHEMA_VERSION_V3,
   USAGE_SIGNING_DOMAIN,
   canonicalUsageEventBytes,
   fallbackOptimizedInputTokens,
   parseUsageEvent,
-  type UsageEvent
+  recoveryIdOf,
+  type UsageEvent,
+  type UsageEventV1,
+  type UsageEventV2,
+  type UsageEventV3
 } from "../../src/core/usage/usage-event.js";
 import {
   USAGE_CHAIN_DOMAIN,
@@ -39,7 +46,11 @@ import { generateDeviceKeyPair } from "../../src/core/auth/device-flow.js";
  */
 const HEADROOM = { ceiling: { allowanceTokens: 1_000_000 } };
 
-function baseEvent(overrides: Partial<UsageEvent> = {}): UsageEvent {
+/**
+ * A LEGACY (schema v1) event — the shape every historical journal line has. It is the backward-
+ * compatibility subject of this file: its canonical bytes are pinned below and must never move.
+ */
+function baseEvent(overrides: Partial<UsageEventV1> = {}): UsageEventV1 {
   return {
     schema_version: USAGE_EVENT_SCHEMA_VERSION,
     event_id: "11111111-1111-1111-1111-111111111111",
@@ -53,9 +64,34 @@ function baseEvent(overrides: Partial<UsageEvent> = {}): UsageEvent {
     route_type: "api-key",
     workflow: "codex",
     provider: "openai",
-    meter_version: USAGE_METER_VERSION,
+    // THE ACTIVE UNIT, because that is the only unit the store accepts: a debit stamped with a
+    // superseded meter is refused before the ceiling is even consulted, so a fixture pinned to the
+    // old label would be testing a path the product can no longer take.
+    meter_version: ACTIVE_USAGE_METER_VERSION,
     optimized_input_tokens: 100,
     estimated_input_tokens_after: 60,
+    ...overrides
+  };
+}
+
+/** The CURRENT (schema v2) event — the same fields with the recovery id under its true name. */
+function baseEventV2(overrides: Partial<UsageEventV2> = {}): UsageEventV2 {
+  const { receipt_id: legacyKey, schema_version: _v1, ...common } = baseEvent();
+  return {
+    schema_version: USAGE_EVENT_SCHEMA_VERSION_V2,
+    recovery_id: legacyKey,
+    ...common,
+    ...overrides
+  };
+}
+
+/** Current schema v3 adds the signed before side of the active meter basis. */
+function baseEventV3(overrides: Partial<UsageEventV3> = {}): UsageEventV3 {
+  const { schema_version: _v2, ...common } = baseEventV2();
+  return {
+    ...common,
+    schema_version: USAGE_EVENT_SCHEMA_VERSION_V3,
+    estimated_input_tokens_before: 160,
     ...overrides
   };
 }
@@ -111,7 +147,11 @@ describe("frozen domain tags (rename guard — literals, never interpolated)", (
 
 describe("usage-event canonical bytes", () => {
   it("pins the frozen domain-tagged byte order (drift guard)", () => {
-    const bytes = canonicalUsageEventBytes(baseEvent()).toString("utf8");
+    // The vector is FROZEN, so it is built from a frozen event — including the `optimized-input-v1`
+    // label written as a literal. `baseEvent`'s default meter tracks whatever unit is active today;
+    // letting that default flow into a pinned wire vector would make the vector move with the
+    // product, which is the one thing a pin must not do.
+    const bytes = canonicalUsageEventBytes(baseEvent({ meter_version: "optimized-input-v1" })).toString("utf8");
     // The domain tag is a LITERAL here, not `${USAGE_SIGNING_DOMAIN}` — see the pins above.
     expect(bytes).toBe(
       "compaction-usage-v1\n" +
@@ -136,6 +176,115 @@ describe("usage-event canonical bytes", () => {
     expect(fallbackOptimizedInputTokens("")).toBe(1);
     expect(fallbackOptimizedInputTokens("abcd")).toBe(1);
     expect(fallbackOptimizedInputTokens("a".repeat(9))).toBe(3);
+  });
+});
+
+/** A throwaway config dir for the schema-v2 describe below (the append tests keep their own). */
+const v2Dirs: string[] = [];
+afterEach(() => v2Dirs.splice(0).forEach((d) => rmSync(d, { recursive: true, force: true })));
+function tmp2(): { COMPACTION_CONFIG_DIR: string } {
+  const dir = mkdtempSync(join(tmpdir(), "usage-journal-v2-"));
+  v2Dirs.push(dir);
+  return { COMPACTION_CONFIG_DIR: dir };
+}
+
+/**
+ * THE RECOVERY-ID RENAME. Schema v1 named the recovery id `receipt_id`; schema v2 names it
+ * `recovery_id`. The v1 bytes above are FROZEN — a rename in place would change the preimage of
+ * every historical signature and every historical `entry_hash` at once. These pin the v2 layout as
+ * data (a second literal), pin the two layouts as DIFFERENT, and pin the exactly-one-key rule.
+ */
+describe("usage-event schema v2: the recovery id under its true name", () => {
+  it("pins the v2 canonical bytes — the v1 layout with `recovery_id` at byte position 3", () => {
+    // FROZEN, exactly as the v1 pin above is, and for the same reason: `baseEvent`'s meter default
+    // tracks whatever unit is active today, and a pinned wire vector that moves with the product is
+    // not a pin. The label is passed as the literal the vector was minted with.
+    const bytes = canonicalUsageEventBytes(baseEventV2({ meter_version: "optimized-input-v1" })).toString("utf8");
+    // Written by hand, exactly as the v1 pin is: an interpolated expectation would move with a
+    // serializer change instead of catching it.
+    expect(bytes).toBe(
+      "compaction-usage-v1\n" +
+        '{"schema_version":2,"event_id":"11111111-1111-1111-1111-111111111111","recovery_id":"rec-1",' +
+        '"lease_id":"lease-1","lease_sequence":1,"device_id":"dev-1",' +
+        `"device_key_hash":"${"f".repeat(64)}","period_id":"2026-07",` +
+        '"occurred_at":"2026-07-15T00:00:00.000Z","route_type":"api-key","workflow":"codex",' +
+        '"provider":"openai","meter_version":"optimized-input-v1","optimized_input_tokens":100,' +
+        '"estimated_input_tokens_after":60}'
+    );
+  });
+
+  it("the two layouts are DIFFERENT bytes (a v1 signature can never be replayed onto a v2 entry)", () => {
+    expect(canonicalUsageEventBytes(baseEventV2()).equals(canonicalUsageEventBytes(baseEvent()))).toBe(false);
+  });
+
+  it("EXACTLY ONE recovery-id key, matching the declared version — anything else is refused", () => {
+    expect(parseUsageEvent(baseEventV2())).toEqual(baseEventV2());
+    // Both keys present, under either version: ambiguous signed layout, so it does not parse.
+    expect(parseUsageEvent({ ...baseEvent(), recovery_id: "rec-1" })).toBeUndefined();
+    expect(parseUsageEvent({ ...baseEventV2(), receipt_id: "rec-1" })).toBeUndefined();
+    // The wrong key for the declared version.
+    expect(parseUsageEvent({ ...baseEvent(), receipt_id: undefined, recovery_id: "rec-1" })).toBeUndefined();
+    expect(parseUsageEvent({ ...baseEventV2(), recovery_id: undefined, receipt_id: "rec-1" })).toBeUndefined();
+    // An unknown schema version has no known layout at all.
+    expect(parseUsageEvent({ ...baseEventV2(), schema_version: 4 })).toBeUndefined();
+  });
+
+  it("recoveryIdOf reads the SAME id out of both shapes and reports which one it came from", () => {
+    expect(recoveryIdOf(baseEvent())).toEqual({ recoveryId: "rec-1", provenance: "legacy-receipt-id-field" });
+    expect(recoveryIdOf(baseEventV2())).toEqual({ recoveryId: "rec-1", provenance: "recovery-id-field" });
+  });
+
+  it("the provenance label is DERIVED — it never reaches the signed bytes or the stored line", async () => {
+    const env = tmp2();
+    const event = baseEventV2({ event_id: "e2e2e2e2-0000-0000-0000-000000000001" });
+    expect(recoveryIdOf(event).provenance).toBe("recovery-id-field");
+    expect(canonicalUsageEventBytes(event).toString("utf8")).not.toContain("provenance");
+    await appendUsageEvent(event, "sig-v2", HEADROOM, env);
+    const line = readFileSync(usageJournalPath(env), "utf8").trim();
+    expect(line).not.toContain("provenance");
+    expect(line).not.toContain("legacy-receipt-id-field");
+    expect(line).not.toContain("receipt_id");
+    expect(JSON.parse(line).recovery_id).toBe("rec-1");
+  });
+
+  it("a v1 line's id is NEVER resolved against the receipt store — the usage modules have no edge to it", () => {
+    // The structural half of "never reinterpreted as a receipt id": `src/core/usage/**` cannot look
+    // anything up in `receipts.jsonl`, because it does not import the module that reads it. Asserted
+    // against the SHIPPED source (comments stripped, so the prose describing the misnomer — which
+    // necessarily names the receipt store — cannot make this test pass or fail).
+    const usageDir = join(dirname(fileURLToPath(import.meta.url)), "../../src/core/usage");
+    const modules = readdirSync(usageDir).filter((f) => f.endsWith(".ts"));
+    expect(modules.length).toBeGreaterThan(0);
+    for (const file of modules) {
+      const code = readFileSync(join(usageDir, file), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/\/\/.*$/gm, "");
+      expect(code, file).not.toMatch(/from\s+"[^"]*receipt/);
+      expect(code, file).not.toMatch(/readReceipts|receipts\.jsonl/);
+    }
+    // The behavioural half: the legacy value comes back labelled as legacy recovery-id data.
+    expect(recoveryIdOf(baseEvent()).provenance).toBe("legacy-receipt-id-field");
+  });
+});
+
+describe("usage-event schema v3: signed recomputation basis", () => {
+  it("pins v3 canonical bytes without moving the frozen v1/v2 layouts", () => {
+    expect(canonicalUsageEventBytes(baseEventV3({ meter_version: "optimized-input-v2" })).toString("utf8")).toBe(
+      "compaction-usage-v1\n" +
+        '{"schema_version":3,"event_id":"11111111-1111-1111-1111-111111111111","recovery_id":"rec-1",' +
+        '"lease_id":"lease-1","lease_sequence":1,"device_id":"dev-1",' +
+        `"device_key_hash":"${"f".repeat(64)}","period_id":"2026-07",` +
+        '"occurred_at":"2026-07-15T00:00:00.000Z","route_type":"api-key","workflow":"codex",' +
+        '"provider":"openai","meter_version":"optimized-input-v2","optimized_input_tokens":100,' +
+        '"estimated_input_tokens_before":160,"estimated_input_tokens_after":60}'
+    );
+  });
+
+  it("requires before only on v3 and resolves the recovery id through the shared accessor", () => {
+    expect(parseUsageEvent(baseEventV3())).toEqual(baseEventV3());
+    expect(parseUsageEvent({ ...baseEventV3(), estimated_input_tokens_before: undefined })).toBeUndefined();
+    expect(parseUsageEvent({ ...baseEventV2(), estimated_input_tokens_before: 160 })).toBeUndefined();
+    expect(recoveryIdOf(baseEventV3())).toEqual({ recoveryId: "rec-1", provenance: "recovery-id-field" });
   });
 });
 
@@ -176,6 +325,60 @@ describe("usage-journal append + hash chain", () => {
     expect(mode).toBe(0o600);
   });
 
+  it("MIXED SCHEMA VERSIONS chain, verify, and sum as ONE journal (v1 history + v2 writes)", async () => {
+    const env = tmp();
+    const keys = generateDeviceKeyPair();
+    // Two LEGACY entries, signed for real, then two CURRENT ones — the shape a device's journal
+    // takes the moment it updates: history stays v1 forever, new debits are v2.
+    const events: UsageEvent[] = [
+      baseEvent({ event_id: "dddddddd-0000-0000-0000-000000000001" }),
+      baseEvent({ event_id: "dddddddd-0000-0000-0000-000000000002", optimized_input_tokens: 50 }),
+      baseEventV2({ event_id: "dddddddd-0000-0000-0000-000000000003", optimized_input_tokens: 25 }),
+      baseEventV2({ event_id: "dddddddd-0000-0000-0000-000000000004", optimized_input_tokens: 25 })
+    ];
+    for (const event of events) {
+      const appended = await appendUsageEvent(
+        event,
+        signDetached(canonicalUsageEventBytes(event), keys.privateKeyPem),
+        HEADROOM,
+        env
+      );
+      expect(appended.appended, event.event_id).toBe(true);
+    }
+
+    const { entries, skipped } = await readUsageJournal(env);
+    expect(skipped).toEqual([]);
+    expect(entries.map((e) => e.schema_version)).toEqual([1, 1, 2, 2]);
+    // ONE unbroken chain across the version boundary: each v1 entry still hashes over its ORIGINAL
+    // `receipt_id` bytes, each v2 entry over its `recovery_id` bytes.
+    expect(verifyUsageChain(entries)).toEqual({ valid: true, count: 4 });
+    entries.forEach((entry) => expect(verifyEntrySignature(entry, keys.publicKey), entry.event_id).toBe(true));
+    // Both shapes surrender the same id through the one accessor.
+    expect(entries.map((e) => recoveryIdOf(e).recoveryId)).toEqual(["rec-1", "rec-1", "rec-1", "rec-1"]);
+    expect(entries.map((e) => recoveryIdOf(e).provenance)).toEqual([
+      "legacy-receipt-id-field",
+      "legacy-receipt-id-field",
+      "recovery-id-field",
+      "recovery-id-field"
+    ]);
+
+    // AND THE TALLY DOES NOT FAIL CLOSED. A mixed SCHEMA version is normal and sums normally — it is
+    // not the mixed METER version that the allowance arithmetic fails closed on.
+    const consumption = await readPeriodConsumption(1_000, "2026-07", env);
+    expect(consumption).toEqual({ ok: true, consumed: 200, remaining: 800 });
+    expect(sumOptimizedInputTokensForPeriod(entries, "2026-07")).toBe(200);
+  });
+
+  it("dedupe by event_id is identical for both shapes", async () => {
+    const env = tmp();
+    const v2 = baseEventV2({ event_id: "eeeeeeee-0000-0000-0000-000000000001" });
+    expect((await appendUsageEvent(v2, "sig-a", HEADROOM, env)).appended).toBe(true);
+    const again = await appendUsageEvent(v2, "sig-a", HEADROOM, env);
+    expect(again.appended).toBe(false);
+    if (!again.appended) expect(again.reason).toContain("already recorded");
+    expect((await readUsageJournal(env)).entries).toHaveLength(1);
+  });
+
   it("detects tampering: editing any field breaks the chain", async () => {
     const env = tmp();
     await appendUsageEvent(baseEvent({ event_id: "bbbbbbbb-0000-0000-0000-000000000001" }), "sigA", HEADROOM, env);
@@ -199,7 +402,8 @@ describe("usage-journal append + hash chain", () => {
     // Determinism and sig-sensitivity below cannot catch a RENAME of USAGE_CHAIN_DOMAIN — both
     // sides of those assertions move together. Only a hash pinned to a literal can, because the
     // domain tag is mixed into the digest. Same vector shape the control plane re-implements.
-    expect(computeEntryHash(baseEvent(), "sig-fixture", USAGE_CHAIN_GENESIS)).toBe(
+    // Same reason as the byte-order pin above: the vector's event is frozen, meter label included.
+    expect(computeEntryHash(baseEvent({ meter_version: "optimized-input-v1" }), "sig-fixture", USAGE_CHAIN_GENESIS)).toBe(
       "2625086c19efe8b04e3cd9201a89cd918e9a4ba64e2bfef284456b4ea47fc14b"
     );
   });

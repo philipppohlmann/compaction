@@ -104,8 +104,8 @@ export async function runPro(deps: ProCommandDeps = {}): Promise<void> {
         `  This period's optimized-input allowance is spent${resetsOn ? `; it resets on ${resetsOn}` : ""}.`
       )
     );
-    print(chalk.dim("  Output shaping is unaffected and keeps running. Input compaction on the API-key route"));
-    print(chalk.dim("  is paused until the allowance resets — nothing is charged and nothing was bought."));
+    print(chalk.dim("  Output shaping is unaffected and keeps running — it is never metered. Input compaction"));
+    print(chalk.dim("  is paused on every route until the allowance resets — nothing is charged and nothing was bought."));
   } else {
     print(chalk.dim("  You are inside your current allowance — nothing is paused."));
   }

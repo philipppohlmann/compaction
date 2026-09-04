@@ -14,20 +14,25 @@
  * receipt, so it does not appear here and no surface may say it does.
  *
  * TIER HONESTY IS THE POINT, not a caveat. Every count is printed with the axis tier the event itself
- * recorded (`local-estimate` | `provider-reported` | …) taken VERBATIM. Cursor is local-estimate only
- * (chars/4 — the vendor emits no usage), and nothing here may upgrade that label. An event whose axes
- * are all unavailable prints as unavailable, never as a zero: a fabricated `output 0` is a measurement
- * claim, and there is no measurement.
+ * recorded (`local-estimate` | `provider-reported` | …) taken VERBATIM. Compaction's current Cursor
+ * capture parser records chars/4 local estimates rather than consuming the vendor's per-turn usage,
+ * and nothing here may upgrade that label. An event whose axes are all unavailable prints as
+ * unavailable, never as a zero: a fabricated `output 0` is a measurement claim.
  *
  * Content-free by construction: only counts, the fixed surface name, the recorded source labels, and a
  * short slice of the event's own opaque, content-derived-free id ever reach the line.
  */
 import type { ActivityEvent } from "./activity-event.js";
+import { coalesceClaudeLogicalRuns, validateActivityEventForStore } from "./activity-store.js";
 import { buildActivityRows, type ActivityRow } from "./activity-view.js";
 import { RECEIPT_LINE_PREFIX } from "./gateway/receipt-line.js";
+import { settledStopLineFromActivityEvent } from "./settled-stop-activity.js";
+import type { GatewayReceipt } from "./gateway/receipt.js";
 
 /**
- * The activity surfaces `watch` renders from the local store: CURSOR ONLY.
+ * The legacy activity surfaces `watch` renders from the local store: CURSOR ONLY. Settled Codex Stop
+ * events use their closed `activity_kind` and the shared Stop renderer below; they never enter this
+ * legacy surface allowlist.
  *
  * The rule is one line per turn. A surface that can produce BOTH an activity event and a gateway
  * receipt for the same run would print twice, and a doubled feed is a worse lie than a missing one.
@@ -35,12 +40,10 @@ import { RECEIPT_LINE_PREFIX } from "./gateway/receipt-line.js";
  * `claude_code` is excluded for that reason: its Stop hook writes activity events for turns that also
  * produce gateway receipts.
  *
- * `codex` is excluded for the SAME reason, which an earlier version of this comment got wrong. It
- * claimed the Codex capture shim had "no gateway receipt to collide with"; it does. The documented
- * routed command is `compaction gateway run -- codex …`, the child inherits PATH, and PATH is exactly
- * where the capture shim lives — so one routed Codex run appends an activity event AND writes a
- * gateway receipt. Codex still has two per-turn surfaces that work: its `Stop` hook line, and its
- * gateway receipts in this feed.
+ * Legacy `codex-shim-*` capture events are excluded for the SAME reason. A routed Codex command can
+ * append one of those and gateway receipts with no shared identity. In contrast, `codex-stop-*`
+ * events carry the exact hashed session + run interval, so the renderer admits that settled aggregate
+ * and suppresses only its positively correlated gateway micro-events.
  *
  * The deferred alternative is cross-store de-duplication rather than exclusion. It is not narrow: the
  * two stores have disjoint id spaces (a content-free `codex-shim-<digest>` run id vs a gateway
@@ -65,7 +68,7 @@ function group(n: number): string {
  * honest outcome; printing a zero would not be.
  */
 export function activityReceiptLine(row: ActivityRow): string | undefined {
-  if (!WATCH_ACTIVITY_SURFACES.includes(row.surface)) return undefined;
+  if (row.surface !== "cursor") return undefined;
   const parts: string[] = [RECEIPT_LINE_PREFIX, row.surface];
 
   if (row.input_before !== null && row.input_after !== null) {
@@ -87,12 +90,9 @@ export function activityReceiptLine(row: ActivityRow): string | undefined {
 /**
  * A rendered per-turn line plus the ONLY ordering fact recorded about it.
  *
- * `recordedAt` is deliberately OPTIONAL and deliberately absent for every activity record: the
- * metrics-only activity contract stores no wall-clock at all (`ACTIVITY_EVENT_ALLOWED_KEYS` has no
- * time field, and `activity-view.ts` states the consequence — "runs are ordered by append recency").
- * A gateway receipt DOES carry one (`captured_at`). Modelling the difference instead of papering over
- * it is what lets a merged feed sort by real time where real time exists, and refuse to invent it
- * where it does not.
+ * `recordedAt` is deliberately OPTIONAL. Settled Codex Stop events carry the host-recorded Stop time;
+ * legacy and Cursor activity records do not. A gateway receipt carries `captured_at`. Modelling the
+ * difference lets a merged feed sort by real time where it exists and refuse to invent it otherwise.
  */
 export interface OrderedTurnLine {
   line: string;
@@ -126,13 +126,26 @@ export function mergeTurnLines(...groups: readonly (readonly OrderedTurnLine[])[
 
 /**
  * Render the canonical lines for a batch of raw activity JSONL, each carrying its ordering fact —
- * which for this store is ALWAYS "none recorded" (see `OrderedTurnLine`). Pure, never throws.
+ * when present (settled Codex Stop) and no invented timestamp otherwise. Pure, never throws.
  */
-export function activityTurnLinesFromJsonl(rawChunk: string): OrderedTurnLine[] {
-  // No `recordedAt`: the metrics-only activity event has no wall-clock field to read. This is stated
-  // once, here, rather than each caller guessing at a substitute (a file mtime or a read order would
-  // both be orderings this record does not have).
-  return activityLinesFromJsonl(rawChunk).map((line) => ({ line }));
+export function activityTurnLinesFromJsonl(
+  rawChunk: string,
+  options: { coalesceClaude?: boolean } = {}
+): OrderedTurnLine[] {
+  const out: OrderedTurnLine[] = [];
+  for (const event of activityEventsFromJsonl(rawChunk, options.coalesceClaude !== false)) {
+    if (event.activity_kind === "codex-stop" || event.activity_kind === "claude-stop") {
+      const line = settledStopLineFromActivityEvent(event);
+      const recordedAt = Date.parse(event.recorded_at ?? "");
+      if (line) out.push({ line, ...(Number.isFinite(recordedAt) ? { recordedAt } : {}) });
+      continue;
+    }
+    if (event.surface !== "cursor") continue;
+    const row = buildActivityRows([event], { limit: 1 })[0];
+    const line = row ? activityReceiptLine(row) : undefined;
+    if (line) out.push({ line });
+  }
+  return out;
 }
 
 /**
@@ -141,26 +154,86 @@ export function activityTurnLinesFromJsonl(rawChunk: string): OrderedTurnLine[] 
  * gateway-receipt renderer skips one.
  */
 export function activityLinesFromJsonl(rawChunk: string): string[] {
+  return activityTurnLinesFromJsonl(rawChunk).map((entry) => entry.line);
+}
+
+function activityEventsFromJsonl(rawChunk: string, coalesceClaude = true): ActivityEvent[] {
   const events: ActivityEvent[] = [];
   for (const line of rawChunk.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
     try {
       const parsed = JSON.parse(trimmed) as ActivityEvent;
-      if (parsed && typeof parsed === "object" && typeof parsed.surface === "string") events.push(parsed);
+      if (validateActivityEventForStore(parsed).problems.length === 0) events.push(parsed);
     } catch {
       continue;
     }
   }
-  if (events.length === 0) return [];
-  // `buildActivityRows` is the ONE place that decides which count is reportable at which tier, so the
-  // line can never disagree with `compaction activity` about the same event. It returns newest-first;
-  // a live feed reads chronologically, so the order is restored here.
-  const rows = buildActivityRows(events, { limit: events.length });
-  const out: string[] = [];
-  for (const row of [...rows].reverse()) {
-    const line = activityReceiptLine(row);
-    if (line) out.push(line);
-  }
-  return out;
+  return coalesceClaude ? coalesceClaudeLogicalRuns(events) : events;
 }
+
+export interface CodexStopRunWindow {
+  sessionCorrelationId: string;
+  startedAt: string;
+  endedAt: string;
+}
+
+export type SettledStopRunWindow = CodexStopRunWindow;
+
+/** Valid persisted Codex Stop windows, used to suppress their gateway micro-call lines in snapshots. */
+export function codexStopRunWindowsFromJsonl(rawChunk: string): CodexStopRunWindow[] {
+  return activityEventsFromJsonl(rawChunk).flatMap((event) => {
+    if (
+      event.activity_kind !== "codex-stop" ||
+      typeof event.session_id !== "string" ||
+      !event.session_id.startsWith("codex-session-") ||
+      typeof event.run_started_at !== "string" ||
+      typeof event.recorded_at !== "string"
+    ) return [];
+    return [{
+      sessionCorrelationId: event.session_id.slice("codex-session-".length),
+      startedAt: event.run_started_at,
+      endedAt: event.recorded_at
+    }];
+  });
+}
+
+/** Valid persisted Codex and Claude Stop windows for default whole-run watch snapshots. */
+export function settledStopRunWindowsFromJsonl(rawChunk: string): SettledStopRunWindow[] {
+  return activityEventsFromJsonl(rawChunk).flatMap((event) => {
+    const prefix = event.activity_kind === "codex-stop"
+      ? "codex-session-"
+      : event.activity_kind === "claude-stop"
+        ? "claude-session-"
+        : undefined;
+    if (
+      !prefix ||
+      typeof event.session_id !== "string" ||
+      !event.session_id.startsWith(prefix) ||
+      typeof event.run_started_at !== "string" ||
+      typeof event.recorded_at !== "string"
+    ) return [];
+    return [{
+      sessionCorrelationId: event.session_id.slice(prefix.length),
+      startedAt: event.run_started_at,
+      endedAt: event.recorded_at
+    }];
+  });
+}
+
+/** Exact session hash + request-start interval only; cwd and append order are never attribution. */
+export function gatewayReceiptCoveredByCodexStop(
+  receipt: GatewayReceipt,
+  windows: readonly CodexStopRunWindow[]
+): boolean {
+  const at = receipt.request_started_at ?? receipt.captured_at;
+  if (typeof receipt.session_correlation_id !== "string" || typeof at !== "string") return false;
+  return windows.some(
+    (window) =>
+      window.sessionCorrelationId === receipt.session_correlation_id &&
+      at >= window.startedAt &&
+      at <= window.endedAt
+  );
+}
+
+export const gatewayReceiptCoveredBySettledStop = gatewayReceiptCoveredByCodexStop;

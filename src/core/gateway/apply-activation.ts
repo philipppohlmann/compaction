@@ -9,6 +9,11 @@
  */
 import { DEDUPE_POLICY, type ApplyPolicyName } from "./request-shape.js";
 import type { LcmApplyPolicyName } from "./lcm-qualified-classes.js";
+// TYPE-ONLY, so nothing is imported at runtime and the value-level dependency stays one-way
+// (`apply-receipt` -> `apply-activation`). The Open-basic output policy is a policy this activation
+// can legitimately name: the gateway's shaping-only degradation applies exactly that public plan, and
+// the receipt's `policy` has to match the recovery record written for the same turn.
+import type { OPEN_BASIC_OUTPUT_POLICY } from "./apply-receipt.js";
 
 export type GatewayEffectiveMode = "record" | "apply" | "dry-run";
 
@@ -22,9 +27,11 @@ export interface ApplyActivation {
    * `deterministic-dedupe`; the LCM policy name exists ONLY for the stored-authorization boundary
    * path (`lcm-apply-boundary.ts`). The invariant here is about REQUESTABILITY, not reachability:
    * the LCM policy can never be selected via `--policy` or a header (unknown values fail closed to
-   * record), whatever qualifies a class on that path.
+   * record), whatever qualifies a class on that path. `open-basic-output-apply` is here for the same
+   * reason: the gateway's shaping-only degradation (Community at its input ceiling) applies the public
+   * Open-basic plan, so that is the policy its receipt and its recovery record both have to name.
    */
-  policy?: ApplyPolicyName | LcmApplyPolicyName;
+  policy?: ApplyPolicyName | LcmApplyPolicyName | typeof OPEN_BASIC_OUTPUT_POLICY;
   /**
    * Content-free label for the receipt's approval_status / activation source. `stored-authorization`
    * is never produced by `resolveApplyActivation` (which resolves only EXPLICIT per-call intent) -

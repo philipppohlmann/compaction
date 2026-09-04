@@ -14,6 +14,7 @@ import { mkdir, appendFile, readFile, open, stat } from "node:fs/promises";
 import path from "node:path";
 import type { OpenAiUsageBreakdown } from "./openai-usage.js";
 import type { OptimizationPlan } from "./optimization-planner.js";
+import type { OutputShapingCalibrationRegime } from "../output-shaping-calibration-store.js";
 
 /** The gateway modes (only `record` is implemented). */
 export type GatewayMode = "record" | "cache" | "apply";
@@ -99,6 +100,16 @@ export interface GatewayReceipt {
   receipt_id: string;
   /** ISO timestamp the receipt was recorded. */
   captured_at: string;
+  /**
+   * ISO timestamp the gateway RECEIVED the request this receipt describes. Recorded on every receipt,
+   * both modes, because `captured_at` is assigned only after the response has fully streamed and the
+   * usage window has been assembled — on a compressed response that is after an asynchronous
+   * decompressor flush, and the client may already have acted on the response by then. Run membership
+   * (`run-boundary.ts`) therefore reads THIS timestamp: a request the client sent inside its run is
+   * provably inside the run, whatever the ledger append latency. Absent on receipts written before the
+   * field existed; readers fall back to `captured_at`.
+   */
+  request_started_at?: string;
   provider: string;
   /** Model label the provider echoed, or "unknown" (never inferred). */
   model: string;
@@ -156,6 +167,25 @@ export interface GatewayReceipt {
   // --- APPLY-mode fields (present ONLY on apply / dry-run receipts) -----------------------------------
   /** The deterministic policy that ran (e.g. `deterministic-dedupe`). */
   policy?: string;
+  /**
+   * THE UPSTREAM BILLING ROUTE this turn was forwarded on — the user's own provider API key
+   * (`api-key`) or a Claude Code subscription session (`subscription`). The same distinction the
+   * usage event records; written here from the same expression so the two cannot drift.
+   *
+   * WHAT IT GATES: the per-turn line's `−$X (list price)` cost clause. That figure prices the
+   * model-visible input delta at the provider's PUBLISHED per-token rate, which is a defensible
+   * estimate of money only on a route where tokens are what gets billed. On a subscription session
+   * the user pays a flat fee and is billed no per-token amount at all, so a list-price figure there
+   * is not a smaller bill — it is a number with no basis. The clause is omitted instead.
+   *
+   * FAIL-CLOSED ON ABSENCE. A receipt written before this field existed records no route, and a
+   * replay cannot recover one. `undefined` therefore suppresses the cost clause rather than assuming
+   * the billed route: the alternative is to keep showing an unverifiable dollar figure for exactly
+   * the receipts whose route is unknown.
+   *
+   * CONTENT-FREE: one of two fixed labels.
+   */
+  upstream_route_type?: "api-key" | "subscription";
   /** True ONLY when apply actually changed the request body (before/after evidence exists via recovery). */
   request_mutated?: boolean;
   /** The gateway NEVER changes the response. Always false when present. */
@@ -195,6 +225,49 @@ export interface GatewayReceipt {
   /** Content-free components actually attached/applied on this request. */
   applied_components?: Array<"lcm-compaction" | "deterministic-compaction" | "output-shaping">;
   /**
+   * WAS OUTPUT SHAPING ACTIVE ON THE FINAL MODEL-VISIBLE REQUEST this turn?
+   *
+   * NOT `applied_components`, AND THE TWO MUST NEVER BE READ AS EACH OTHER. That field answers "what did
+   * THIS APPLY PASS mutate"; this one answers "what was true of the bytes we forwarded". They are
+   * independent: the tool's own `UserPromptSubmit` hook attaches the same policy upstream, so the planner
+   * correctly attaches nothing and correctly omits `output-shaping` — on a request the model still reads
+   * the policy from.
+   *
+   *  - `attached-this-pass` — this pass attached it. Normally implies `applied_components` contains
+   *    `output-shaping`.
+   *  - `already-active` — the current policy was ALREADY at instruction level on the final request, so
+   *    nothing was attached and no duplicate was created. `applied_components` does NOT contain
+   *    `output-shaping`. This is the ordinary LCM case: 5/5 Founder Journey turns and 261/261 replayable
+   *    captures classify here.
+   *  - `absent` — the current policy is not at instruction level on the final request. Covers shaping
+   *    disabled, the task-aware classifier hold, and fail-closed shapes.
+   *
+   * ABSENT FIELD MEANS UNKNOWN, NEVER `absent`. The final request is not retained anywhere (recovery
+   * stores `original_body` only), so a receipt written before this field CANNOT be classified after the
+   * fact. Readers fail closed and withhold the savings claim rather than guess.
+   */
+  output_shaping_state?: "attached-this-pass" | "already-active" | "absent";
+  /** Exact identity of the model-visible shaping policy when state proves it active. */
+  output_shaping_policy_version?: string;
+  /** Fixed regime only when the task classifier positively observed it. */
+  output_shaping_regime?: OutputShapingCalibrationRegime;
+  /**
+   * WHICH TOOL SESSION produced this call — a device-local keyed hash, never the session id itself
+   * (see `session-correlation.ts`). Recorded on EVERY receipt, both modes, because only apply receipts
+   * retain a body and record-mode is the large majority of traffic (counted in
+   * `session-correlation.ts`); the session cannot be recovered afterwards.
+   *
+   * NOT A RUN ID. One session contains many user runs; run identity is the `UserPromptSubmit`→`Stop`
+   * interval recorded separately (`run-boundary.ts`). Membership in a run needs BOTH this and that
+   * interval — never the working directory, which cannot separate two concurrent sessions.
+   */
+  session_correlation_id?: string;
+  /**
+   * WHY LCM DID OR DID NOT CONTRIBUTE on this request — fixed vocabulary, content-free
+   * (see `lcm-outcome.ts`). Absent on receipts written before this field, which are simply unknown.
+   */
+  lcm_outcome?: { kind: string; reason: string };
+  /**
    * WHY input optimization did not run on this turn, when the reason was the Community optimized-input
    * ALLOWANCE rather than a fail-closed gate. Content-free: a reason enum and a UTC calendar date, no
    * remaining/consumed figure (those stay in the lease and the local journal).
@@ -224,8 +297,44 @@ export interface GatewayReceipt {
     period_id?: string;
     /** The UTC date (`YYYY-MM-DD`) the allowance resets, when the lease carries a usable period. */
     resets_on?: string;
-    /** Which traffic the pause covers; `api-key-route` when only metered traffic stopped. */
+    /**
+     * Which traffic the pause covers. Live pauses are `all-routes`: the allowance buys Hybrid input
+     * optimization on every upstream route. `api-key-route` appears only on receipts persisted before
+     * metering became route-independent.
+     */
     scope?: AllowancePauseScope;
+  };
+  /**
+   * The Community allowance countdown for THIS turn: what was left after this turn's debit, out of
+   * the period's total. Present only on a turn that actually debited the allowance — a confirmed
+   * Hybrid INPUT apply — and only when the entitlement lease carried a signed period total.
+   *
+   * WHY IT IS ON THE RECEIPT rather than read at render time: the same reason `allowance_pause` is
+   * (see above). A per-turn line is a statement about the turn it belongs to, and re-deriving the
+   * numbers when the line is rendered would stamp today's balance onto a replayed receipt from three
+   * weeks ago. It also keeps the statusline render loop free of any lease read, journal read, or
+   * network call — it renders what the turn recorded.
+   *
+   * ABSENT ON A PAUSED TURN. The pause clause owns that line: it is the state the user needs to act
+   * on, and a countdown next to it would restate the same zero in weaker words.
+   *
+   * CONTENT-FREE: two token counts and a calendar month. `optimized_input_tokens` is a product
+   * ALLOWANCE unit — never a provider bill, cost, or savings figure.
+   */
+  allowance_snapshot?: {
+    /**
+     * Allowance left for the period AFTER this turn's debit — the authoritative figure, measured
+     * under the usage-journal append lock against the fresh tally the ceiling itself refuses on.
+     */
+    remaining_tokens: number;
+    /**
+     * The period's TOTAL allowance before any consumption — the denominator, carried in the signed
+     * lease. Never the lease's `allowance_tokens`, which is already net of server-recorded
+     * consumption and would render a permanently full tank.
+     */
+    period_total_tokens: number;
+    /** The allowance PERIOD (`YYYY-MM`) both figures belong to, when the lease carried one. */
+    period_id?: string;
   };
 }
 
@@ -245,6 +354,31 @@ export function buildGatewayReceipt(params: {
   usage: OpenAiUsageBreakdown;
   /** Model from the request (content-free metadata), used only if the response did not echo one. */
   requestModel?: string;
+  /** Device-local keyed hash of the tool session id (never the id itself). See `session-correlation.ts`. */
+  sessionCorrelationId?: string;
+  /** ISO timestamp the gateway received the request. See `request_started_at` on the receipt. */
+  requestStartedAt?: string;
+  /**
+   * Fixed-vocabulary LCM outcome (content-free; see `lcm-outcome.ts`). A record receipt carries it when
+   * the engine ran for this turn and applied nothing — the did-not-contribute turns are exactly the
+   * ones whose reason was being lost.
+   */
+  lcmOutcome?: { kind: string; reason: string };
+  /**
+   * Output-shaping provenance for the bytes this turn FORWARDED. A record-mode turn mutates nothing,
+   * which is NOT the same as a turn on which output shaping did not run: the tool's own
+   * `UserPromptSubmit` hook routinely attaches the policy upstream, so the request arrives already
+   * carrying it and reaches the model shaped while the gateway attaches nothing. Recording that fact
+   * here is what lets the run aggregate account for shaping it did not itself perform.
+   *
+   * Set by the caller ONLY from the strict instruction-level predicate
+   * (`outputShapingActiveOnRequest`), never from the broad skip guard — this field is what a receipt
+   * durably CLAIMS, so it must not inherit the guard's deliberate false-positive bias.
+   */
+  outputShapingState?: "attached-this-pass" | "already-active" | "absent";
+  /** Exact identity supplied by the component that inspected/attached the policy bytes. */
+  outputShapingPolicyVersion?: string;
+  outputShapingRegime?: OutputShapingCalibrationRegime;
   /** Optional client-set proof-run id (from an `x-compaction-proof-run` header) - an opaque grouping label. */
   proofRunId?: string;
   /** Optional content-free variant label (baseline | compacted) from x-compaction-proof-variant. */
@@ -256,6 +390,8 @@ export function buildGatewayReceipt(params: {
   const id = params.id ?? (() => randomUUID());
   const u = params.usage;
   const model = u.model ?? params.requestModel ?? "unknown";
+  const shapingActive =
+    params.outputShapingState === "attached-this-pass" || params.outputShapingState === "already-active";
 
   const tokens: GatewayReceipt["tokens"] = {
     ...(u.promptInputTokens !== undefined ? { prompt_input: u.promptInputTokens } : {}),
@@ -275,6 +411,7 @@ export function buildGatewayReceipt(params: {
   return {
     receipt_id: id(),
     captured_at: now(),
+    ...(params.requestStartedAt ? { request_started_at: params.requestStartedAt } : {}),
     provider: params.provider,
     model,
     endpoint: params.endpoint,
@@ -297,6 +434,13 @@ export function buildGatewayReceipt(params: {
     approval_status: "not-required",
     sync_status: "local-only",
     content_uploaded: false,
+    ...(params.sessionCorrelationId ? { session_correlation_id: params.sessionCorrelationId } : {}),
+    ...(params.lcmOutcome ? { lcm_outcome: params.lcmOutcome } : {}),
+    ...(params.outputShapingState ? { output_shaping_state: params.outputShapingState } : {}),
+    ...(shapingActive && params.outputShapingPolicyVersion
+      ? { output_shaping_policy_version: params.outputShapingPolicyVersion }
+      : {}),
+    ...(shapingActive && params.outputShapingRegime ? { output_shaping_regime: params.outputShapingRegime } : {}),
     ...(params.proofRunId ? { proof_run_id: params.proofRunId } : {}),
     ...(params.proofVariant ? { proof_variant: params.proofVariant } : {}),
     label: GATEWAY_RECORD_LABEL
@@ -337,6 +481,57 @@ function parseLastReceiptLine(raw: string): GatewayReceipt | undefined {
     return typeof parsed?.receipt_id === "string" ? parsed : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** The tail window: its receipts, and whether the ledger extends further back than the window read. */
+export interface GatewayReceiptTailWindow {
+  receipts: GatewayReceipt[];
+  /** True when bytes of the ledger precede the window — older receipts exist that were NOT read. */
+  truncated: boolean;
+}
+
+/**
+ * Read the receipts in the tail window, newest last, WITH the fact of whether the window cut the
+ * ledger off. The RUN AGGREGATE needs every receipt in the current run, not just the last one — a run
+ * is many provider calls, and the interleaved record-mode calls are exactly the ones a per-receipt
+ * read drops.
+ *
+ * Tail-bounded for the same reason `readLatestGatewayReceiptTail` is: the status line runs inside
+ * Claude Code's render loop and must never scan a multi-megabyte ledger. A run longer than the window
+ * aggregates only the part that fits, which under-reports rather than invents — and `truncated` is
+ * how the caller can tell a partial total from a total instead of presenting one as the other.
+ */
+export async function readGatewayReceiptTailWindow(
+  cwd: string = process.cwd(),
+  tailBytes = 512 * 1024
+): Promise<GatewayReceiptTailWindow> {
+  const file = path.join(cwd, DEFAULT_GATEWAY_RECEIPTS_DIR, GATEWAY_RECEIPTS_FILE);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    const info = await stat(file);
+    if (info.size === 0) return { receipts: [], truncated: false };
+    const start = Math.max(0, info.size - tailBytes);
+    const length = info.size - start;
+    handle = await open(file, "r");
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, start);
+    const out: GatewayReceipt[] = [];
+    for (const line of buffer.toString("utf8").split("\n")) {
+      const trimmed = line.trim();
+      if (trimmed === "") continue;
+      try {
+        const parsed = JSON.parse(trimmed) as GatewayReceipt;
+        if (typeof parsed?.receipt_id === "string") out.push(parsed);
+      } catch {
+        // A partial first line from the byte window, or a corrupt row: skipped, never guessed at.
+      }
+    }
+    return { receipts: out, truncated: start > 0 };
+  } catch {
+    return { receipts: [], truncated: false };
+  } finally {
+    await handle?.close().catch(() => {});
   }
 }
 

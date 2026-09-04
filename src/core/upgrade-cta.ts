@@ -33,7 +33,6 @@ import type { AllowancePauseScope } from "./onboarding-preferences.js";
  *
  *  - `exhausted`    — nothing remains this period (`remaining <= 0`).
  *  - `insufficient` — something remains, but less than THIS turn's optimized input would debit. The
- *    real case that motivated this: 44,054 remaining against a 75,946-token eligible turn. The
  *    session-level resolver (`resolveOpenTier`) fires only on `remaining <= 0` and structurally cannot
  *    express this, which is why the pause is carried per-turn on the receipt instead.
  */
@@ -48,11 +47,52 @@ export type AllowancePauseReason = "exhausted" | "insufficient";
 export const UPGRADE_CTA_LABEL = "Upgrade to Pro ↗";
 
 /**
- * The per-turn clause that states the product fact the CTA follows from. Deliberate phrasing, and
- * it is the honest one for BOTH pause reasons — a limit was reached either way, which "allowance
- * spent" only gets right in the `exhausted` case.
+ * The per-turn clause when the reset date is UNKNOWN — the fallback, no longer the usual form.
+ *
+ * It is the honest phrasing for BOTH pause reasons ("allowance spent" is only right in the
+ * `exhausted` case), and it states no scope, so a receipt replayed from the period when metering was
+ * api-key-only is not re-narrated as something it never said. It survives because a blocked user
+ * whose pause carries no datable period still needs to be told WHY the line above them says
+ * `input paused`; dropping the clause would leave them a bare `apply off` and no reason at all.
  */
 export const COMMUNITY_LIMIT_CLAUSE = "Community limit reached";
+
+/**
+ * The per-turn clause when the reset date IS known — the usual form.
+ *
+ * A WALL AND ITS EXIT, IN ONE CLAUSE. `Community limit reached` states only the wall: the user learns
+ * they are blocked and must run another command to learn for how long. The date is the single fact
+ * that turns the ceiling from an outage into a wait, and the primary line is the one surface a
+ * blocked user reliably reads, so it is the surface that has to carry it.
+ *
+ * It costs the line nothing, because it replaces narration that was already saying less. The clause
+ * this supersedes ran `Community limit reached · input optimization paused until 2026-09-01 · output
+ * shaping continues` — three clauses of which two were restating what the same line already showed
+ * (`input paused` two clauses earlier; the output arrow, which is the measurement `output shaping
+ * continues` was merely captioning). The date was the one fact not otherwise on the line, and it is
+ * now the only one of the three that is.
+ *
+ * NO FIGURE AND NO PRICE, unchanged: a date is not a balance. The ceiling still refuses and degrades;
+ * it never auto-purchases, and this clause asserts nothing about what a reader would be charged.
+ */
+export const COMMUNITY_LIMIT_RESETS_PREFIX = "Community limit resets";
+
+/**
+ * The per-turn ceiling clause for a given reset date: the dated form when the date is real, the
+ * undated fallback when it is not.
+ *
+ * VALIDATED HERE, NOT TRUSTED, for the same reason `upgradeNoticeLines` validates: the date is read
+ * back off `.compaction/gateway/receipts.jsonl` under the working directory, which is not a trust
+ * boundary, and it is interpolated into a string printed straight into a terminal. A value that does
+ * not parse yields the undated clause — never a sanitized fragment, and never a guessed date.
+ *
+ * ONE FUNCTION FOR ONE CLAUSE so the per-turn line and its tests cannot disagree about which form a
+ * given date produces.
+ */
+export function communityLimitClause(resetsOn: string | undefined): string {
+  const valid = validResetsOn(resetsOn);
+  return valid === undefined ? COMMUNITY_LIMIT_CLAUSE : `${COMMUNITY_LIMIT_RESETS_PREFIX} ${valid}`;
+}
 
 /** The canonical conversion COMMAND. `compaction pro` is its alias; this is the name surfaces print. */
 export const UPGRADE_COMMAND = "compaction upgrade";
@@ -91,7 +131,13 @@ export function upgradeCta(env: NodeJS.ProcessEnv = process.env): string {
   return terminalHyperlink(UPGRADE_CTA_LABEL, proUrl(env), env);
 }
 
-/** What the pause covers, in the same vocabulary the per-turn ceiling clause uses. */
+/**
+ * What the pause covers, in the same vocabulary the per-turn ceiling clause uses.
+ *
+ * `all-routes` is what a live pause means: the allowance buys Hybrid input optimization on every
+ * upstream route. `api-key-route` survives only for receipts persisted before metering became
+ * route-independent, and it stays QUALIFIED so replaying one states what was true when it was written.
+ */
 const PAUSE_SUBJECT: Record<AllowancePauseScope, string> = {
   "all-routes": "Community input optimization",
   "api-key-route": "Community input optimization on API-key routed turns"
@@ -128,10 +174,10 @@ export function upgradeNoticeLines(input: UpgradeNoticeInput): string[] {
       ? `${subject} is paused: this period's remaining allowance does not cover a turn of this size.`
       : `${subject} is paused for this period.`;
   const lines = [why, "Output shaping remains active."];
-  // SCOPED, and the narrower case must say what is UNAFFECTED. While a valid lease is merely spent
-  // locally, only metered api-key traffic stops; this block renders globally with no way to know
-  // which route the next turn takes, so telling a subscription user their apply is paused — when it is
-  // running normally — would be exactly the false claim these surfaces exist to prevent.
+  // SCOPED, and the narrower HISTORICAL case must still say what it left unaffected: while metering
+  // was api-key-only, subscription traffic really did keep applying, and a replayed receipt from that
+  // period must not be re-narrated as something it never said. A live pause is `all-routes` and gets
+  // no such sentence, because today there is no unaffected route.
   if (scope === "api-key-route") lines.push("Subscription-routed turns are unaffected.");
   // VALIDATED, NOT TRUSTED: this value is read back off a persisted receipt. An unparseable one
   // simply gets no resume sentence - the pause and the conversion path are still stated.

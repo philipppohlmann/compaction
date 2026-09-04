@@ -6,11 +6,31 @@ import {
   receiptLineOutputOnly
 } from "../../src/core/gateway/receipt-line.js";
 import { receiptLinesFromJsonl } from "../../src/cli/commands/watch.js";
-import { upgradeNoticeLines, UPGRADE_CTA_LABEL } from "../../src/core/upgrade-cta.js";
+import {
+  COMMUNITY_LIMIT_CLAUSE,
+  COMMUNITY_LIMIT_RESETS_PREFIX,
+  communityLimitClause,
+  upgradeNoticeLines,
+  UPGRADE_CTA_LABEL
+} from "../../src/core/upgrade-cta.js";
 import { hyperlinkTarget, osc8, supportsHyperlinks, terminalHyperlink } from "../../src/core/terminal-hyperlink.js";
 import { PRO_PATH, proUrl } from "../../src/core/pro-destination.js";
 import { DEFAULT_WEB_ORIGIN } from "../../src/core/web-origin.js";
 import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
+import { currentPeriodId, periodEndUtc } from "../../src/core/entitlement/lease.js";
+
+/**
+ * THE PAUSE DATE IS DERIVED, NOT WRITTEN DOWN.
+ *
+ * These fixtures used the literal `"2026-09-01"`. A recorded pause is only rendered with its
+ * conversion path while it is still CURRENT (`allowancePauseIsCurrent`), so the literal was a live
+ * pause right up to 2026-09-01 UTC and an expired one from that instant on — and ten cases in this
+ * file went red on the calendar, with nothing about the product having changed. Bumping the literal
+ * only moves the next failure; deriving the date from the CURRENT period means the pause is current
+ * whenever the suite runs, on any date.
+ */
+const CURRENT_PERIOD = currentPeriodId();
+const PERIOD_END = periodEndUtc(CURRENT_PERIOD) as string;
 
 /**
  * COMMUNITY → PRO CONVERSION UX.
@@ -43,7 +63,7 @@ function receipt(over: Partial<GatewayReceipt> = {}): GatewayReceipt {
     mode: "apply",
     upstream_status: 200,
     model_visible_bytes_changed: true,
-    tokens: { prompt_input: 75_946, output: 300 },
+    tokens: { prompt_input: 1_500, output: 300 },
     fresh_billed_input_reduction: { available: false, note: "no cached tokens reported" },
     token_source: "provider-reported",
     cache_source: "unavailable",
@@ -62,21 +82,27 @@ function receipt(over: Partial<GatewayReceipt> = {}): GatewayReceipt {
 function healthyFullApply(over: Partial<GatewayReceipt> = {}): GatewayReceipt {
   return receipt({
     request_mutated: true,
-    estimated_input_tokens_before: 75_946,
-    estimated_input_tokens_after: 51_682,
-    estimated_model_visible_input_reduction_percent: 31.9,
+    estimated_input_tokens_before: 1_500,
+    estimated_input_tokens_after: 1_000,
+    estimated_model_visible_input_reduction_percent: 33.3,
     token_source_before: "local-estimate",
     applied_components: ["lcm-compaction", "output-shaping"],
     ...over
   });
 }
 
-/** A turn refused for allowance: no input compaction happened, output shaping still ran. */
+/**
+ * A turn refused for allowance: no input compaction happened, output shaping still ran.
+ *
+ * `all-routes` is what the gateway writes today — the allowance pays for the Hybrid Engine, so a live
+ * pause covers every upstream route. The narrower `api-key-route` label is read back only off receipts
+ * persisted before that was true, and is exercised deliberately by the historical-replay case below.
+ */
 function pausedTurn(reason: "exhausted" | "insufficient", over: Partial<GatewayReceipt> = {}): GatewayReceipt {
   return receipt({
     request_mutated: true,
     applied_components: ["output-shaping"],
-    allowance_pause: { reason, resets_on: "2026-09-01", scope: "api-key-route" },
+    allowance_pause: { reason, resets_on: PERIOD_END, scope: "all-routes" },
     ...over
   });
 }
@@ -85,33 +111,49 @@ describe("the CTA appears exactly when Community input optimization is unavailab
   it("a HEALTHY Community full-apply turn shows no Pro CTA at all", () => {
     const line = communityFullApplyReceiptLine(healthyFullApply(), undefined, receiptCeiling(healthyFullApply(), PLAIN_ENV));
     expect(line).toBeDefined();
-    // The real receipt values still render — the healthy path is untouched by this work.
-    expect(line).toContain("input 75,946→51,682");
+    expect(line).toContain("input 1,500→1,000");
     expect(line).not.toContain(UPGRADE_CTA_LABEL);
-    expect(line).not.toContain("Community limit reached");
+    // The stem, so neither the dated clause nor its undated fallback can appear on a healthy turn.
+    expect(line).not.toContain("Community limit");
     expect(line).not.toMatch(/https?:\/\//);
   });
 
   it("allowance EXHAUSTED (remaining 0) → the CTA is visible", () => {
     const r = pausedTurn("exhausted");
-    const line = receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, undefined, receiptCeiling(r, PLAIN_ENV));
-    expect(line).toContain("Community limit reached");
+    const line = receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, receiptCeiling(r, PLAIN_ENV));
+    expect(line).toContain(communityLimitClause(PERIOD_END));
     expect(line).toContain(UPGRADE_CTA_LABEL);
   });
 
-  /**
-   * THE CASE THE PRODUCT COULD NOT EXPRESS BEFORE, and the one actually observed: 44,054 tokens
-   * remaining against a 75,946-token eligible turn. `resolveOpenTier` fires on `remaining <= 0` only,
-   * so session state calls this device healthy. The pause rides the RECEIPT precisely so this turn is
-   * not silent.
-   */
+  /** A positive remainder can still be insufficient for one turn, so the receipt carries the pause. */
   it("remaining > 0 but INSUFFICIENT for this turn → the CTA is visible", () => {
     const r = pausedTurn("insufficient");
-    const line = receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, undefined, receiptCeiling(r, PLAIN_ENV));
-    expect(line).toContain("Community limit reached");
+    const line = receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, receiptCeiling(r, PLAIN_ENV));
+    // `insufficient` is the reason the wording has to be reason-neutral: tokens REMAIN on this turn,
+    // so "allowance spent" would be false. Naming the reset date says nothing about the balance.
+    expect(line).toContain(communityLimitClause(PERIOD_END));
     expect(line).toContain(UPGRADE_CTA_LABEL);
     // NOT a false claim of input compaction: the paused turn compacted nothing, so no arrow may appear.
     expect(line).not.toMatch(/input [\d,]+→/);
+  });
+
+  /**
+   * A REAL RECEIPT SHAPE, not a hypothetical: the gateway spreads `resets_on` CONDITIONALLY
+   * (`server.ts`), so a pause recorded when the period could not be named carries the reason alone.
+   * That turn is still a blocked user, and the clause must degrade to its undated form rather than
+   * print a dangling prefix or disappear.
+   */
+  it("a pause recorded with no reset date still names the limit and the way out", () => {
+    const r = receipt({
+      request_mutated: true,
+      applied_components: ["output-shaping"],
+      allowance_pause: { reason: "insufficient" }
+    } as Partial<GatewayReceipt>);
+    const line = receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, receiptCeiling(r, PLAIN_ENV)) as string;
+    expect(line).toContain(COMMUNITY_LIMIT_CLAUSE);
+    expect(line).not.toContain(COMMUNITY_LIMIT_RESETS_PREFIX);
+    expect(line).toContain(UPGRADE_CTA_LABEL);
+    expect(line).toContain("input paused");
   });
 
   it("a paused turn NEVER claims an input reduction and never carries an apply label", () => {
@@ -129,16 +171,27 @@ describe("the CTA appears exactly when Community input optimization is unavailab
   it("shows the CTA on a held turn, without claiming output shaping ran", () => {
     const r = pausedTurn("insufficient", { applied_components: [], request_mutated: false });
     const ceiling = receiptCeiling(r, PLAIN_ENV);
+    // THE EVIDENCE IS STILL READ OFF THE RECEIPT, even though the primary line no longer narrates it:
+    // the detail surfaces are what state the shaping, and they must not be handed a `true` the
+    // receipt does not support.
     expect(ceiling?.outputShapingContinues).toBe(false);
-    const line = receiptLineFromGatewayReceipt(r, undefined, undefined, undefined, undefined, ceiling);
+    const line = receiptLineFromGatewayReceipt(r, undefined, undefined, undefined, ceiling);
     expect(line).toContain(UPGRADE_CTA_LABEL);
     expect(line).not.toContain("output shaping continues");
   });
 
-  it("says output shaping continues ONLY when the receipt's own components record it", () => {
+  /**
+   * THE SHAPING IS SHOWN, NOT NARRATED. This case used to assert the words `output shaping continues`.
+   * The words are gone from the primary line; the FACT is not, and it is now carried by evidence the
+   * user can check rather than a caption: the `basic shaping` posture label, on a paused turn whose
+   * `apply off` counterpart would read very differently.
+   */
+  it("still shows that shaping ran on a paused turn — as a posture label, not a caption", () => {
     const shaped = pausedTurn("exhausted");
-    const line = receiptLineFromGatewayReceipt(shaped, "basic", undefined, undefined, undefined, receiptCeiling(shaped, PLAIN_ENV));
-    expect(line).toContain("output shaping continues");
+    const line = receiptLineFromGatewayReceipt(shaped, "basic", undefined, undefined, receiptCeiling(shaped, PLAIN_ENV));
+    expect(line).toContain("basic shaping");
+    expect(line).toContain(communityLimitClause(PERIOD_END));
+    expect(line).not.toContain("output shaping continues");
   });
 });
 
@@ -153,7 +206,7 @@ describe("the CTA is clickable, and points at the ONE canonical destination", ()
    */
   it("the OSC 8 hyperlink target on a rendered per-turn line IS proUrl", () => {
     const r = pausedTurn("insufficient");
-    const line = receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, undefined, receiptCeiling(r, LINKING_ENV));
+    const line = receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, receiptCeiling(r, LINKING_ENV));
     expect(line).toBeDefined();
     expect(hyperlinkTarget(line as string)).toBe(proUrl(LINKING_ENV));
     // The clickable form shows the LABEL, not a raw URL, in the visible text.
@@ -163,7 +216,7 @@ describe("the CTA is clickable, and points at the ONE canonical destination", ()
   it("follows an overridden destination rather than a second hardcoded URL", () => {
     const staging = { ...LINKING_ENV, COMPACTION_PRO_URL: "https://staging.example/waitlist?plan=pro" } as NodeJS.ProcessEnv;
     const r = pausedTurn("exhausted");
-    const line = receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, undefined, receiptCeiling(r, staging));
+    const line = receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, receiptCeiling(r, staging));
     expect(hyperlinkTarget(line as string)).toBe("https://staging.example/waitlist?plan=pro");
     expect(line).not.toContain(new URL(DEFAULT_WEB_ORIGIN).hostname);
   });
@@ -186,15 +239,15 @@ describe("the CTA is clickable, and points at the ONE canonical destination", ()
 
   it("EVERY state surface resolves the same destination and names no second one", () => {
     const surfaces = [
-      upgradeNoticeLines({ reason: "exhausted", resetsOn: "2026-09-01", scope: "api-key-route", env: PLAIN_ENV }).join("\n"),
+      upgradeNoticeLines({ reason: "exhausted", resetsOn: PERIOD_END, scope: "all-routes", env: PLAIN_ENV }).join("\n"),
       upgradeNoticeLines({ reason: "insufficient", env: PLAIN_ENV }).join("\n"),
-      receiptLineFromGatewayReceipt(pausedTurn("insufficient"), "basic", undefined, undefined, undefined, receiptCeiling(pausedTurn("insufficient"), PLAIN_ENV)) ?? "",
+      receiptLineFromGatewayReceipt(pausedTurn("insufficient"), "basic", undefined, undefined, receiptCeiling(pausedTurn("insufficient"), PLAIN_ENV)) ?? "",
       receiptLineOutputOnly({
         outputTokens: 300,
         providerReported: true,
         shapingActive: true,
         tier: "basic",
-        ceiling: { reason: "exhausted", resetsOn: "2026-09-01", ctaEnv: PLAIN_ENV }
+        ceiling: { reason: "exhausted", resetsOn: PERIOD_END, ctaEnv: PLAIN_ENV }
       }) ?? ""
     ];
     for (const s of surfaces) {
@@ -211,32 +264,43 @@ describe("the CTA is clickable, and points at the ONE canonical destination", ()
 describe("sequential turns produce sequential, non-stale lines", () => {
   const turns: GatewayReceipt[] = [
     // A — shaping-only warm-up. No input compaction, so no input arrow may appear.
+    //
+    // THE STATE IS PART OF THE ROW, not decoration. This block asserts that the line built directly and
+    // the line `watch` replays are the SAME string, and the replay path derives the Open label from
+    // `output_shaping_state` (`openLineForTurn`), which fails closed on a receipt that records none.
+    // A turn the gateway shaped writes `attached-this-pass`, so that is what this fixture carries; a
+    // legacy receipt genuinely has no label to replay, and is pinned in
+    // `tests/cli/watch-tier-label-provenance.test.ts` instead of being smuggled in here.
     receipt({
       receipt_id: "aaaaaaaa-0000-0000-0000-000000000001",
       request_mutated: true,
       tokens: { prompt_input: 12_004, output: 210 },
-      applied_components: ["output-shaping"]
+      applied_components: ["output-shaping"],
+      output_shaping_state: "attached-this-pass"
     }),
     // B — a real full-apply turn.
     healthyFullApply({ receipt_id: "bbbbbbbb-0000-0000-0000-000000000002" }),
     // C — another full-apply turn, with ITS OWN values.
     healthyFullApply({
       receipt_id: "cccccccc-0000-0000-0000-000000000003",
-      tokens: { prompt_input: 61_220, output: 415 },
-      estimated_input_tokens_before: 61_220,
-      estimated_input_tokens_after: 44_900,
+      tokens: { prompt_input: 1_200, output: 415 },
+      estimated_input_tokens_before: 1_200,
+      estimated_input_tokens_after: 900,
       estimated_model_visible_input_reduction_percent: 26.7
     }),
     // D — the allowance cannot cover this turn.
     pausedTurn("insufficient", {
       receipt_id: "dddddddd-0000-0000-0000-000000000004",
-      tokens: { prompt_input: 75_946, output: 288 }
+      tokens: { prompt_input: 1_500, output: 288 },
+      // Input optimization is what the ceiling paused; shaping still rode this request. Same reason as
+      // turn A: the replayed label reads the state, so the fixture has to record it.
+      output_shaping_state: "attached-this-pass"
     })
   ];
 
   const lines = turns.map(
     (r) => communityFullApplyReceiptLine(r, undefined, receiptCeiling(r, PLAIN_ENV)) ??
-      receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, undefined, receiptCeiling(r, PLAIN_ENV)) ??
+      receiptLineFromGatewayReceipt(r, "basic", undefined, undefined, receiptCeiling(r, PLAIN_ENV)) ??
       ""
   );
 
@@ -249,10 +313,10 @@ describe("sequential turns produce sequential, non-stale lines", () => {
 
   it("turn A claims NO input saving (shaping-only), and turns B/C claim their own", () => {
     expect(lines[0]).not.toMatch(/input [\d,]+→/);
-    expect(lines[1]).toContain("input 75,946→51,682");
-    expect(lines[2]).toContain("input 61,220→44,900");
+    expect(lines[1]).toContain("input 1,500→1,000");
+    expect(lines[2]).toContain("input 1,200→900");
     // Turn C is not a repeat of turn B.
-    expect(lines[2]).not.toContain("51,682");
+    expect(lines[2]).not.toContain("1,000");
   });
 
   it("no earlier turn's reduction or ceiling leaks forward, and no later one leaks back", () => {
@@ -261,8 +325,8 @@ describe("sequential turns produce sequential, non-stale lines", () => {
     expect(lines[3]).toContain(UPGRADE_CTA_LABEL);
     // Turn D compacted nothing, so neither predecessor's arrow may survive onto it.
     expect(lines[3]).not.toMatch(/input [\d,]+→/);
-    expect(lines[3]).not.toContain("51,682");
-    expect(lines[3]).not.toContain("44,900");
+    expect(lines[3]).not.toContain("1,000");
+    expect(lines[3]).not.toContain("900");
   });
 
   it("`compaction watch` replays the SAME lines in the SAME order", () => {
@@ -286,6 +350,77 @@ describe("sequential turns produce sequential, non-stale lines", () => {
   });
 });
 
+/**
+ * THE ALLOWANCE COUNTDOWN ACROSS SURFACES.
+ *
+ * §6's requirement is that the healthy-turn countdown agrees with `compaction usage` and reaches every
+ * surface without any of them consulting live state. Both figures ride the RECEIPT, so `watch` replays
+ * the balance of the turn it is replaying rather than today's — the same rule the ceiling already
+ * follows — and the statusline render loop performs no file read and no network call to produce it.
+ *
+ * It is also a COMMUNITY clause. An Open device has no metered allowance to count down, so an Open
+ * render of the very same receipt must not acquire one.
+ */
+describe("the healthy allowance countdown rides the receipt onto every surface", () => {
+  const turnB = healthyFullApply({
+    receipt_id: "bbbbbbbb-1111-1111-1111-111111111111",
+    allowance_snapshot: { remaining_tokens: 1_823_400, period_total_tokens: 2_000_000, period_id: "2026-08" }
+  });
+  const turnC = healthyFullApply({
+    receipt_id: "cccccccc-1111-1111-1111-111111111111",
+    tokens: { prompt_input: 1_200, output: 415 },
+    estimated_input_tokens_before: 1_200,
+    estimated_input_tokens_after: 900,
+    estimated_model_visible_input_reduction_percent: 26.7,
+    allowance_snapshot: { remaining_tokens: 1_806_800, period_total_tokens: 2_000_000, period_id: "2026-08" }
+  });
+
+  function communityLine(r: GatewayReceipt): string {
+    return communityFullApplyReceiptLine(r, undefined, receiptCeiling(r, PLAIN_ENV)) ?? "";
+  }
+
+  it("renders on a healthy Community turn, with no CTA and no pause claim beside it", () => {
+    const line = communityLine(turnB);
+    expect(line).toContain("1.82M/2M left");
+    expect(line).not.toContain(UPGRADE_CTA_LABEL);
+    expect(line).not.toContain("paused");
+  });
+
+  it("each turn carries ITS OWN balance — no earlier turn's countdown leaks forward", () => {
+    expect(communityLine(turnB)).toContain("1.82M/2M left");
+    expect(communityLine(turnC)).toContain("1.8M/2M left");
+    expect(communityLine(turnC)).not.toContain("1.82M");
+  });
+
+  it("`compaction watch` replays the same countdowns, in order, from the receipts alone", () => {
+    const jsonl = [turnB, turnC].map((r) => JSON.stringify(r)).join("\n");
+    const replayed = receiptLinesFromJsonl(jsonl, { productTier: "full", env: PLAIN_ENV });
+    expect(replayed).toEqual([communityLine(turnB), communityLine(turnC)]);
+  });
+
+  it("an OPEN render of the SAME receipt carries no Community budget clause", () => {
+    // Open has no metered allowance, so the clause has nothing to describe. Pinned on the same receipt
+    // object rather than a stripped copy, so the guard is about the BUILDER and not about the fixture.
+    const open = receiptLineFromGatewayReceipt(turnB, "basic", undefined, undefined, receiptCeiling(turnB, PLAIN_ENV));
+    expect(open).toBeDefined();
+    expect(open).not.toContain("left");
+    expect(open).not.toContain("2M");
+  });
+
+  it("a PAUSED turn states the pause instead — one line never both counts down and pauses", () => {
+    const paused = pausedTurn("exhausted", {
+      receipt_id: "eeeeeeee-1111-1111-1111-111111111111",
+      allowance_snapshot: { remaining_tokens: 1_823_400, period_total_tokens: 2_000_000, period_id: "2026-08" }
+    });
+    const line =
+      communityFullApplyReceiptLine(paused, undefined, receiptCeiling(paused, PLAIN_ENV)) ??
+      receiptLineFromGatewayReceipt(paused, "basic", undefined, undefined, receiptCeiling(paused, PLAIN_ENV)) ??
+      "";
+    expect(line).not.toContain("1.82M/2M left");
+    expect(line).toContain(UPGRADE_CTA_LABEL);
+  });
+});
+
 describe("nothing navigates by itself", () => {
   /**
    * A ceiling turn must not open a browser, and ceiling turns repeat. The rendering path is
@@ -303,106 +438,103 @@ describe("nothing navigates by itself", () => {
   });
 });
 
-/**
- * THE CAPTURED DEFECT, PINNED.
- *
- * Receipt `e64ff2cb-a9c8-48b0-a6e3-48e5b770a551` is a REAL post-ceiling turn recorded on 2026-08-22
- * against the live Anthropic endpoint, in the run that first reached the Community allowance ceiling.
- * The allowance was spent, so NO input optimization ran — but output shaping still rewrote the request,
- * which set `request_mutated: true` and left an `estimated_input_tokens_*` pair whose "after" is the
- * SHAPED body: 926 → 1,032, i.e. bigger. `isRealApply` therefore answered true, and the shipped line
- * read, verbatim from the run log:
- *
- *   compaction · input 926→1,032 (−-11%) · output 43→23 (−47%, est. · default prior) · full apply · id e64ff2cb
- *
- * Three lies on the one turn where the user most needed the truth: a reduction that did not happen
- * (with a mangled double-minus), a `full apply` label on a refused apply, and no way to convert. The
- * numbers below are that receipt's own; they are counts, so nothing of the prompt travels with them.
- */
-describe("the real captured ceiling turn no longer claims a reduction it did not make", () => {
-  const CAPTURED = {
-    receipt_id: "e64ff2cb-a9c8-48b0-a6e3-48e5b770a551",
-    captured_at: "2026-08-22T20:41:00.000Z",
+/** A synthetic shaping-only ceiling receipt must never masquerade as input optimization. */
+describe("a shaping-only ceiling turn does not claim an input reduction", () => {
+  const SYNTHETIC_RECEIPT = {
+    receipt_id: "11111111-1111-4111-8111-111111111111",
+    captured_at: "2026-01-02T03:04:05.000Z",
     provider: "anthropic",
     model: "claude-haiku-4-5-20251001",
     endpoint: "/v1/messages",
     mode: "apply",
     request_mutated: true,
     policy: "deterministic-dedupe",
-    estimated_input_tokens_before: 926,
-    estimated_input_tokens_after: 1032,
-    tokens: { prompt_input: 960, cached_input: 0, billed_fresh_input: 960, output: 23 },
+    estimated_input_tokens_before: 1000,
+    estimated_input_tokens_after: 1100,
+    tokens: { prompt_input: 1050, cached_input: 0, billed_fresh_input: 1050, output: 25 },
     applied_components: ["output-shaping"]
   } as unknown as GatewayReceipt;
   const SAVED = { calibrated: true, tokensSaved: 20, basis: "default-prior" as const };
 
   function lineFor(pause?: Record<string, unknown>): string {
-    const r = (pause === undefined ? CAPTURED : { ...CAPTURED, allowance_pause: pause }) as GatewayReceipt;
+    const r = (pause === undefined ? SYNTHETIC_RECEIPT : { ...SYNTHETIC_RECEIPT, allowance_pause: pause }) as GatewayReceipt;
     return communityFullApplyReceiptLine(r, SAVED, receiptCeiling(r, PLAIN_ENV)) ?? "";
   }
 
-  it("is still the captured receipt, field for field", () => {
-    // FIXTURE FIDELITY, asserted on the RECEIPT rather than on the line it renders. This used to pin the
-    // rendered defect string byte-for-byte — which was the right guard while the pause was the only fix,
-    // and became the wrong one once the input axis itself was corrected: the renderer no longer produces
-    // that string for ANY input, so pinning it would only prove the fixture had been rewritten to keep a
-    // dead assertion alive. What must not drift is the capture, so that is what is pinned.
-    expect(CAPTURED.estimated_input_tokens_before).toBe(926);
-    expect(CAPTURED.estimated_input_tokens_after).toBe(1032); // the SHAPED body — bigger, not smaller
-    expect(CAPTURED.request_mutated).toBe(true); // output shaping mutated it, which is what fooled isRealApply
-    expect(CAPTURED.applied_components).toEqual(["output-shaping"]); // and nothing compacted input
-    expect(CAPTURED.tokens?.output).toBe(23);
+  it("pins the synthetic shaping-only conditions", () => {
+    expect(SYNTHETIC_RECEIPT.estimated_input_tokens_before).toBe(1000);
+    expect(SYNTHETIC_RECEIPT.estimated_input_tokens_after).toBe(1100);
+    expect(SYNTHETIC_RECEIPT.request_mutated).toBe(true);
+    expect(SYNTHETIC_RECEIPT.applied_components).toEqual(["output-shaping"]);
+    expect(SYNTHETIC_RECEIPT.tokens.output).toBe(25);
   });
 
   it("no longer renders the fabricated reduction even with NO pause recorded", () => {
-    // THE SECOND HALF OF THE SAME DEFECT. The pause clause fixed the line for a turn the gateway KNEW it
-    // had refused. This turn is the other case — a shaping-only turn carrying no pause at all — and it
-    // rendered `input 926→1,032 (−-11%)` from the same bad inference. The axis now follows
-    // `applied_components`, so a turn that compacted nothing shows no before→after: just the plain
-    // provider-reported input count, its real output evidence, and the device's tier label.
+    // A shaping-only turn carrying no pause still has no input before→after. The axis follows
+    // `applied_components`, not request mutation alone.
     const line = lineFor();
-    expect(line).toBe(
-      "compaction · input 960 · output 43→23 (−47%, est. · default prior) · full apply · id e64ff2cb"
-    );
-    expect(line).not.toContain("926");
-    expect(line).not.toContain("1,032");
-    expect(line).not.toContain("→1,032");
+    expect(line).toBe("compaction · input 1,050 · output 25 · full apply · id 11111111");
+    expect(line).not.toContain("1,000");
+    expect(line).not.toContain("1,100");
+    expect(line).not.toContain("→1,100");
     expect(line.split(" · output ")[0]).not.toContain("−"); // no reduction glyph on the input axis
   });
 
   it("states the pause on the input axis instead of a fabricated reduction", () => {
-    const line = lineFor({ reason: "exhausted", resets_on: "2026-09-01", scope: "api-key-route" });
+    const line = lineFor({ reason: "exhausted", resets_on: PERIOD_END, scope: "all-routes" });
     expect(line).toContain("input paused");
-    expect(line).not.toContain("926");
-    expect(line).not.toContain("1,032");
-    // The reduction glyph must not appear on the input axis at all. The output axis keeps its own
-    // (−47%, est. · default prior) — that shaping really did run, and the ceiling leaves its
-    // provenance alone.
+    expect(line).not.toContain("1,000");
+    expect(line).not.toContain("1,100");
+    // The reduction glyph must not appear on the input axis at all. Nor, on this device, on the output
+    // axis: shaping really did run, but no experiment on this machine ever measured what it removed.
     expect(line.split(" · output ")[0]).not.toContain("−");
+    expect(line).not.toContain("−47%");
   });
 
   it("drops the `full apply` label on a turn whose apply was refused", () => {
-    expect(lineFor({ reason: "exhausted", scope: "api-key-route" })).not.toContain("full apply");
+    expect(lineFor({ reason: "exhausted", scope: "all-routes" })).not.toContain("full apply");
     // ...and keeps it on the identical turn WITHOUT a pause, so the label was suppressed by the pause
     // and not by some unrelated change to the builder.
     expect(lineFor()).toContain("full apply");
   });
 
   it("gives that turn the conversion path it never had", () => {
-    const line = lineFor({ reason: "exhausted", resets_on: "2026-09-01", scope: "api-key-route" });
+    const line = lineFor({ reason: "exhausted", resets_on: PERIOD_END, scope: "all-routes" });
     expect(line).toContain(UPGRADE_CTA_LABEL);
     expect(line).toContain(proUrl(PLAIN_ENV));
-    expect(line).toContain("Community limit reached");
-    // The scope stays named: this pause covers the metered API-key route, and a subscription user
-    // reading an unqualified "input optimization paused" would be reading a false statement.
-    expect(line).toContain("API-key input optimization paused until 2026-09-01");
+    expect(line).toContain(communityLimitClause(PERIOD_END));
+    // NO SCOPE, AND THE DATE ONLY INSIDE THE CLAUSE. The clause states when the limit resets and
+    // stops; the scope and the shaping are stated in sentences on the detail surfaces, and the date
+    // must not ALSO reappear in a second narrating clause beside it.
+    expect(line).not.toContain("input optimization paused");
+    expect(line).not.toContain("API-key input optimization");
+    expect(line).not.toContain(`until ${PERIOD_END}`);
+    expect(line.split(PERIOD_END).length - 1).toBe(1);
   });
 
-  it("says output shaping continues, because THIS receipt's components record that it did", () => {
-    expect(lineFor({ reason: "exhausted", scope: "all-routes" })).toContain("output shaping continues");
-    const noShaping = { ...CAPTURED, applied_components: [], allowance_pause: { reason: "exhausted" } } as unknown as GatewayReceipt;
+  it("REPLAYS a historical `api-key-route` pause without restating it as today's rule", () => {
+    // Receipts outlive the contract that wrote them. A pause persisted while metering was api-key-only
+    // said something narrower and true then. The old fix was to QUALIFY the pause sentence; the
+    // clause no longer HAS a pause sentence, so there is nothing left to misqualify — WHEN the limit
+    // resets is true under either scope, because it names no traffic at all.
+    const line = lineFor({ reason: "exhausted", resets_on: PERIOD_END, scope: "api-key-route" });
+    expect(line).toContain(communityLimitClause(PERIOD_END));
+    expect(line).toContain(COMMUNITY_LIMIT_RESETS_PREFIX);
+    expect(line).not.toContain("API-key");
+    expect(line).not.toContain("paused until");
+    // ...and the qualification survives where it is actually read.
+    const detail = upgradeNoticeLines({ reason: "exhausted", resetsOn: PERIOD_END, scope: "api-key-route", env: PLAIN_ENV }).join("\n");
+    expect(detail).toContain("Community input optimization on API-key routed turns is paused");
+    expect(detail).toContain("Subscription-routed turns are unaffected.");
+    expect(detail).toContain(`It resumes ${PERIOD_END}.`);
+  });
+
+  it("no longer narrates shaping on the line, and still says it on the detail surface", () => {
+    expect(lineFor({ reason: "exhausted", scope: "all-routes" })).not.toContain("output shaping continues");
+    const noShaping = { ...SYNTHETIC_RECEIPT, applied_components: [], allowance_pause: { reason: "exhausted" } } as unknown as GatewayReceipt;
     const line = communityFullApplyReceiptLine(noShaping, SAVED, receiptCeiling(noShaping, PLAIN_ENV)) ?? "";
     expect(line).not.toContain("output shaping continues");
     expect(line).toContain(UPGRADE_CTA_LABEL);
+    expect(upgradeNoticeLines({ reason: "exhausted", scope: "all-routes", env: PLAIN_ENV })).toContain("Output shaping remains active.");
   });
 });

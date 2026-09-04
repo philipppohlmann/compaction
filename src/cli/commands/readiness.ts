@@ -42,6 +42,7 @@ import { liveVerificationsForMatrix } from "../../core/gateway/verification-stor
 import {
   readPolicyPreferences,
   gatesAreEngineEvaluable,
+  authorizationStoreDirectory,
   DEFAULT_POLICY_PREFERENCES_DIRECTORY,
   POLICY_PREFERENCES_FILENAME
 } from "../../core/policy-preferences.js";
@@ -441,7 +442,15 @@ export async function collectReadinessReport(
     codex: { authorized: false }
   };
   try {
-    const { preferences } = await readPolicyPreferences(path.join(cwd, DEFAULT_POLICY_PREFERENCES_DIRECTORY));
+    // The DEVICE store - the same and only store the apply guard resolves, so `status` cannot report
+    // "not authorized" in a directory where routing would in fact engage, or the reverse.
+    //
+    // Resolved from the REPORT's `env`, not the ambient one. `runStatus({ env })` builds a report for an
+    // injected `COMPACTION_CONFIG_DIR`, and every other field here already honours it (the optimization
+    // mode and connected workflows are read from `env` a few lines below) - reading the authorization
+    // off `process.env` would describe two different devices in one report, and print next-step commands
+    // for the wrong one.
+    const { preferences } = await readPolicyPreferences(authorizationStoreDirectory(env));
     for (const tool of ["claude-code", "codex"] as const) {
       const match = preferences.find(
         (p) =>

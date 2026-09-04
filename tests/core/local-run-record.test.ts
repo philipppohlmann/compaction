@@ -130,7 +130,7 @@ describe("per-tool rollup - contract tiers, honest and separate per axis", () =>
         input_tokens: 400,
         output_tokens: undefined,
         input_reduction_label: "estimated",
-        notes: ["Cursor emits no provider usage; output not safely separable from this invocation."]
+        notes: ["Compaction does not ingest Cursor's conditional result.usage; output not safely separable from this invocation."]
       })
     ]);
 

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ACTIVE_USAGE_METER_VERSION } from "../../src/core/usage/usage-event.js";
 import { createServer, request, type RequestOptions, type Server } from "node:http";
 import https from "node:https";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -37,8 +38,9 @@ vi.mock("../../src/core/gateway/engine-ipc/engine-apply-seam.js", () => ({
       mutatedRequestBody: JSON.stringify({ model: "claude-x", messages: [{ role: "user", content: "compacted" }] }),
       recoveryRequired: true as const,
       appliedComponents: ["deterministic-compaction"],
-      meterVersion: "optimized-input-v1",
+      meterVersion: ACTIVE_USAGE_METER_VERSION,
       meteredOptimizedInputTokens: PER_APPLY_TOKENS,
+      estimatedInputTokensBefore: PER_APPLY_TOKENS + 10,
       estimatedInputTokensAfter: 10,
       receiptArtifacts: {
         deterministic_plan: {
@@ -68,6 +70,10 @@ const { savePolicyPreference, AUTO_APPLY_ELIGIBILITY_GATES } = await import("../
 const { provisionValidLease } = await import("../helpers/lease-fixture.js");
 const { GATEWAY_RECOVERY_DIR } = await import("../../src/core/gateway/recovery.js");
 const { readUsageJournal, usageJournalLockPath } = await import("../../src/core/usage/usage-journal.js");
+// The ONE accessor for a journal entry's recovery id. Read through it rather than off a field
+// name: the id is named `recovery_id` from schema v2 and `receipt_id` on frozen v1 entries, and a
+// direct read of the wrong key yields `undefined` instead of failing to compile.
+const { recoveryIdOf } = await import("../../src/core/usage/usage-event.js");
 
 const BIG = "Z".repeat(700);
 const UPSTREAM_REPLY = JSON.stringify({ id: "msg_fake", usage: { input_tokens: 60, output_tokens: 4 } });
@@ -167,7 +173,7 @@ describe("a declined apply leaves no retained original behind", () => {
         preference: "auto-when-gates-pass",
         gates_required: [...AUTO_APPLY_ELIGIBILITY_GATES]
       },
-      join(cwd, ".compaction")
+      leaseDir // the DEVICE store, the only one the gateway reads
     );
     return { port: await listen(gateway), cwd, seen, logs, env };
   }
@@ -181,18 +187,29 @@ describe("a declined apply leaves no retained original behind", () => {
     const { entries } = await readUsageJournal(ctx.env);
     expect(entries).toHaveLength(1);
     expect(ctx.logs.join("\n")).toContain("allowance-ceiling-exceeded");
-    expect(ctx.seen.filter((body) => body === DEDUPABLE)).toHaveLength(3); // the other three forwarded the original
+    // …and the other three forwarded their INPUT untouched. They are not bare originals: losing the
+    // under-lock ceiling costs the INPUT plan, not output shaping, so each one is still shaped.
+    const others = ctx.seen.filter(
+      (body) => JSON.stringify(JSON.parse(body).messages) === JSON.stringify(JSON.parse(DEDUPABLE).messages)
+    );
+    expect(others).toHaveLength(3);
 
-    // …and exactly one retained original remains: the committed one. The three declined applies
-    // each retained an original before losing the under-lock ceiling re-check; none of those files
-    // survives, so no original request body is left that nothing references.
+    // FOUR retained originals remain and every one of them is REFERENCED — one per applied turn. What
+    // must not survive is the record each ceiling-declined apply retained for the input plan it then
+    // lost: those three are discarded, and the shaping-only turn that replaced each of them retains
+    // its own under the policy it actually applied. Seven files here would mean an orphan per decline.
     const remaining = recoveryIds(ctx.cwd);
-    expect(remaining).toHaveLength(1);
-    expect(remaining[0]).toBe(entries[0].receipt_id);
+    expect(remaining).toHaveLength(4);
+    expect(remaining).toContain(recoveryIdOf(entries[0]).recoveryId);
 
-    // The survivor is genuinely the retained original (recovery still works for the applied request).
-    const record = JSON.parse(readFileSync(join(ctx.cwd, GATEWAY_RECOVERY_DIR, `${remaining[0]}.json`), "utf8"));
-    expect(record.original_body).toBe(DEDUPABLE);
+    // Every survivor is genuinely the byte-exact original, and the policy each one names is the policy
+    // that ran on its turn — one input apply, three shaping-only.
+    const records = remaining.map((id) =>
+      JSON.parse(readFileSync(join(ctx.cwd, GATEWAY_RECOVERY_DIR, `${id}.json`), "utf8"))
+    );
+    records.forEach((record) => expect(record.original_body).toBe(DEDUPABLE));
+    expect(records.filter((r) => r.policy === "deterministic-dedupe")).toHaveLength(1);
+    expect(records.filter((r) => r.policy === "open-basic-output-apply")).toHaveLength(3);
   });
 
   it("leaves nothing behind when a SINGLE apply is declined without contention (journal lock unavailable)", async () => {
@@ -219,7 +236,12 @@ describe("a declined apply leaves no retained original behind", () => {
     const { entries } = await readUsageJournal(ctx.env);
     expect(entries).toHaveLength(1);
     const remaining = recoveryIds(ctx.cwd);
-    expect(remaining).toEqual([entries[0].receipt_id]);
+    const { recoveryId, provenance } = recoveryIdOf(entries[0]);
+    expect(remaining).toEqual([recoveryId]);
+    // The debit names that record under the CURRENT key. A regression that wrote the legacy key
+    // would still resolve through the accessor above, so it is pinned here on the real end-to-end
+    // write rather than inferred from the unit-level serializer test.
+    expect(provenance).toBe("recovery-id-field");
     const record = JSON.parse(readFileSync(join(ctx.cwd, GATEWAY_RECOVERY_DIR, `${remaining[0]}.json`), "utf8"));
     expect(record.original_body).toBe(DEDUPABLE);
   });

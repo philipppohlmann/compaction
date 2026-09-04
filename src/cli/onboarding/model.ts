@@ -561,7 +561,7 @@ export interface ReadyRoutingCapability {
   liveVerified: boolean;
   /** True when the workflow only records session ACTIVITY (no gateway routing) - honest limited state. */
   activityOnly: boolean;
-  /** True when only a LOCAL ESTIMATE is possible (provider emits no usage; vendor gap) - e.g. Cursor. */
+  /** True when the current Compaction integration can produce only a LOCAL ESTIMATE - e.g. Cursor. */
   localEstimateOnly: boolean;
   /** The concrete honest reason (from the matrix) that cache proof is unavailable - shown for non-routable rows. */
   unavailableReason?: string;
@@ -1168,8 +1168,8 @@ export const FOOTER_LINES = [
  *  - All three tools get OUTPUT-SHAPING (shorter responses) on a plan/subscription - no API key.
  *  - FULL optimization = output-shaping PLUS input compaction; the input side needs an API key /
  *    the Gateway route (an apply-capable provider). Off by default; approval-gated.
- *  - Cursor is session-level output-shaping + a LOCAL ESTIMATE only (vendor emits no usage); input
- *    savings need an API key and are not measured on Cursor.
+ *  - Cursor is session-level output-shaping + a LOCAL ESTIMATE only (Compaction does not ingest its
+ *    conditional `result.usage`); input savings need an API key and are not measured on Cursor.
  *  - A subscription buys output-shaping + headroom (more useful work per plan window), NEVER a
  *    dollar-savings claim.
  * ============================================================================================== */

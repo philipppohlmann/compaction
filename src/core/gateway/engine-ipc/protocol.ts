@@ -38,6 +38,8 @@ export type EngineIpcOperation = "plan_and_apply" | "dry_run" | "ping";
 
 /** Terminal result classes an engine response may carry (includes explicit refusal states). */
 export type EngineIpcResult = "applied" | "refused" | "noop" | "error";
+export type EngineIpcOutputShapingState = "attached-this-pass" | "already-active" | "absent";
+export type EngineIpcOutputShapingRegime = "default-shapeable";
 
 /**
  * Opaque authorization descriptor. Content-free: a policy id and a scope hash only. The engine
@@ -158,6 +160,19 @@ export interface EngineIpcReceiptArtifacts {
   optimization_plan: unknown;
   /** Applied-component labels, in fixed order (lcm → deterministic → output-shaping). */
   applied_components: string[];
+  /**
+   * Output-shaping provenance for the FINAL forwarded request (`attached-this-pass` | `already-active` |
+   * `absent`). See `GatewayReceipt.output_shaping_state`. OPTIONAL AND ADDITIVE — an older engine omits
+   * it and the caller reads `undefined` (no claim made), so `protocol_version` stays `1`, exactly as
+   * `quota_degraded` does.
+   */
+  output_shaping_state?: EngineIpcOutputShapingState;
+  /** Exact identity of the policy bytes proven active on the final request. */
+  output_shaping_policy_version?: string;
+  /** Fixed regime only when the engine's task-aware gate positively classified the treatment. */
+  output_shaping_regime?: EngineIpcOutputShapingRegime;
+  /** Fixed-vocabulary LCM outcome (`{kind, reason}`); optional and additive, so `protocol_version` stays `1`. */
+  lcm_outcome?: { kind: string; reason: string };
   /** Local-estimate model-visible input tokens over every changed component (counts only). */
   composed_input_estimate: { before: number; after: number };
   /** True when the LCM hybrid candidate contributed (selects the LCM policy receipt label). */
@@ -179,11 +194,24 @@ export interface EngineIpcResponse {
   result: EngineIpcResult;
   /** Transport-only replacement body; present only when `result === "applied"`. */
   mutated_request_body?: string;
-  /** Frozen meter version label when a metered optimization occurred (e.g. "optimized-input-v1"). */
+  /**
+   * THE UNIT `metered_optimized_input_tokens` IS DENOMINATED IN, declared by the engine that computed
+   * it (e.g. "optimized-input-v2"). Every engine at or past the v2 meter sets it on an `applied`
+   * response.
+   *
+   * OPTIONAL IN THE TYPE, REQUIRED IN PRACTICE — and its ABSENCE is meaningful rather than benign.
+   * The engine is installed separately and versioned on its own cadence, so a pre-v2 engine reports a
+   * throughput count here with no label; the two bases differ by ~19x on measured data. The caller
+   * therefore refuses an undeclared quantity (`USAGE_METER_VERSION_UNDECLARED`) and fail-closes
+   * rather than adopting its own active unit. `protocol_version` stays `1`: an older engine's frames
+   * still decode, they simply cannot be metered.
+   */
   meter_version?: string;
-  /** Pre-mutation model-visible input tokens metered (counts only). */
+  /** The metered count, in `meter_version` (counts only). */
   metered_optimized_input_tokens?: number;
-  /** Local estimate of model-visible input tokens after the mutation (counts only). */
+  /** Local estimate of model-visible input before input optimization (counts only). */
+  estimated_input_tokens_before?: number;
+  /** Local estimate after input optimization and before output shaping (counts only). */
   estimated_input_tokens_after?: number;
   /** Content-free labels of the components the engine applied (e.g. ["input-compaction"]). */
   applied_components: string[];
@@ -193,6 +221,22 @@ export interface EngineIpcResponse {
   failure_reason?: string;
   /** Content-free receipt artifacts for the public receipt/activity record; present on `applied`. */
   receipt_artifacts?: EngineIpcReceiptArtifacts;
+  /**
+   * WHY LCM DID OR DID NOT CONTRIBUTE, on a `noop` the pipeline produced (no safe change). An
+   * `applied` result carries the same fact inside `receipt_artifacts.lcm_outcome`, beside the other
+   * receipt facts; a no-op has no artifacts, and without this field the receipt would be silent on
+   * exactly the did-not-contribute turns the outcome exists to explain. Fixed vocabulary (`lcm-outcome.ts`),
+   * never free text. OPTIONAL AND ADDITIVE: an older engine omits it and the caller reads `undefined`
+   * (unknown, no claim), so `protocol_version` stays `1`.
+   */
+  lcm_outcome?: { kind: string; reason: string };
+  /**
+   * Output-shaping provenance for the unchanged body on a pipeline-produced `noop`. Optional and
+   * additive: ping/dry-run, failures, and older engines omit it, which means unknown.
+   */
+  output_shaping_state?: EngineIpcOutputShapingState;
+  /** Exact policy identity paired with a no-op's already-active provenance, when known. */
+  output_shaping_policy_version?: string;
   /**
    * THE ENGINE'S OWN CEILING FIRED: this `applied` result is the output-shaping-only DEGRADATION of a
    * request whose pre-mutation metered input exceeded the caller's declared remainder — not a turn
@@ -313,6 +357,11 @@ export function isEngineIpcResponse(value: unknown): value is EngineIpcResponse 
     typeof v.request_id === "string" &&
     (v.result === "applied" || v.result === "refused" || v.result === "noop" || v.result === "error") &&
     Array.isArray(v.applied_components) &&
-    typeof v.recovery_required === "boolean"
+    typeof v.recovery_required === "boolean" &&
+    (v.output_shaping_state === undefined ||
+      (v.result === "noop" &&
+        (v.output_shaping_state === "attached-this-pass" ||
+          v.output_shaping_state === "already-active" ||
+          v.output_shaping_state === "absent")))
   );
 }

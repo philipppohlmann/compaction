@@ -7,22 +7,20 @@
  *  1. `<cwd>/.compaction/gateway/receipts.jsonl` - anything routed through the local Gateway
  *     (Claude Code AND Codex). The Claude Code status line cannot do this (it is Claude Code-only) and
  *     the Codex interactive TUI cannot show it inline (upstream gap).
- *  2. `<cwd>/.compaction/activity/activity.jsonl` - shim-captured CURSOR runs, rendered at their own
- *     honest tier. This half was missing, and its absence made the command's own promise false for one
- *     supported workflow: Cursor's shim is `kind: "capture"`, its turns only ever reach the ACTIVITY
- *     store, and no Cursor turn has ever produced a gateway receipt. A Cursor user who followed the
- *     setup flow to `compaction watch` watched an empty feed forever.
+ *  2. `<cwd>/.compaction/activity/activity.jsonl` - settled interactive Codex Stop turns, exact
+ *     Gateway-backed Claude Stop aggregates, positively reconciled hook-only Claude task-notification
+ *     continuations, and shim-captured Cursor runs, rendered at their own honest tier.
  *
- * The two are rendered by their own formatters and MERGED. Cursor's counts stay local-estimate
- * (chars/4; the vendor reports no usage) - `watch` never relabels one as provider-reported, and never
- * prints a zero for an axis that was simply not reported.
+ * The two are rendered by their own formatters and MERGED. Cursor's current capture records a
+ * local estimate (chars/4); `watch` never upgrades it to provider-reported and never prints a zero
+ * for an axis that was not consumed by the current parser.
  *
  * WHAT DOES NOT APPEAR, and why the headers say so. Only the MEASURABLE forms are recorded: a
- * Gateway-routed run, or a shim-captured batch invocation (`codex exec --json`, `cursor-agent …
- * --output-format json`). An interactive `codex` session and a Cursor IDE session pass through
- * untouched, so they produce neither a receipt nor an activity record and cannot show up here.
- * Codex's ACTIVITY records are deliberately not read (see `WATCH_ACTIVITY_SURFACES`): a routed Codex
- * run inherits PATH, hits the capture shim, and would otherwise print twice - once per store.
+ * Gateway-routed run, an interactive Codex turn settled by its Stop hook, a positively reconciled
+ * hook-only Claude task-notification continuation, or a shim-captured batch invocation
+ * (`codex exec --json`, `cursor-agent … --output-format json`). A Cursor IDE session still
+ * produces neither a receipt nor an activity record. Legacy Codex shim events remain excluded; the
+ * exact Codex Stop event suppresses gateway micro-call duplicates by session hash + run interval.
  *
  * `--once` is the SNAPSHOT mode: print the last N receipt lines (default 10) and EXIT instead of
  * following. This is the "show me the last few receipts" a plain `watch --all | tail` cannot give
@@ -50,13 +48,19 @@ import {
   receiptCeiling,
   receiptLineFromGatewayReceipt,
   openLineForTurn,
+  outputShapingActiveForTurn,
+  isRealApply,
   communityFullApplyReceiptLine,
   type OpenLineRendering
 } from "../../core/gateway/receipt-line.js";
 import { allowancePauseIsCurrent } from "../../core/entitlement/lease-store.js";
 import {
   activityTurnLinesFromJsonl,
+  codexStopRunWindowsFromJsonl,
+  gatewayReceiptCoveredByCodexStop,
+  settledStopRunWindowsFromJsonl,
   mergeTurnLines,
+  type CodexStopRunWindow,
   type OrderedTurnLine
 } from "../../core/activity-receipt-line.js";
 import { ACTIVITY_LOG_FILENAME, DEFAULT_ACTIVITY_DIRECTORY } from "../../core/activity-store.js";
@@ -64,10 +68,13 @@ import { resolveOpenTier, type ProductMode, type AllowancePauseScope } from "../
 import type { AllowancePauseReason } from "../../core/upgrade-cta.js";
 import {
   estimatePerTurnOutputSaved,
-  loadCalibrationReduction,
-  type PerTurnReduction
+  loadOutputCalibrationResolver,
+  type OutputCalibrationResolver
 } from "../../core/output-shaping-savings.js";
+import { outputCalibrationQuery } from "../../core/output-shaping-calibration-store.js";
 import { lastTurnWasShaped } from "../../core/output-shaping-turn-state.js";
+import type { ShapingTurnScope } from "../../core/output-shaping-turn-state.js";
+import { codexUserRunForReceipt } from "../../core/gateway/run-boundary.js";
 
 /**
  * What `watch` needs to render the SAME line the status line renders: the product tier and the
@@ -85,8 +92,8 @@ import { lastTurnWasShaped } from "../../core/output-shaping-turn-state.js";
 async function watchRenderContext(env: NodeJS.ProcessEnv): Promise<WatchRenderContext> {
   try {
     const { tier } = await resolveOpenTier(env);
-    const reduction = await loadCalibrationReduction(env);
-    return { productTier: tier, reduction, env };
+    const calibrationResolver = await loadOutputCalibrationResolver(env);
+    return { productTier: tier, calibrationResolver, env };
   } catch {
     return { env };
   }
@@ -118,7 +125,7 @@ export interface WatchRenderContext {
    */
   productTier?: ProductMode;
   /** The calibrated reduction RATE. The per-turn count is derived from each receipt's own output. */
-  reduction?: PerTurnReduction;
+  calibrationResolver?: OutputCalibrationResolver;
   /**
    * Whether THIS batch of receipts may carry the estimated-output arrow.
    *
@@ -145,17 +152,90 @@ export function receiptLinesFromJsonl(rawChunk: string, context?: WatchRenderCon
  * merged feed can sort by real time. An unparseable `captured_at` yields no timestamp rather than a
  * substitute — a receipt whose clock we cannot read is undated, not "now".
  */
-export function receiptTurnLinesFromJsonl(rawChunk: string, context?: WatchRenderContext): OrderedTurnLine[] {
+export function receiptTurnLinesFromJsonl(
+  rawChunk: string,
+  context?: WatchRenderContext,
+  codexStopWindows: readonly CodexStopRunWindow[] = [],
+  codexRunEnv?: NodeJS.ProcessEnv
+): OrderedTurnLine[] {
   const out: OrderedTurnLine[] = [];
   for (const line of rawChunk.split("\n")) {
     const receipt = parseReceiptLine(line);
     if (!receipt) continue;
+    if (gatewayReceiptCoveredByCodexStop(receipt, codexStopWindows)) continue;
+    // A workflow=codex request is positively identifiable before Stop because UserPromptSubmit wrote
+    // a bounded run record carrying the hashed turn identity and the Gateway receipt carries the exact
+    // hashed session identity. Withhold that micro-call rather than emit a result that cannot later be
+    // retracted; the codex-stop activity event is the one authoritative final line. No timer/buffer or
+    // guessed workflow is involved. Claude runs have no turn hash and uncorrelated receipts have no
+    // run, so every other workflow keeps its existing live behavior. If Stop never settles, silence is
+    // the fail-closed outcome and the receipt remains durable in its ledger.
+    if (codexRunEnv && codexUserRunForReceipt(receipt, codexRunEnv)) continue;
     // The saving is per TURN (rate × THAT turn's output), so the RATE is injected and the count derived
     // per receipt — one precomputed count would attribute a single turn's saving to every line.
+    //
+    // THE RECEIPT IS ASKED FIRST, exactly as the LABEL beneath already asks it. This gate used to read
+    // `context.shapedEvidence` ALONE, which is a LIVE session signal (`lastTurnWasShaped`) that the two
+    // replay callers — `watch --once` and `status`'s "Last turns", both of which build their context in
+    // `watchRenderContext` — never set. The arrow was therefore unreachable on those two surfaces for
+    // every turn, at every tier: a real full apply that the gateway's own inline line rendered as
+    // `output 617→327 (−47%, est.)` came back as a bare `output 327` the moment the same receipt was
+    // replayed. One receipt, two descriptions, and the weaker one came from the surface a user is most
+    // likely to check. (The capture that surfaced this carried the shipped default prior, which now
+    // renders no figure on either surface — the DISAGREEMENT is what this gate is about, and it would
+    // read the same way on a device that has measured.)
+    //
+    // THE EVIDENCE IS `output_shaping_state`, NOT `applied_components`. #941 gated on the component set,
+    // which was the right correction to `isRealApply` (that answers "did we mutate") but still the wrong
+    // predicate: `applied_components` records what THIS APPLY PASS MUTATED, and the tool's own
+    // `UserPromptSubmit` hook attaches the same policy upstream. The planner then correctly attaches
+    // nothing, correctly omits `output-shaping` — and the model still reads the policy at instruction
+    // level. Measured: all five 0.6.7 Founder Journey LCM turns and 261/261 replayable captures are in
+    // exactly that state, so the arrow was withheld on the ordinary LCM turn.
+    //
+    // `already-active` and `attached-this-pass` both mean ACTIVE ON THE FINAL MODEL-VISIBLE REQUEST,
+    // which is the only thing that licenses an output saving. `absent` and a MISSING field do not:
+    // the final request is not retained anywhere, so a legacy receipt cannot be classified after the
+    // fact and must fail closed rather than borrow a guess.
+    //
+    // DO NOT REINTRODUCE `isRealApply` HERE. It answers "did we mutate", not "did we shape output" --
+    // its own doc says so -- and the engine composes a real apply from EITHER layer
+    // (`shapedChanged = deterministicPlan.changed || outputShapingPlan?.changed`). An input-only apply
+    // (`applied_components: ["lcm-compaction"]`, no output-shaping) is therefore a real apply on which
+    // output shaping never ran, and gating on `isRealApply` drew a reconstructed
+    // `output 617→327 (−47%, est.)` over it -- a counterfactual for a saving that did
+    // not happen. That is not a hypothetical shape: every `lcm-compaction` turn in the 0.6.7 founder
+    // journey has exactly that receipt, because the tool's own `UserPromptSubmit` hook attached the
+    // policy upstream: the planner correctly attached nothing, so `applied_components` names only
+    // `lcm-compaction` even though the request reached the model carrying the shaping policy at
+    // instruction level. The component set therefore cannot separate a genuinely unshaped turn from a
+    // hook-shaped one -- only the recorded `output_shaping_state` can.
+    //
+    // `shapedEvidence` remains the fallback for a LIVE turn whose receipt records NO state; it is
+    // still never set for a historical batch, so a replayed receipt cannot borrow today's session
+    // state. AND IT IS ONLY A FALLBACK: a live drain coalesces every receipt appended since the last
+    // poll and hands all of them the latest turn's `lastTurnWasShaped`, so an earlier receipt that
+    // explicitly says `absent` must not inherit `true` from a later shaped turn and draw an arrow
+    // over a saving that did not occur. `outputShapingActiveForTurn` holds that precedence for the
+    // arrow and the label alike. The estimate itself comes only from an exact shared calibration
+    // match; there is no generic-rate fallback.
+    const shapedTurn = outputShapingActiveForTurn(receipt, context?.shapedEvidence === true);
+    const query = outputCalibrationQuery({
+      policyVersion: receipt.output_shaping_policy_version,
+      provider: receipt.provider,
+      model: receipt.model,
+      regime: receipt.output_shaping_regime
+    });
+    // Proven shaping owns the counterfactual axis even when exact applicability metadata or the
+    // resolver is unavailable. In that case the before and percentage are explicitly N/A; dropping to
+    // the plain count would make the same shaped receipt indistinguishable from an unshaped one and
+    // disagree with the gateway/statusline renderers. Only a turn not proven shaped stays plain.
     const estimatedSaved =
-      context?.shapedEvidence === true && context.reduction
-        ? estimatePerTurnOutputSaved(context.reduction, receipt.tokens?.output)
-        : undefined;
+      shapedTurn && context?.calibrationResolver && query
+        ? estimatePerTurnOutputSaved(context.calibrationResolver(query), receipt.tokens?.output)
+        : shapedTurn
+          ? { calibrated: false, state: "unseeded" as const }
+          : undefined;
 
     // THE LABEL DESCRIBES THE TURN, NOT TODAY'S SETTING. It used to be the device's CURRENT product
     // mode, so flipping `compaction mode` retroactively relabelled turns that were never produced
@@ -169,8 +249,11 @@ export function receiptTurnLinesFromJsonl(rawChunk: string, context?: WatchRende
     // `openLineForTurn` holds that rule for every surface, so it cannot drift between them.
     const openLine: OpenLineRendering = openLineForTurn(receipt, context?.shapedEvidence === true);
 
-    // Same builder choice the status line makes: a REAL full-apply receipt renders `full apply`; any
-    // non-apply turn on a full-tier device falls back to the honest Open line.
+    // Builder choice is separate from output-estimate eligibility. A REAL apply on a full-tier device
+    // takes the Community builder; a REAL public explicit apply takes the generic apply builder so its
+    // measured input before→after survives without acquiring a `full apply` label. Non-apply turns use
+    // the honest Open line. `isRealApply` decides only this dispatch — `shapedTurn` above remains the
+    // sole gate for an output counterfactual.
     // THE CEILING RIDES THE LINE HERE, unlike the session-state notice in the header above — and the
     // distinction is the whole reason both exist. The header states TODAY's allowance state, which is
     // false about a turn recorded before the allowance ran out. This ceiling is read off THE RECEIPT:
@@ -181,8 +264,10 @@ export function receiptTurnLinesFromJsonl(rawChunk: string, context?: WatchRende
     const rendered =
       context?.productTier === "full"
         ? (communityFullApplyReceiptLine(receipt, estimatedSaved, ceiling) ??
-          receiptLineFromGatewayReceipt(receipt, openLine, undefined, undefined, estimatedSaved, ceiling))
-        : receiptLineFromGatewayReceipt(receipt, openLine, undefined, undefined, estimatedSaved, ceiling);
+          receiptLineFromGatewayReceipt(receipt, openLine, undefined, estimatedSaved, ceiling))
+        : isRealApply(receipt)
+          ? receiptLineFromGatewayReceipt(receipt, undefined, undefined, estimatedSaved, ceiling)
+          : receiptLineFromGatewayReceipt(receipt, openLine, undefined, estimatedSaved, ceiling);
     if (rendered) {
       const at = Date.parse(receipt.captured_at ?? "");
       out.push({ line: rendered, ...(Number.isFinite(at) ? { recordedAt: at } : {}) });
@@ -214,18 +299,17 @@ async function ceilingNoticeLines(env: NodeJS.ProcessEnv, cwd: string): Promise<
  * needs to know their counts are a local estimate BEFORE reading a number.
  */
 export const WATCH_SOURCES_LINE =
-  "Live per-turn lines from the local Gateway (Claude Code, Codex - anything routed through it) AND your local activity records (Cursor runs captured by the shim: `cursor-agent … --output-format json`).";
+  "Live per-turn lines from the local Gateway, settled Codex Stop turns, exact Gateway-backed Claude Stop aggregates, positively reconciled hook-only Claude task-notification continuations, AND local activity records (Cursor runs captured by the shim: `cursor-agent … --output-format json`).";
 export const WATCH_TIER_LINE =
-  "Counts print at the tier they were recorded at: Cursor is local-estimate only (the vendor reports no usage), never provider-reported.";
+  "Counts print at the tier they were recorded at: Cursor is local-estimate only because Compaction's current Cursor parser does not consume the vendor's per-turn usage; watch never upgrades it to provider-reported.";
 /**
  * WHAT THIS FEED CANNOT SHOW, said in the header rather than discovered by watching an empty screen.
- * Only the measurable forms are recorded: a Gateway-routed run, or a shim-captured batch invocation
- * (`core/tool-shim.ts`). An interactive `codex` session and a Cursor IDE session pass through
- * untouched and write neither a receipt nor an activity record - the connect block says exactly this
- * eight lines above, and this surface must not contradict it.
+ * Only the measurable forms are recorded: a Codex Stop, an exact Gateway-backed Claude Stop, a
+ * positively reconciled hook-only Claude task-notification continuation, a Gateway-routed run, or a
+ * shim-captured batch invocation (`core/tool-shim.ts`). A Cursor IDE session writes no activity record.
  */
 export const WATCH_SCOPE_LINE =
-  "Interactive sessions are not measured and do not appear here: a turn shows up when it is routed through the Gateway, or captured as `codex exec --json` / `cursor-agent … --output-format json`.";
+  "Codex turns settle after Stop. Claude Code settles exact Gateway-backed runs and positively reconciled hook-only task-notification continuations; other turns appear when routed through the Gateway, or captured as `codex exec --json` / `cursor-agent … --output-format json`. Cursor IDE sessions are not measured.";
 
 /** The content-free header printed once at the top of a `watch` session. */
 export async function watchHeaderLines(
@@ -264,9 +348,15 @@ export async function lastReceiptLines(
   // MERGE-SORTED, never concatenated: the tail slice below picks the NEWEST lines, so the two stores
   // have to be in one time order first (see `mergeTurnLines` for the rule and why an undated record
   // may not take the newest slot).
+  const activityRaw = await readFileOrEmpty(activityLogFile(cwd));
   const rendered = mergeTurnLines(
-    receiptTurnLinesFromJsonl(await readFileOrEmpty(gatewayReceiptsFile(cwd)), await watchRenderContext(env)),
-    activityTurnLinesFromJsonl(await readFileOrEmpty(activityLogFile(cwd)))
+    receiptTurnLinesFromJsonl(
+      await readFileOrEmpty(gatewayReceiptsFile(cwd)),
+      await watchRenderContext(env),
+      settledStopRunWindowsFromJsonl(activityRaw),
+      env
+    ),
+    activityTurnLinesFromJsonl(activityRaw)
   );
   const n = Number.isFinite(count) && count > 0 ? Math.trunc(count) : 1;
   return { lines: rendered.slice(-n), killSwitch: false };
@@ -277,8 +367,8 @@ export async function lastReceiptLines(
  * unimpeded (or there are no turns).
  *
  * WHY THE RECEIPT AND NOT THE JOURNAL. `insufficient` is not a property of the period — it is a
- * property of ONE turn measured against what was left ("40,000 remaining, this turn needs 75,777").
- * A period-level surface reading only the journal sees `remaining: 40,000` and reports a healthy
+ * property of ONE turn measured against what was left. A period-level surface reading only the
+ * journal sees a positive remainder and reports a healthy
  * allowance, which is how `compaction usage` came to show a comfortable number to a user whose every
  * turn was being paused. The receipt is where that turn recorded what happened to it, so it is the
  * only honest source, and it stays honest on replay.
@@ -348,7 +438,7 @@ async function readTailOrEmpty(file: string): Promise<string> {
  *     it is a statement about the PERIOD, true of the next turn as much as the last one.
  *  2. the newest turn's recorded pause — the only source that can express `insufficient`, because
  *     `insufficient` is not a property of the period at all but of one turn measured against what was
- *     left ("40,000 remaining, this turn needed 75,777"). Source (1) reads that same period as healthy.
+ *     left. Source (1) reads that same period as healthy.
  *
  * Without (2) these surfaces were silent for every user whose allowance was merely too small rather
  * than gone — measured: a `watch` header and a `status` block that said nothing at all while every
@@ -395,6 +485,14 @@ export interface WatchDeps {
   print?: (line: string) => void;
   /** Poll interval for the fallback loop (ms). */
   pollMs?: number;
+  /**
+   * WHOSE turn `watch` should read shaping evidence for. There is no default and no fallback: `watch` is
+   * a side pane, not a hook, so it is handed no tool session identifier and cannot name the turn on
+   * screen. Left undefined it fails closed — receipt lines render without the output arrow rather than
+   * borrowing whichever session happened to record last. Injectable so a caller that DOES know the
+   * session (and the tests that exercise this loop) can supply it.
+   */
+  shapingScope?: ShapingTurnScope;
 }
 
 interface WatchOptions {
@@ -468,16 +566,28 @@ export async function runWatchOnce(options: WatchOptions, deps: WatchDeps = {}):
   // BOTH stores. The activity half is what makes this command true for Cursor (and for a captured
   // Codex run): those turns never produce a gateway receipt, so a gateway-only snapshot is empty for
   // them no matter how many turns the user has run.
+  const activityRaw = await readFileOrEmpty(activityLogFile(cwd));
+  // `--all` is the explicit physical diagnostic replay: retain its existing micro-receipt view.
+  // The ordinary snapshot is the product surface and uses the exact settled Claude/Codex windows.
+  const settledWindows = options.all === true
+    ? codexStopRunWindowsFromJsonl(activityRaw)
+    : settledStopRunWindowsFromJsonl(activityRaw);
   const rendered = mergeTurnLines(
-    receiptTurnLinesFromJsonl(await readFileOrEmpty(gatewayReceiptsFile(cwd)), await watchRenderContext(env)),
-    activityTurnLinesFromJsonl(await readFileOrEmpty(activityLogFile(cwd)))
+    receiptTurnLinesFromJsonl(
+      await readFileOrEmpty(gatewayReceiptsFile(cwd)),
+      await watchRenderContext(env),
+      settledWindows,
+      env
+    ),
+    activityTurnLinesFromJsonl(activityRaw, { coalesceClaude: options.all !== true })
   );
   if (rendered.length === 0) {
     print(
       chalk.gray(
-        "No turns recorded yet - a turn appears here when it is routed through the Gateway " +
-          "(`compaction gateway run -- <your-command>`) or captured in a measurable form " +
-          "(`codex exec --json`, `cursor-agent … --output-format json`). Interactive sessions are not measured."
+        "No turns recorded yet - a turn appears here after a Codex Stop, an exact Gateway-backed Claude Stop, " +
+          "or a positively reconciled hook-only Claude task-notification continuation; when routed " +
+          "through the Gateway (`compaction gateway run -- <your-command>`), or when captured as " +
+          "`cursor-agent … --output-format json`."
       )
     );
     return;
@@ -531,6 +641,7 @@ export async function runWatch(signal: AbortSignal, options: WatchOptions, deps:
   };
   let gatewayOffset = await startOffset(gatewayFile);
   let activityOffset = await startOffset(activityFile);
+  let codexStopWindows = settledStopRunWindowsFromJsonl(await readTailOrEmpty(activityFile));
 
   // The RATE is loaded once: it changes only when `compaction savings` runs, so re-reading it per drain
   // would be file IO in the tail loop for a constant. The per-turn EVIDENCE is NOT loaded once — it is
@@ -553,20 +664,26 @@ export async function runWatch(signal: AbortSignal, options: WatchOptions, deps:
       gatewayOffset = gateway.nextOffset;
       const activity = await readFrom(activityFile, activityOffset);
       activityOffset = activity.nextOffset;
+      for (const window of settledStopRunWindowsFromJsonl(activity.text)) {
+        if (!codexStopWindows.some(
+          (known) => known.sessionCorrelationId === window.sessionCorrelationId &&
+            known.startedAt === window.startedAt && known.endedAt === window.endedAt
+        )) codexStopWindows.push(window);
+      }
       // Fresh evidence for THIS batch — these receipts are the turns that just happened. Except the
       // initial `--all` replay, which is history and gets none.
       const isHistoricalReplay = replayPending;
       replayPending = false;
       const context: WatchRenderContext = {
         ...base,
-        shapedEvidence: isHistoricalReplay ? false : await lastTurnWasShaped(env)
+        shapedEvidence: isHistoricalReplay ? false : await lastTurnWasShaped(deps.shapingScope, env)
       };
       // Merged by the SAME rule as the snapshot path, so a drain that picks up both stores prints one
       // time-ordered batch rather than "all receipts, then all activity". The activity renderer takes
       // NO shaped-evidence context: those lines carry recorded counts at their recorded tier and
       // nothing derived from the current turn's state.
       for (const rendered of mergeTurnLines(
-        receiptTurnLinesFromJsonl(gateway.text, context),
+        receiptTurnLinesFromJsonl(gateway.text, context, codexStopWindows, env),
         activityTurnLinesFromJsonl(activity.text)
       )) {
         print(rendered);
@@ -584,7 +701,12 @@ export async function runWatch(signal: AbortSignal, options: WatchOptions, deps:
   const watchers: FSWatcher[] = [];
   for (const dir of new Set([path.dirname(gatewayFile), path.dirname(activityFile)])) {
     try {
-      watchers.push(watch(dir, { persistent: false }, () => void drain()));
+      const watcher = watch(dir, { persistent: false }, () => void drain());
+      // Exhausted or unavailable native watcher resources are non-fatal: the polling loop below is
+      // already the authoritative fallback. Handle an asynchronous watcher failure as deliberately as
+      // the synchronous `watch()` throw so it cannot escape as an uncaught process error.
+      watcher.on("error", () => watcher.close());
+      watchers.push(watcher);
     } catch {
       /* directory may not exist yet - polling covers it */
     }
@@ -609,9 +731,9 @@ export function registerWatchCommand(program: Command): void {
     .command("watch")
     .description(
       "Live per-turn feed: tails the local Gateway receipts AND your local activity records, printing each " +
-        "new content-free line as it lands (Claude Code and Codex via the Gateway; shim-captured Cursor runs " +
-        "from the activity store, at their own recorded tier). Interactive sessions are not measured and do " +
-        "not appear. Ctrl-C to stop, or use --once for a snapshot of the last few turns. Content-free, " +
+        "new content-free line as it lands (Gateway traffic, settled interactive Codex Stop turns, exact Gateway-backed " +
+        "Claude Stop aggregates, positively reconciled hook-only Claude task-notification continuations, and shim-captured Cursor " +
+        "runs at their own recorded tier). Ctrl-C to stop, or use --once for a snapshot. Content-free, " +
         "local-only, no network."
     )
     .option("--all", "Replay the existing receipts first, then follow new ones (default: only new).")

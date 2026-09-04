@@ -150,17 +150,17 @@ describe("entitlement lease-store (content-free verdict, fail-closed, never thro
    * ENTITLEMENT AND BALANCE ARE TWO QUESTIONS.
    *
    * A zero carried allowance used to END the verification chain as `allowance-exhausted` — a terminal
-   * verdict every caller reads as "not entitled". That is the right answer for the metered api-key
-   * route and the wrong one for the subscription route, whose full apply consumes no allowance: the
-   * tier clamp and the gateway's route-blind entitlement gate both withdrew full apply from traffic
-   * that owes the allowance nothing. The zero is now a FACT on a VALID verdict, and the route decides.
+   * verdict every caller reads as "not entitled". That withdrew the whole capability, including the
+   * OUTPUT SHAPING the allowance never bought and which must keep running on a spent period: the tier
+   * clamp and the gateway's entitlement gate both acted on a balance fact as if it were an entitlement
+   * one. The zero is now a FACT on a VALID verdict, and the apply path decides what it pauses.
    */
   it("a zero carried allowance is a spent METERED BALANCE, not a withdrawn entitlement", () => {
     writeSignedLease(basePayload({ allowance_tokens: 0 }));
     const v = readLeaseVerdict(env);
     expect(v.label).toBe("lease-valid");
     expect(v.meteredBalanceExhausted).toBe(true);
-    // The snapshot the metered route refuses on, and the period a surface names the reset date from.
+    // The snapshot input optimization pauses on, and the period a surface names the reset date from.
     expect(v.allowanceTokens).toBe(0);
     expect(v.periodId).toBe(currentPeriodId());
     // Still entitled: subscription-route full apply runs on exactly this lease.

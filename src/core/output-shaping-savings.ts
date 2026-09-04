@@ -17,7 +17,19 @@
  * No fabricated numbers: if the A/B has no provider-reported sample, everything is `unavailable`.
  */
 import { summarizeOutputShapingAb, type OutputShapingAbSummary } from "./output-shaping-ab.js";
-import { calibratedRate, loadCalibration, type CalibrationBasis } from "./output-shaping-calibration-store.js";
+import {
+  bestApplicableOutputCalibration,
+  emptyCalibration,
+  foldCalibrationConfirmation,
+  loadCalibration,
+  mergeOutputCalibrations,
+  type OutputShapingCalibrationConfirmation,
+  type OutputShapingCalibration,
+  type OutputShapingCalibrationQuery,
+  type CalibrationBasis,
+  type CalibrationState
+} from "./output-shaping-calibration-store.js";
+import { SHARED_OUTPUT_CALIBRATION_CONFIRMATIONS } from "./output-shaping-shared-calibration-registry.js";
 
 /** The honest label carried by the plan-lifetime projection. It is an inference, not an observation. */
 export const ROUTE_A_INFERENCE_LABEL =
@@ -41,24 +53,45 @@ export interface MeasuredPerTurnReduction {
   /** The A/B confidence enum verbatim (`observed_not_confirmed` / `eligible_for_engine_confirmation`). */
   confidence: OutputShapingAbSummary["confidence"];
   /**
-   * How many distinct A/B experiments back this rate when it came from the LEARNING calibration store (so a
+   * How many distinct confirmed A/B experiments back this rate when it came from the shared/local calibration (so a
    * reader never over-trusts a 1-sample rate). Absent when the reduction came directly from a single A/B
    * summary (`measuredPerTurnReduction`), which is inherently one experiment.
    */
   sampleCount?: number;
   /**
-   * PROVENANCE of the reduction RATE, carried so the per-turn line can label the output arrow honestly
-   * (G7, 2026-08-04). `"measured"` ⇒ this device's OWN A/B (single summary or folded store); `"default-prior"`
-   * ⇒ the shipped 0.47 starting rate no experiment on this device backs yet. A default prior must NEVER
-   * render as measured evidence, so this rides all the way to the receipt-line formatter — the magnitude is
-   * unchanged, only the label differs. Absent ⇒ treated as a generic estimate (`est.`), never as a prior.
+   * PROVENANCE of the reduction RATE. `"measured"` ⇒ confirmed exact-key empirical evidence (a
+   * direct A/B summary, the package-shipped registry, or the local additive store); `"default-prior"`
+   * ⇒ the internal generic starting rate, which no user-facing calibration path may consume.
+   *
+   * IT DECIDES WHETHER A PER-RUN FIGURE MAY BE DRAWN AT ALL — it is not a label selector. It used to pick
+   * between two estimate markers on an arrow that rendered either way; a rendered before→after pair reads
+   * as counted whatever it is labelled, so a `"default-prior"` basis now suppresses the arrow instead of
+   * annotating it, both here (`estimatePerTurnOutputSaved`) and again at the formatter. Absent ⇒ treated as
+   * a generic estimate, never as a prior.
    */
   basis?: CalibrationBasis;
+  /**
+   * The calibration LIFECYCLE behind the rate, forwarded verbatim from the resolver. On this type it is
+   * always `"calibrated"` when it is present at all; it rides here so one field answers "what does this
+   * device know?" on both halves of the union and a renderer never has to infer it from which variant
+   * it received.
+   */
+  state?: CalibrationState;
 }
 
 export interface UnavailableReduction {
   availability: "unavailable";
+  /**
+   * Human-readable prose. NOT a discriminant, and no consumer may parse it: it is the same field for an
+   * unreadable evidence, an unmatched exact key, and a measured null, which is precisely why `state` exists.
+   */
   reason: string;
+  /**
+   * WHICH KIND of unavailable this is (`unseeded` / `calibrating` / `measured-no-effect`), when the
+   * store could be read at all. Absent ⇒ we do not even know that much, and every renderer must fail
+   * closed to a plain count rather than guess between "not yet measured" and "measured, no effect".
+   */
+  state?: CalibrationState;
 }
 
 export type PerTurnReduction = MeasuredPerTurnReduction | UnavailableReduction;
@@ -96,7 +129,7 @@ export function measuredPerTurnReduction(summary: OutputShapingAbSummary): PerTu
     nControl: summary.nControl,
     nTreatment: summary.nTreatment,
     confidence: summary.confidence,
-    // A single real provider-reported A/B is this device's OWN measurement (never the shipped prior).
+    // A single real provider-reported A/B is measured evidence (never the generic prior).
     basis: "measured"
   };
 }
@@ -112,11 +145,18 @@ export interface PerTurnEstimatedSaved {
   calibrated: boolean;
   tokensSaved?: number;
   /**
-   * PROVENANCE of the rate behind `tokensSaved`, forwarded to the receipt-line formatter so the output
-   * arrow's label distinguishes a device measurement from the shipped default prior (G7). Present only when
-   * `calibrated`; it copies the reduction's `basis`. Never changes the magnitude — only the label.
+   * PROVENANCE of the rate behind `tokensSaved`, forwarded to the receipt-line formatter. Present only when
+   * `calibrated`; it copies the reduction's `basis`, and on this type that is always `"measured"` — a
+   * default-prior reduction returns `calibrated: false` above rather than a saving to label.
    */
   basis?: CalibrationBasis;
+  /**
+   * The calibration LIFECYCLE, forwarded to the receipt-line formatter WHETHER OR NOT a saving exists.
+   * It is the only field that survives an uncalibrated estimate, and it is what lets the line say
+   * "shaping ran, the size of what it removed is unmeasured" instead of dropping the axis entirely on a
+   * exact key that has no confirmed evidence. Absent ⇒ the formatter renders a plain count (fail closed).
+   */
+  state?: CalibrationState;
 }
 
 /**
@@ -136,19 +176,31 @@ export function estimatePerTurnOutputSaved(
   reduction: PerTurnReduction,
   observedOutputTokens: number | undefined
 ): PerTurnEstimatedSaved {
-  if (reduction.availability !== "measured") return { calibrated: false };
+  // THE LIFECYCLE SURVIVES EVERY REFUSAL BELOW. Each `calibrated: false` return means "no defensible
+  // saving for this turn", and each carries the reason ONE level up: whether the exact cohort has yet to
+  // measure, or has measured and found nothing. Dropping it here is what previously forced the
+  // formatter to treat those two as one, and it is the only thing the formatter can use to keep the
+  // output axis visible without inventing a figure for it.
+  const state = reduction.state !== undefined ? { state: reduction.state } : {};
+  if (reduction.availability !== "measured") return { calibrated: false, ...state };
+  // A DEFAULT PRIOR NEVER PRODUCES A PER-RUN FIGURE, whoever hands it in. `loadCalibrationReduction` no
+  // longer labels the prior `measured`, so the store path cannot reach this line at all — the gate is
+  // here for every OTHER caller that builds a reduction directly, so the shipped constant is
+  // unreachable as a per-turn saving through EVERY path and not only through the one that was traced.
+  if (reduction.basis === "default-prior") return { calibrated: false, ...state };
   if (typeof observedOutputTokens !== "number" || !Number.isFinite(observedOutputTokens) || observedOutputTokens <= 0) {
-    return { calibrated: false };
+    return { calibrated: false, ...state };
   }
   const r = reduction.reductionPct / 100;
   // A reduction fraction must be a real fraction strictly inside (0,1); r ≥ 1 would imply the control was
   // entirely removed (nonsensical for output shaping) and r ≤ 0 is not a saving.
-  if (!Number.isFinite(r) || r <= 0 || r >= 1) return { calibrated: false };
+  if (!Number.isFinite(r) || r <= 0 || r >= 1) return { calibrated: false, ...state };
   const tokensSaved = Math.round((observedOutputTokens * r) / (1 - r));
-  if (tokensSaved <= 0) return { calibrated: false };
-  // Carry the rate's provenance so the receipt line can label the arrow (`est.` vs `est. · default prior`).
-  // The magnitude is identical either way; only the label differs.
-  return { calibrated: true, tokensSaved, ...(reduction.basis ? { basis: reduction.basis } : {}) };
+  if (tokensSaved <= 0) return { calibrated: false, ...state };
+  // Carry the rate's provenance to the receipt line. Reaching here it is always confirmed measurement —
+  // a prior was refused above — but it is forwarded rather than assumed, so the formatter's own guard
+  // has something to check and the two layers cannot drift into disagreeing about the same turn.
+  return { calibrated: true, tokensSaved, ...(reduction.basis ? { basis: reduction.basis } : {}), ...state };
 }
 
 export interface PlanLifetimeProjection {
@@ -197,7 +249,7 @@ export function planLifetimeProjection(reduction: PerTurnReduction, planOutputBu
   // Extra turns the plan is EXTENDED BY, measured against the unshaped baseline:
   // budget/treatment − budget/control (equivalently, the saved tokens divided by the CONTROL mean).
   // Dividing by the treatment mean would count the extension against the already-shaped rate and
-  // overstate it (a 40-turn real extension would read as 67), so the honest divisor is the control mean.
+  // overstate it, so the honest divisor is the control mean.
   const extendedByTurns = Math.round(extendedByTokens / reduction.meanControlOutputTokens);
   return {
     availability: "measured",
@@ -209,58 +261,76 @@ export function planLifetimeProjection(reduction: PerTurnReduction, planOutputBu
 }
 
 /**
- * Load the current MEASURED per-turn reduction from the LEARNING calibration store, for the receipt line's
- * estimated-output-saved clause. The store (`output-shaping-calibration-store.ts`) accumulates real,
- * provider-reported A/B measurements fed in by `compaction savings`; its running sample-weighted rate is
+ * Load the current MEASURED per-turn reduction from the shared exact calibration sources, for the receipt line's
+ * estimated-output-saved clause. MEASURED is meant literally: an exact key with no confirmed experiment gets
+ * `unavailable`, not the generic starting prior dressed as evidence. The shared registry and additive
+ * local store (`output-shaping-calibration-store.ts`) contain only engine-confirmed,
+ * provider-reported A/B measurements admitted by the private confirmation gate; their running
+ * experiment-weighted rate is
  * what this returns. Total and fail-open: an absent / unreadable / uncalibrated store yields an
  * `unavailable` reduction (⇒ the line degrades to a plain `output N`), NEVER a thrown error and NEVER a
  * fabricated rate. The `sampleCount` rides on the measured result so a reader never over-trusts a 1-sample
  * rate. Content-free: the store holds only aggregate counts + rates (no request bytes).
  */
-export async function loadCalibrationReduction(env: NodeJS.ProcessEnv = process.env): Promise<PerTurnReduction> {
-  try {
-    const calibration = await loadCalibration(env);
-    const rate = calibratedRate(calibration);
-    if (!rate.calibrated || rate.rate === undefined) {
-      return { availability: "unavailable", reason: "no measured output-shaping A/B sample in the calibration store yet." };
-    }
-    // THE DEFAULT PRIOR (no fold yet). The rate is real and shipped, but the aggregate behind it is
-    // empty — so the accumulated totals are genuinely zero and must not be dressed up as this device's
-    // means. Only `reductionPct` reaches the per-turn line (`estimatePerTurnOutputSaved` uses nothing
-    // else), so the honest shape here is the rate plus zeroed denominators and a confidence that says
-    // no experiment backs it yet. The first real A/B replaces this wholesale.
-    if (rate.basis === "default-prior") {
+export type OutputCalibrationResolver = (query: OutputShapingCalibrationQuery) => PerTurnReduction;
+
+/** Build the one exact-match resolver shared by inline, statusline, watch, and run aggregation. */
+export function outputCalibrationResolver(calibration: OutputShapingCalibration): OutputCalibrationResolver {
+  return (query) => {
+    const match = bestApplicableOutputCalibration(calibration, query);
+    if (!match) {
       return {
-        availability: "measured",
-        meanControlOutputTokens: 0,
-        meanTreatmentOutputTokens: 0,
-        meanOutputTokenReduction: 0,
-        reductionPct: rate.rate * 100,
-        nControl: 0,
-        nTreatment: 0,
-        confidence: "unavailable",
-        sampleCount: 0,
-        // The rate is the shipped starting prior, not this device's measurement — the label must say so.
-        basis: "default-prior"
+        availability: "unavailable",
+        reason: "no confirmed output-shaping calibration exactly matches this policy, provider, model, and regime.",
+        state: "unseeded"
       };
     }
     return {
       availability: "measured",
-      // The store carries aggregate control/treatment totals, not per-arm means; the receipt line's estimate
-      // needs only the reduction FRACTION, so surface it as the reductionPct and the accumulated totals as
-      // the means (weighted). Denominators are the cumulative provider-reported turns behind the rate.
-      meanControlOutputTokens: calibration.totalControlOutputTokens,
-      meanTreatmentOutputTokens: calibration.totalTreatmentOutputTokens,
-      meanOutputTokenReduction: calibration.totalControlOutputTokens - calibration.totalTreatmentOutputTokens,
-      reductionPct: rate.rate * 100,
-      nControl: rate.totalTurns,
-      nTreatment: rate.totalTurns,
-      confidence: rate.sampleCount >= 1 ? "observed_not_confirmed" : "unavailable",
-      sampleCount: rate.sampleCount,
-      // This device's own folded A/B measurement (the prior has been displaced) — a calibrated `est.`.
-      basis: "measured"
+      meanControlOutputTokens: match.meanControlOutputTokens,
+      meanTreatmentOutputTokens: match.meanTreatmentOutputTokens,
+      meanOutputTokenReduction: match.meanControlOutputTokens - match.meanTreatmentOutputTokens,
+      reductionPct: match.rate * 100,
+      nControl: match.nControl,
+      nTreatment: match.nTreatment,
+      confidence: "eligible_for_engine_confirmation",
+      sampleCount: match.evidenceCount,
+      basis: "measured",
+      state: "calibrated"
     };
+  };
+}
+
+export async function loadOutputCalibrationResolver(
+  env: NodeJS.ProcessEnv = process.env,
+  sharedConfirmations: readonly OutputShapingCalibrationConfirmation[] = SHARED_OUTPUT_CALIBRATION_CONFIRMATIONS
+): Promise<OutputCalibrationResolver> {
+  let shared = emptyCalibration();
+  for (const confirmation of sharedConfirmations) {
+    shared = foldCalibrationConfirmation(shared, confirmation);
+  }
+  const effective = mergeOutputCalibrations(shared, await loadCalibration(env));
+  return outputCalibrationResolver(effective);
+}
+
+export async function loadCalibrationReduction(
+  env: NodeJS.ProcessEnv = process.env,
+  query?: OutputShapingCalibrationQuery
+): Promise<PerTurnReduction> {
+  try {
+    if (!query) {
+      return {
+        availability: "unavailable",
+        reason: "no output-shaping applicability metadata was available for exact calibration matching.",
+        state: "unseeded"
+      };
+    }
+    return (await loadOutputCalibrationResolver(env))(query);
   } catch {
-    return { availability: "unavailable", reason: "no local shaping calibration store yet." };
+    return {
+      availability: "unavailable",
+      reason: "no applicable confirmed shaping calibration is available.",
+      state: "unseeded"
+    };
   }
 }

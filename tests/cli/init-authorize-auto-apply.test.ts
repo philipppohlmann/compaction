@@ -49,7 +49,17 @@ async function run(args: string[]): Promise<{ stdout: string; stderr: string; co
   }
 }
 
-const prefsPath = (): string => join(cwd, ".compaction", "policy-preferences.json");
+/**
+ * The authorization store is DEVICE-level: `COMPACTION_CONFIG_DIR` (here `<cwd>/config-home`), the same
+ * directory the optimization mode, connected workflows and the entitlement lease live in. It used to be
+ * the RELATIVE `.compaction`, i.e. whatever cwd the command ran in — which is why an authorization made
+ * from `$HOME` was invisible to `claude` launched inside a project (0.6.6 release blocker). Asserting on
+ * the device path is what makes that regression visible from the CLI surface.
+ */
+const prefsPath = (): string => join(cwd, "config-home", "policy-preferences.json");
+
+/** The pre-fix project-local location. Nothing writes here any more; reads still honour it (legacy). */
+const legacyProjectPrefsPath = (): string => join(cwd, ".compaction", "policy-preferences.json");
 
 interface StoredPreference {
   id: string;
@@ -68,7 +78,9 @@ describe("init --authorize-auto-apply - explicit scoped opt-in (default OFF)", (
   it("DEFAULT OFF: choosing an optimization mode does NOT write any policy preference", async () => {
     const result = await run(["init", "--mode", "cache-plus-context", "--projects-dir", "/tmp/none-here-nonexistent"]);
     expect(result.code).toBe(0);
-    expect(existsSync(prefsPath())).toBe(false); // the mode is a recorded default only, never an authorization
+    // Neither store: the mode is a recorded default only, never an authorization.
+    expect(existsSync(prefsPath())).toBe(false);
+    expect(existsSync(legacyProjectPrefsPath())).toBe(false);
     // Mode-only has no selected routed workflow, so it stores no authorization.
     expect(result.stdout).toContain("With selected routed workflows");
   });
@@ -116,6 +128,7 @@ describe("init --authorize-auto-apply - explicit scoped opt-in (default OFF)", (
     expect(result.code).not.toBe(0);
     expect(result.stderr).toMatch(/no Gateway routing path|vendor gap/);
     expect(existsSync(prefsPath())).toBe(false);
+    expect(existsSync(legacyProjectPrefsPath())).toBe(false);
   });
 
   it("global/all/unknown workflows are rejected; nothing written", async () => {
@@ -125,6 +138,7 @@ describe("init --authorize-auto-apply - explicit scoped opt-in (default OFF)", (
       expect(result.stderr).toMatch(/never global|unknown --authorize-auto-apply/);
     }
     expect(existsSync(prefsPath())).toBe(false);
+    expect(existsSync(legacyProjectPrefsPath())).toBe(false);
   });
 
   it("init --disconnect 2 disables the stored codex authorization (a disconnected tool keeps no live authorization)", async () => {

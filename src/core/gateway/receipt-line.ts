@@ -6,9 +6,8 @@
  * the short receipt id, never a prompt, code, path, or response byte.
  *
  * Grammar (fields OMITTED when unavailable, never fabricated):
- *   compaction · [observed input N | input B→A (−PP%)] · output N · [<value-clause>] · [<tier-label>] ·
- *     [Community limit reached · input optimization paused[ until <YYYY-MM-DD>][ · output shaping
- *      continues] · Upgrade to Pro ↗] · id <8hex>
+ *   compaction · [observed input N | input B→A (−PP%) | input paused] · output N · [<value-clause>] ·
+ *     [<tier-label>] · [Community limit resets <YYYY-MM-DD>[ · Upgrade to Pro ↗]] · id <8hex>
  *
  * TIER LABELS (open-core):
  *   - `apply off`      (Open observe)   — no model-visible mutation.
@@ -22,9 +21,8 @@
  * Hard claim rules encoded here (do NOT relax without re-opening the design doc):
  *  - The input REDUCTION clause (`input 41,210→21,876 (−47%)`) appears ONLY for a REAL apply before→after
  *    (apply mode, request actually mutated) that already exists on the receipt. The `−PP%` reduction glyph
- *    appears ONLY here UNLABELED. An output percent exists too but ALWAYS carries an estimate label — `est.`
- *    when the rate is this device's own A/B, `est. · default prior` when it is the shipped starting prior
- *    (its before is reconstructed, not measured), and the tests pin that rather than pinning its absence. Never
+ *    appears ONLY here UNLABELED. An output percent exists too but ALWAYS carries the `est.` label (its
+ *    before is reconstructed, not measured) and ONLY when exact-key confirmed A/B evidence backs the rate. Never
  *    synthesized. Open shows `observed input N` (a plain count, no reduction). Provider prompt-cache is
  *    NOT surfaced on this line: it is a provider fact, not a Compaction reduction, and carrying it here
  *    invites the "Compaction reduced my tokens" misread.
@@ -36,10 +34,10 @@
  *        an invoice, and not net of the provider's prompt cache.
  *  - OUTPUT carries the saving: `output 652→512 (−21%, est.)`. The AFTER is real
  *    provider-reported output; the BEFORE is DERIVED from the reduction rate, which is why it carries an
- *    estimate label and the input arrow does not. The label's exact form marks WHOSE evidence backs the
- *    rate: `est.` for this device's own A/B, `est. · default prior` for the shipped starting prior. With no
- *    rate at all it degrades to a plain `output N` — no arrow, no fabricated before. The percent is dropped
- *    when integer rounding would reach `−0%` or `−100%`, since either would contradict the pair shown.
+ *    estimate label and the input arrow does not. THE ARROW REQUIRES EXACT CONFIRMED MEASUREMENT. Any
+ *    proven-shaped turn without applicable evidence renders `output N/A→N (N/A%, est.)`; only a turn
+ *    not proven shaped stays plain. The percent is dropped when integer rounding would reach `−0%`
+ *    or `−100%`, since either would contradict the pair shown.
  *  - The two are NOT mutually exclusive: an apply turn shows the input arrow, the output arrow, and the
  *    cost clause together.
  *  - Cursor emits NO per-turn line (handled by callers, never here) — but NOT for the reason this
@@ -58,9 +56,10 @@
  * `COMPACTION_SHAPING_HOOKS=0` kill-switch value set.
  */
 import type { GatewayReceipt } from "./receipt.js";
+import type { RunAggregate } from "./run-aggregate.js";
 import type { AllowancePauseScope } from "../onboarding-preferences.js";
 import type { AllowancePauseReason } from "../upgrade-cta.js";
-import { COMMUNITY_LIMIT_CLAUSE, upgradeCta, validResetsOn } from "../upgrade-cta.js";
+import { communityLimitClause, upgradeCta, validResetsOn } from "../upgrade-cta.js";
 import { applyInputCostReductionUsd } from "./api-cost-impact.js";
 import { allowancePausePeriodStatus } from "../entitlement/lease-store.js";
 
@@ -77,29 +76,62 @@ const PREFIX = RECEIPT_LINE_PREFIX;
 export const RECEIPT_LINE_ENV = "COMPACTION_RECEIPT_LINE";
 
 /**
- * PROVENANCE labels for the OUTPUT arrow's reconstructed reduction (G7, 2026-08-04). The output before is
- * always DERIVED from a rate (the unshaped turn was never generated), so an output arrow is never the bare
- * measured `(−PP%)` reserved for the input apply arrow — it always carries one of these:
+ * The label every OUTPUT arrow carries. The output before is always DERIVED from a rate (the unshaped turn
+ * was never generated), so an output arrow is never the bare measured `(−PP%)` reserved for the input apply
+ * arrow — it is always `(−PP%, est.)`.
  *
- *   - `CALIBRATED_ESTIMATE_MARKER` (`est.`) — the rate is this DEVICE'S OWN A/B measurement.
- *   - `DEFAULT_PRIOR_MARKER` (`est. · default prior`) — the rate is the shipped 0.47 starting prior no
- *     experiment on this device backs yet. The magnitude is identical to a calibrated turn; only this label
- *     tells the reader it is a general figure, not their own evidence.
- *
- * PRODUCT RULE (provenance honesty): a default prior must NEVER visually read as measured evidence, so the
- * default-prior render carries `default prior` explicitly and is a DIFFERENT string from the calibrated one.
- * These are provenance labels, NOT new claims — they never change a magnitude. They are the shipped strings,
- * so they must never be a placeholder (E8): the default-prior marker is the literal text a user sees.
+ * PRODUCT RULE (provenance honesty): a default prior must NEVER visually read as measured evidence. There
+ * used to be a second marker for that case — `est. · default prior` — rendered beside a full `777→412
+ * (−47%)` pair on turn one of a fresh install. The words were accurate and the pair was still read as
+ * counted, which is the whole failure: a disclosure printed next to a specific per-run number does not
+ * withdraw it. So the rule is now enforced by the ARROW and not by a label. A default-prior basis renders
+ * NO arrow (see `outputClause`), the second marker is gone, and this one means what it says — an estimate
+ * built on an exact-key rate confirmed by empirical evidence.
  */
 export const CALIBRATED_ESTIMATE_MARKER = "est." as const;
-export const DEFAULT_PRIOR_MARKER = "est. · default prior" as const;
 
-/** The output-estimate provenance the arrow's label reflects (`est.` vs `est. · default prior`). */
+/**
+ * Whose evidence backs the estimate. It gates the arrow rather than choosing its label: `"measured"` (this
+ * shared/local exact confirmed A/B) may render one; `"default-prior"` (the internal starting rate) may not.
+ */
 export type OutputEstimateBasis = "measured" | "default-prior";
 
-/** The exact estimate label for an output arrow of the given provenance. Absent basis ⇒ a generic `est.`. */
-function outputEstimateMarker(basis: OutputEstimateBasis | undefined): string {
-  return basis === "default-prior" ? DEFAULT_PRIOR_MARKER : CALIBRATED_ESTIMATE_MARKER;
+/**
+ * WHAT THE EXACT APPLICABILITY KEY RESOLVES about its shaping rate — the second half of the estimate's provenance, and
+ * the half that decides whether an UNMEASURED axis is shown as unknown or not shown at all. Mirrors
+ * `CalibrationState` in `output-shaping-calibration-store.ts` (declared here rather than imported, the
+ * same way `OutputEstimateBasis` mirrors `CalibrationBasis`, so the formatter keeps no dependency on the
+ * store).
+ *
+ * `unseeded` / `calibrating` ⇒ we have no exact rate yet. `measured-no-effect` ⇒ evidence measured and the
+ * answer was "shaping did not reduce output here". Those are opposite epistemic positions that happen to
+ * share an empty percentage, and `outputClause` renders them differently for exactly that reason.
+ */
+export type OutputEstimateState = "unseeded" | "calibrating" | "calibrated" | "measured-no-effect";
+
+/**
+ * The explicitly-unknown endpoint. It occupies the BEFORE slot and the percentage slot when shaping
+ * provably ran on a turn whose exact cohort cannot yet be sized.
+ *
+ * IT IS NOT A NUMBER AND CANNOT BE MISREAD AS ONE — which is the entire reason the axis may be shown at
+ * all. The withdrawn `777→412 (−47%, est. · default prior)` failed because a specific pair reads as
+ * counted whatever label stands beside it; `N/A→412 (N/A%, est.)` states the same absence the plain
+ * count stated, without also deleting the fact that shaping ran on this turn.
+ */
+const NOT_AVAILABLE = "N/A" as const;
+
+/**
+ * The calibration estimate as it is INJECTED into a line builder (reading the store is async and these
+ * renderers are not). Structurally the estimator's own `PerTurnEstimatedSaved`, named here so every
+ * builder accepts the same shape: five call sites previously re-declared it inline, and a re-declaration
+ * that omits a field silently drops that field's guarantee — exactly how the `basis` gate came to be
+ * statically invisible on the gateway path (#951).
+ */
+export interface InjectedOutputEstimate {
+  calibrated: boolean;
+  tokensSaved?: number;
+  basis?: OutputEstimateBasis;
+  state?: OutputEstimateState;
 }
 
 /** Kill-switch values (case-insensitive), mirrors the output-shaping hook kill switch. */
@@ -119,6 +151,28 @@ export function isReceiptLineEnabled(env: NodeJS.ProcessEnv = process.env): bool
 /** Add thousands separators to a non-negative integer count (ASCII commas). */
 function group(n: number): string {
   return Math.trunc(n).toLocaleString("en-US");
+}
+
+/** Drop a trailing `.00` / `.50` zero tail so `2.00M` reads `2M` and `1.20M` reads `1.2M`. */
+function trimDecimalZeros(fixed: string): string {
+  return fixed.includes(".") ? fixed.replace(/0+$/, "").replace(/\.$/, "") : fixed;
+}
+
+/**
+ * A short magnitude for an allowance count: `2M`, `1.82M`, `950K`, `4.1K`, `730`.
+ *
+ * SEPARATE FROM `group` ON PURPOSE. The token axes render exact counts because they are measurements
+ * of one turn; an allowance countdown is a budget the reader glances at, and `1,823,904/2,000,000`
+ * spends a third of the line on digits nobody reads. Different job, different formatter.
+ *
+ * TRUNCATES, NEVER ROUNDS UP: a remainder must not be shown as more headroom than the device has, and
+ * the last visible increment before zero must not read as a full unit.
+ */
+function compactTokens(n: number): string {
+  const v = Math.max(0, Math.trunc(n));
+  if (v >= 1_000_000) return `${trimDecimalZeros((Math.trunc(v / 10_000) / 100).toFixed(2))}M`;
+  if (v >= 1_000) return `${trimDecimalZeros((Math.trunc(v / 100) / 10).toFixed(1))}K`;
+  return `${v}`;
 }
 
 /**
@@ -150,30 +204,73 @@ export const RECEIPT_TIER_LABELS: Record<ReceiptTier, string> = {
 export type OpenLineRendering = "observe" | "basic" | "unlabeled";
 
 /**
+ * Whether output shaping was ACTIVE on the final model-visible request of ONE turn.
+ *
+ * THE RECEIPT IS AUTHORITATIVE WHENEVER IT SPEAKS. `output_shaping_state` is the engine's own
+ * measurement of the exact bytes forwarded: `attached-this-pass` and `already-active` both mean the
+ * policy was on the request the model read; `absent` means it was not. A live session signal
+ * (`lastTurnWasShaped`, the prompt hook's record of what it DECIDED) is weaker evidence than that
+ * measurement and must never override it — in particular an explicit `absent` may not inherit `true`
+ * from the session, which is exactly what happens when a live drain coalesces several receipts and
+ * hands every one of them the latest turn's evidence.
+ *
+ * THE LIVE FALLBACK APPLIES ONLY WHEN THE FIELD IS UNDEFINED: a receipt written before the field
+ * existed recorded nothing, so the session's own account of the turn is the only evidence there is.
+ * Callers pass `false` for anything historical, where no such account exists.
+ *
+ * THE PRICE OF THAT PRECEDENCE, STATED HONESTLY. `outputShapingActiveOnRequest` inspects
+ * INSTRUCTION-LEVEL CARRIERS ONLY, so a `UserPromptSubmit` hook that shapes the USER message writes a
+ * truthful `absent` onto a turn that really was shaped, and this function then reports `false` for it.
+ * That is the correct trade for the callers here — silence on a turn we cannot attribute beats an arrow
+ * on a turn that had no saving — but it is a real false negative, not a neutral one, and it costs the
+ * Stop hook (`capture-claude-code.ts`) a label on a prompt-shaped turn it could once claim. Accepted:
+ * `absent` is the engine measuring the bytes it forwarded, and no surface should print over that.
+ * The live statusline deliberately does NOT share this rule (`statusline.ts`, `shapedThisTurn`): it
+ * pairs a per-turn hook record with the receipt in one place and can prefer the stronger of the two.
+ *
+ * One rule for the arrow and the label, so the two can never disagree about the same receipt.
+ */
+export function outputShapingActiveForTurn(receipt: GatewayReceipt, liveShapedTurn: boolean): boolean {
+  const state = receipt.output_shaping_state;
+  if (state !== undefined) return state === "attached-this-pass" || state === "already-active";
+  return liveShapedTurn;
+}
+
+/**
  * The tier label THIS RECEIPT proves, or undefined when it proves none.
  *
- * The only Open posture a gateway receipt can establish is that the gateway itself shaped the turn:
- * `request_mutated: true` with `applied_components` carrying `output-shaping` and no input
- * before→after (an input before→after is a full apply, which is the community builder's line, not
- * an Open one). That is a statement about THAT turn, so it stays true however the device is
- * configured later.
+ * The one Open posture a gateway receipt can establish is that output shaping was ACTIVE on the
+ * final model-visible request: `output_shaping_state` of `attached-this-pass` (the gateway attached
+ * the policy) or `already-active` (the policy arrived upstream — the tool's own `UserPromptSubmit`
+ * hook — and the engine measured it on the bytes forwarded), with no input before→after (an input
+ * before→after is a full apply, which is the community builder's line, not an Open one). That is a
+ * statement about THAT turn, so it stays true however the device is configured later.
  *
- * NOTHING ELSE IS DERIVABLE, AND `apply off` IS DELIBERATELY NOT. A receipt with no mutation does not establish "no
- * model-visible mutation": the tool's own `UserPromptSubmit` hook shapes the prompt BEFORE the
- * gateway sees the request, so the gateway records a turn it cannot tell was shaped. Stamping
- * `apply off` there would convert an unverified label into a false one. Callers omit instead.
+ * This used to read `request_mutated` + an `output-shaping` entry in `applied_components`, which
+ * answers "did THIS PASS mutate", and withheld the label on the ordinary `already-active` turn while
+ * the adjacent arrow — a stronger claim — rode the state. The state is the stronger evidence of the
+ * two: it is measured against the full current policy at instruction-level carriers only, whereas a
+ * mutation record says nothing about what the model finally read.
+ *
+ * NOTHING ELSE IS DERIVABLE, AND `apply off` IS DELIBERATELY NOT. A receipt with NO state (legacy)
+ * establishes nothing and licenses nothing — the final request is not retained anywhere, so it cannot
+ * be classified after the fact; fail closed. And an explicit `absent` establishes only that the policy
+ * was not on the request, which is not the same as "no model-visible mutation": stamping `apply off`
+ * there would convert an unverified label into a false one. Callers omit instead.
  */
 export function receiptProvenOpenLabel(receipt: GatewayReceipt): "basic" | undefined {
-  return receipt.request_mutated === true &&
-    receipt.applied_components?.includes("output-shaping") === true &&
-    receipt.estimated_input_tokens_before === undefined
+  return outputShapingActiveForTurn(receipt, false) && receipt.estimated_input_tokens_before === undefined
     ? "basic"
     : undefined;
 }
 
 /**
- * The Open rendering for ONE turn: the label the receipt proves, else the label the LIVE turn's own
- * shaped-evidence supports, else no label at all.
+ * The Open rendering for ONE turn: the label the receipt proves, else — only when the receipt records
+ * no state at all — the label the LIVE turn's own shaped-evidence supports, else no label at all.
+ *
+ * THE RECEIPT'S STATE IS AUTHORITATIVE WHEN PRESENT (see `outputShapingActiveForTurn`): a receipt that
+ * says `absent` is never relabelled `basic shaping` from session state, however the session recorded
+ * the turn. The fallback exists for the legacy receipt with no state.
  *
  * `liveShapedTurn` may be true ONLY for a turn that just happened, where the prompt hook's own record
  * of what it decided describes THIS turn (`lastTurnWasShaped`). It is the same evidence the adjacent
@@ -194,8 +291,16 @@ export function receiptProvenOpenLabel(receipt: GatewayReceipt): "basic" | undef
  * not read it as a guarantee that no surface can label the same receipt differently.
  */
 export function openLineForTurn(receipt: GatewayReceipt, liveShapedTurn: boolean): OpenLineRendering {
+  // ROUTED THROUGH `receiptProvenOpenLabel`, not a second copy of its predicate. The gateway's own
+  // inline line calls that function directly (`server.ts`), so an independent re-derivation here would
+  // be free to drift from it silently — two surfaces disagreeing about one receipt is the exact defect
+  // this module exists to prevent.
   const proven = receiptProvenOpenLabel(receipt);
   if (proven !== undefined) return proven;
+  // THE FALLBACK IS GUARDED ON ABSENCE OF STATE, not merely on the label being unproven: `absent` is a
+  // measurement, and reaching past it to the session flag is how an explicit "not shaped" turn gets
+  // relabelled `basic shaping`.
+  if (receipt.output_shaping_state !== undefined) return "unlabeled";
   if (liveShapedTurn && receipt.estimated_input_tokens_before === undefined) return "basic";
   return "unlabeled";
 }
@@ -262,16 +367,16 @@ export interface ReceiptLineFields {
   /**
    * Estimated OUTPUT tokens saved on THIS shaped turn. Turns the output clause into a before→after:
    * `output 652→512 (−21%, est.)`, where BEFORE = this count + the real output. Derived by the caller from
-   * the LEARNING calibration rate applied to THIS line's own output (never a session-wide sum); this
+   * the shared exact calibration rate applied to THIS line's own output (never a session-wide sum); this
    * module only renders it. Supply it on any surface that knows the turn was shaped — hook-only AND
-   * gateway/apply lines. When `estimatedOutputSavedCalibrated` is false the clause degrades to a plain
-   * `output N`: no arrow, no fabricated before.
+   * gateway/apply lines. When `estimatedOutputSavedCalibrated` is false, explicit unseeded state renders
+   * `output N/A→N`; no numeric arrow or fabricated before is possible.
    */
   estimatedOutputTokensSaved?: number;
   /**
    * Whether the estimated-saved figure rests on a real A/B calibration sample. When a saved clause is
-   * requested (`estimatedOutputSavedRequested`) but this is false, the output clause stays a plain
-   * `output N` — no arrow and no reconstructed before, rather than a bare fabricated number.
+   * requested (`estimatedOutputSavedRequested`) but this is false, the output clause uses its explicit
+   * state to choose N/A or plain actual — never a numeric arrow or reconstructed before.
    */
   estimatedOutputSavedCalibrated?: boolean;
   /**
@@ -281,32 +386,52 @@ export interface ReceiptLineFields {
    */
   estimatedOutputSavedRequested?: boolean;
   /**
-   * PROVENANCE of the estimated-saved rate, so the arrow's label distinguishes a device measurement
-   * (`est.`) from the shipped default prior (`est. · default prior`) per G7. Same magnitude either way —
-   * ONLY the label differs. Absent ⇒ a generic `est.` (a default prior always carries `"default-prior"`
-   * from the real code path, so it can never silently fall back to the calibrated label).
+   * PROVENANCE of the estimated-saved rate. `"default-prior"` SUPPRESSES the arrow entirely — the shipped
+   * starting rate may back an internal estimate but never a rendered per-run figure — and `"measured"` (or
+   * absent, the pre-existing default for callers that only ever pass their own measurement) allows it.
+   * It used to choose between two labels on an arrow that rendered either way.
    */
   estimatedOutputSavedBasis?: OutputEstimateBasis;
   /**
-   * The CEILING clause: the UTC date (`YYYY-MM-DD`) this period's optimized-input allowance resets,
-   * rendered as `allowance spent · input optimization paused until 2026-09-01`.
+   * WHAT THE EXACT APPLICABILITY KEY RESOLVES about its shaping rate. Only meaningful alongside
+   * `estimatedOutputSavedRequested` (i.e. the caller proved this turn was shaped), and only consulted
+   * when no defensible saving exists:
+   *  - `unseeded` / `calibrating` → `output N/A→412 (N/A%, est.)`. Shaping ran; its size is unmeasured.
+   *  - `measured-no-effect`       → `output 412`. Empirical evidence found nothing to show.
+   *  - ABSENT                     → `output 412`. We do not know which of the two it is, so we claim
+   *                                 neither. Every renderer must forward it explicitly; nothing here
+   *                                 infers it.
+   */
+  estimatedOutputSavedState?: OutputEstimateState;
+  /**
+   * The UTC date (`YYYY-MM-DD`) this period's optimized-input allowance resets.
    *
-   * Present ONLY when the user asked for Community `full` apply and the entitlement lease says the
-   * period allowance is exhausted. Without it the line renders a bare `apply off` and a Community
-   * user's tier silently downgrades with no reason and no end date — the surface would be describing
-   * a refusal as if it were the user's chosen posture.
+   * BOTH A PAUSE SIGNAL AND THE RENDERED DATE. `inputPaused` treats this field as sufficient evidence
+   * that the turn was refused for allowance, which is what turns the input axis into `input paused`,
+   * suppresses a `full apply` label, and raises the ceiling clause — and the clause it raises PRINTS
+   * this value (`Community limit resets 2026-09-01`, see `ceilingClause`). It is the one fact the
+   * rest of the line cannot express: `input paused` says the capability is gone, and only the date
+   * says it comes back. The detail surfaces still state it in a sentence ("It resumes 2026-09-01." on
+   * `status`, `usage`, `lease status`, `watch` and `mode`); the primary line no longer depends on
+   * them to say the one thing a blocked user needs.
    *
-   * Claim rules: it names NO figure (no remaining/consumed count — those stay content-free in the
-   * lease/journal) and NO price. Ceiling behavior is refuse/degrade, never auto-purchase, so the only
-   * honest things to say are that the limit was reached, that input optimization is paused, when it
-   * comes back, and — since 2026-08-23 — WHERE TO CONVERT. The clause used to carry no upgrade path
-   * and no URL at all, which left the one surface a user reads mid-turn stating a blocked state with
-   * nothing to act on; it now ends in a single canonical CTA (`upgradeCta`, resolved from
-   * `pro-destination.ts`) that the user may click and is never auto-opened. The date is derived from
-   * the lease's PERIOD (`periodEndUtc`), never from `expires_at`.
+   * DERIVED, NEVER LITERAL. The value reaches this field from the lease PERIOD (`periodEndUtc`) via
+   * the receipt's recorded pause — see the claim rules below. A caller that hard-coded a date here
+   * would be printing a promise the entitlement chain never made.
    *
-   * OPTIONAL NOW. A reset date is no longer required to state the pause — see `allowancePauseReason`,
-   * which covers the case where a date is unknown or the pause is per-turn rather than period-wide.
+   * Set ONLY when the user asked for Community `full` apply and the entitlement lease says the period
+   * allowance is exhausted. Without it (or `allowancePauseReason`) the line renders a bare `apply off`
+   * and a Community user's tier silently downgrades with no reason at all — the surface would be
+   * describing a refusal as if it were the user's chosen posture.
+   *
+   * Claim rules: the clause it raises names NO figure (no remaining/consumed count — those stay
+   * content-free in the lease/journal) and NO price. Ceiling behavior is refuse/degrade, never
+   * auto-purchase. A date is not a balance: printing when the allowance returns asserts nothing about
+   * what it costs or how much of it is left. The date is derived from the lease's PERIOD
+   * (`periodEndUtc`), never from `expires_at`.
+   *
+   * OPTIONAL. A reset date is not required to state the pause — see `allowancePauseReason`, which
+   * covers the case where a date is unknown or the pause is per-turn rather than period-wide.
    */
   allowanceResetsOn?: string;
   /**
@@ -324,25 +449,10 @@ export interface ReceiptLineFields {
    */
   allowancePauseReason?: AllowancePauseReason;
   /**
-   * Whether OUTPUT SHAPING really ran on this paused turn, so the clause may say so.
-   *
-   * NOT ASSUMED. Output shaping fires on prose turns and not on tool-call turns, and a task-aware hold
-   * leaves the body unchanged — so "output shaping continues" is a claim about THIS turn that is
-   * sometimes false. Callers set it from the receipt's applied components; absent ⇒ the clause states
-   * the pause and the CTA without asserting a shaping that may not have happened.
-   */
-  outputShapingContinues?: boolean;
-  /**
    * Environment used to resolve the CTA destination and terminal-hyperlink support. Injected so tests
    * can pin the encoded target and the plain-text degradation; defaults to `process.env`.
    */
   ctaEnv?: NodeJS.ProcessEnv;
-  /**
-   * WHICH traffic the pause covers. Defaults to `all-routes` when a reset date is supplied without a
-   * scope, which is the conservative rendering (it claims the pause is broader, never narrower, than
-   * it is). The resolver always supplies it.
-   */
-  allowancePauseScope?: AllowancePauseScope;
   /**
    * Whether the pause this line describes is still ACTIONABLE — i.e. it belongs to the allowance
    * period the reader is in right now. Defaults to actionable, because every live caller renders the
@@ -350,12 +460,29 @@ export interface ReceiptLineFields {
    *
    * HISTORY IS NOT AN OFFER. `watch`'s replay and `status`'s "Last turns" re-render receipts recorded
    * days or months ago, and a July line replayed in August is still a true record of July: it keeps
-   * `input paused`, `Community limit reached`, the reset date it was written with, the shaping fact
-   * and its receipt id. What it must NOT keep is the `Upgrade to Pro ↗` CTA, because a CTA is not a
-   * historical fact — it is an action offered to the user NOW, about a ceiling they are no longer at.
-   * Set `false` and the clause states the recorded facts and stops.
+   * `input paused`, its ceiling clause, its output arrow and its receipt id. What it must NOT
+   * keep is the `Upgrade to Pro ↗` CTA, because a CTA is not a historical fact — it is an action
+   * offered to the user NOW, about a ceiling they are no longer at. Set `false` and the clause states
+   * the recorded fact and stops.
    */
   ctaActionable?: boolean;
+  /**
+   * The Community allowance COUNTDOWN for this turn: optimized-input allowance left after this turn's
+   * debit, and the period total it is left out of. Both or neither — a numerator with no denominator
+   * is a bare number the reader cannot size, and a denominator alone says nothing about this turn.
+   *
+   * HEALTHY-TURN ONLY, and the counterpart of the ceiling clause rather than a companion to it. A
+   * paused turn renders `allowancePauseReason` and the conversion path; restating the same spent
+   * allowance as `0/2M left` alongside it would be the same fact in weaker words.
+   *
+   * The values come from the RECEIPT (`allowance_snapshot`), recorded when the debit committed —
+   * never read from the lease or the journal at render time. That is what keeps every surface's line
+   * a statement about the turn it belongs to, and keeps the statusline render loop free of any file
+   * read or network call.
+   */
+  allowanceRemainingTokens?: number;
+  /** The period's TOTAL allowance — the countdown's denominator. See `allowanceRemainingTokens`. */
+  allowancePeriodTotalTokens?: number;
   /** The first 8 hex of the receipt id, when a receipt exists this turn. */
   shortReceiptId?: string;
 }
@@ -386,13 +513,18 @@ export interface ReceiptLineCeiling {
  * receipt — the gateway's inline line, Claude Code's `statusLine`, and the Stop-hook capture — so a
  * paused turn cannot say one thing on one surface and something else on another.
  *
- * `outputShapingContinues` is asserted from the receipt's OWN applied components, never assumed.
- * Output shaping fires on prose turns and not on tool-call turns, and a task-aware hold can leave the
- * body unchanged — so on the turns where it did not run, the line states the pause and the conversion
- * path without claiming a shaping that did not happen. The CTA appears either way: the user is
+ * `outputShapingContinues` is asserted from the receipt's OWN recorded evidence, never assumed.
+ * Two different things leave this pass having mutated nothing. A task-aware hold can leave the body
+ * unchanged — that turn really was not shaped. And the tool's own `UserPromptSubmit` hook may have
+ * attached the policy upstream, in which case the planner correctly attached nothing and the turn
+ * still reaches the model shaped (`already-active`). The recorded state distinguishes them, so the
+ * line states the pause and the conversion path without claiming a shaping that did not happen. The CTA appears either way: the user is
  * blocked either way, and that is what they need to be able to act on.
  */
-export function receiptCeiling(receipt: GatewayReceipt, env: NodeJS.ProcessEnv): ReceiptLineCeiling | undefined {
+export function receiptCeiling(
+  receipt: Pick<GatewayReceipt, "allowance_pause" | "output_shaping_state" | "applied_components">,
+  env: NodeJS.ProcessEnv
+): ReceiptLineCeiling | undefined {
   const pause = receipt.allowance_pause;
   if (pause === undefined) return undefined;
   // VALIDATED AT THE READ, once, for every surface that renders from a receipt. The date is
@@ -412,7 +544,19 @@ export function receiptCeiling(receipt: GatewayReceipt, env: NodeJS.ProcessEnv):
     reason: pause.reason,
     ...(resetsOn !== undefined ? { resetsOn } : {}),
     ...(pause.scope !== undefined ? { scope: pause.scope } : {}),
-    outputShapingContinues: receipt.applied_components?.includes("output-shaping") === true,
+    // SAME QUESTION AS THE OUTPUT ARROW, so it must not answer differently on the same line: an
+    // `already-active` paused turn would otherwise draw the arrow while omitting this clause, and the
+    // line would contradict itself. `output_shaping_state` is the durable answer.
+    //
+    // BUT THE FAIL-CLOSED RULE IS THE ARROW'S, NOT THIS CLAUSE'S. The arrow is a SAVINGS CLAIM, so a
+    // legacy receipt with no state gets no arrow. This clause only EXPLAINS that the input pause did not
+    // take shaping with it — no number, no claim — and it already shipped on `applied_components` for
+    // every receipt written before the state field existed. Dropping it from those would regress a real
+    // explanation on the one line a blocked user reads, so legacy receipts keep the component fallback.
+    outputShapingContinues:
+      receipt.output_shaping_state !== undefined
+        ? receipt.output_shaping_state === "attached-this-pass" || receipt.output_shaping_state === "already-active"
+        : receipt.applied_components?.includes("output-shaping") === true,
     ctaEnv: env,
     ctaActionable: allowancePausePeriodStatus(pause, env) !== "stale"
   };
@@ -422,9 +566,12 @@ export function receiptCeiling(receipt: GatewayReceipt, env: NodeJS.ProcessEnv):
 function applyCeiling(fields: ReceiptLineFields, ceiling: ReceiptLineCeiling | undefined): void {
   if (!ceiling) return;
   fields.allowancePauseReason = ceiling.reason;
+  // THE DATE IS BOTH THE PAUSE SIGNAL AND THE CLAUSE'S ONE VARIABLE (see
+  // `ReceiptLineFields.allowanceResetsOn`), so it must cross. `scope` and `outputShapingContinues` are
+  // deliberately NOT copied across: they are facts about the receipt that the DETAIL surfaces state in
+  // sentences, and the primary line has no clause left that renders either. They stay on
+  // `ReceiptLineCeiling` so a caller reading a receipt still gets them.
   if (ceiling.resetsOn !== undefined) fields.allowanceResetsOn = ceiling.resetsOn;
-  if (ceiling.scope !== undefined) fields.allowancePauseScope = ceiling.scope;
-  if (ceiling.outputShapingContinues !== undefined) fields.outputShapingContinues = ceiling.outputShapingContinues;
   if (ceiling.ctaEnv !== undefined) fields.ctaEnv = ceiling.ctaEnv;
   if (ceiling.ctaActionable !== undefined) fields.ctaActionable = ceiling.ctaActionable;
 }
@@ -455,9 +602,8 @@ function inputPaused(f: ReceiptLineFields): boolean {
 function inputClause(f: ReceiptLineFields): string | undefined {
   // AT THE CEILING THE INPUT AXIS CARRIES NO NUMBER. Output shaping still mutates the request, so a
   // paused turn arrives here with `request_mutated: true` and a before/after pair whose "after" is the
-  // SHAPED body — bigger than the original, not smaller. Rendering that pair produced the defect this
-  // fixes: a real captured line read `input 926→1,032 (−-11%)`, claiming a reduction that never
-  // happened, on the one turn where nothing was reduced. `input paused` is the whole truth about the
+  // SHAPED body — bigger than the original, not smaller. Rendering that pair would claim a reduction
+  // on a turn where nothing was reduced. `input paused` is the whole truth about the
   // input axis of this turn, and it is what the user needs to read to understand the CTA that follows.
   // It REPLACES an input axis; it never invents one. The hook-only path (`receiptLineOutputOnly`) has
   // no input axis at all, and the ceiling clause alone already explains that line.
@@ -496,58 +642,107 @@ function tierClause(f: ReceiptLineFields): string | undefined {
 }
 
 /**
- * The exact traffic each pause scope names, in the clause's compact vocabulary.
+ * The ceiling clause — the product FACT that explains the refusal above it, and the ONE place the
+ * product mentions converting. `Community limit resets 2026-10-01`, then the CTA. No figure, no
+ * price, one destination.
  *
- * `api-key-route` MUST stay qualified. `optimized-input-v1` is debited on the metered api-key route
- * only; subscription-route full apply is non-debitable by the binding route contract, so an
- * unqualified "full apply paused" is a false
- * statement to every subscription user whose traffic is still being applied normally.
- */
-/**
- * WHAT THE ALLOWANCE PAUSES. `optimized-input-v1` buys INPUT optimization, so that is what stops at
- * the ceiling; output shaping is the Open/base capability and keeps running on the same turn. The
- * subject used to read "full apply", which named a capability the user still partly has — and, beside
- * the tier label this clause exists to explain, read as "nothing is applying".
- */
-const CEILING_CLAUSE_SUBJECT: Record<AllowancePauseScope, string> = {
-  "all-routes": "input optimization",
-  "api-key-route": "API-key input optimization"
-};
-
-/**
- * The ceiling clause — why input optimization is off, when it returns, whether shaping still ran, and
- * the ONE place the product mentions converting. No figure, no price, one destination.
+ * WHAT THE ALLOWANCE PAUSES, AND WHY THE DATE IS THE WHOLE CLAUSE. The optimized-input allowance
+ * buys INPUT optimization, so that is what stops at the ceiling; output shaping is the Open/base
+ * capability and keeps running on the same turn. The clause used to narrate all of that:
+ * `Community limit reached · input optimization paused until 2026-09-01 · output shaping continues`.
+ * Every added clause was true, and each one cost the primary line the property it exists for — being
+ * readable in one glance, mid-turn, by a user who is in the middle of something else. Two of the
+ * three were also being said, better, earlier on the same line:
+ *
+ *  - THE PAUSE — `inputClause` renders `input paused` from the same `inputPaused` predicate, so
+ *    `input optimization paused` was the same fact in the next breath.
+ *  - THE SHAPING — a paused turn that was shaped still draws its output arrow
+ *    (`output 652→512 (−21%, est.)`). That is the measurement; `output shaping continues` was the
+ *    caption under it, and a caption is the weaker of the two.
+ *
+ * The date was the only one of the three the line could not otherwise express, so it is the only one
+ * that survived — folded INTO the clause rather than trailing it. `reached` alone states a wall;
+ * `resets <date>` states the wall and the way out, in fewer characters than the narration it
+ * replaced. A blocked user learns how long they are blocked without leaving the line.
+ *
+ * WHEN THERE IS NO DATE, `communityLimitClause` falls back to the undated `Community limit reached`.
+ * A pause whose period is not datable is still a blocked user, and a clause is still owed to them:
+ * without one the line reads as a bare `apply off`, which describes a refusal as if it were the
+ * user's chosen posture. Neither form names a scope, so a receipt replayed from the period when
+ * metering was api-key-only is not re-narrated as something it never said — the scope qualifier the
+ * old wording needed has nothing left to qualify. The scope still reaches the reader, qualified as it
+ * always was, on the detail surfaces.
+ *
+ * "ALLOWANCE SPENT" IS ABSENT on purpose: it is false for the `insufficient` pause, where tokens
+ * remain and this particular turn is simply larger than they cover. Both forms here are true of both
+ * reasons, which is why they are the forms that survived.
  *
  * Nothing before the ceiling advertises Pro — not the README, not onboarding, not this line while a
  * user is inside their allowance. At the ceiling the user IS blocked, so the
  * conversion pointer is honest here and ONLY here: callers must not set either allowance field on a
  * healthy turn, and the tests pin a Community full-apply turn rendering no CTA at all.
  *
- * IT CARRIES A LINK NOW, NOT A COMMAND. The previous wording ended in
- * `run: compaction upgrade`, which is reachable but asks a blocked user to stop and type. The line has
- * no stdin — it is rendered by the host tool (Claude Code's `statusLine`, Codex's `Stop` hook) — so a
- * prompt is impossible here, but a TERMINAL HYPERLINK needs none: it is inert until clicked. The
- * command remains the fallback and the state surfaces still name it; this line leads with the link.
- * Nothing here opens a browser, and repeating this clause on turn after turn opens nothing either.
- *
- * "ALLOWANCE SPENT" IS GONE from the leading words on purpose: it is false for the `insufficient`
- * pause, where tokens remain and this particular turn is simply larger than they cover.
+ * IT CARRIES A LINK, NOT A COMMAND. The line has no stdin — it is rendered by the host tool (Claude
+ * Code's `statusLine`, Codex's `Stop` hook) — so "press Enter to upgrade" is unreachable here, but a
+ * TERMINAL HYPERLINK needs none: it is inert until clicked. The command remains the fallback and the
+ * state surfaces still name it; this line leads with the link. Nothing here opens a browser, and
+ * repeating this clause on turn after turn opens nothing either.
  */
 function ceilingClause(f: ReceiptLineFields): string | undefined {
   if (f.allowancePauseReason === undefined && f.allowanceResetsOn === undefined) return undefined;
-  const subject = CEILING_CLAUSE_SUBJECT[f.allowancePauseScope ?? "all-routes"];
-  // SCOPE STAYS NAMED even though the input axis may also read `input paused`: that axis cannot say
-  // WHICH traffic stopped, and an unqualified pause is false to a subscription user whose own turns are
-  // still applying. The short redundancy is the price of a clause that is true for every reader.
-  const paused =
-    f.allowanceResetsOn === undefined ? `${subject} paused` : `${subject} paused until ${f.allowanceResetsOn}`;
-  const parts = [COMMUNITY_LIMIT_CLAUSE, paused];
-  if (f.outputShapingContinues === true) parts.push("output shaping continues");
+  const parts = [communityLimitClause(f.allowanceResetsOn)];
   // ONLY IF IT IS STILL AN OFFER. Absent/true ⇒ live turn ⇒ the blocked user gets the one place to
-  // act. Explicit `false` ⇒ this line is a replay of a pause from a period that has ended: the facts
-  // above stay, the action goes.
+  // act. Explicit `false` ⇒ this line is a replay of a pause from a period that has ended: the fact
+  // above stays, the action goes.
   if (f.ctaActionable !== false) parts.push(upgradeCta(f.ctaEnv));
   return parts.join(" · ");
+}
+
+/**
+ * The COUNTDOWN clause: `1.82M/2M left` — optimized-input allowance remaining after this turn, out of
+ * the period's total.
+ *
+ * WHY A HEALTHY LINE CARRIES A NUMBER AT ALL. Before this, a Community user learned the state of their
+ * allowance exactly once: the turn it ran out, in a clause that also asked them to upgrade. Everything
+ * before that read identically at 5% spent and at 99%, so the first signal was indistinguishable from
+ * the sales pitch attached to it. A countdown that is present from the first turn makes the ceiling a
+ * budget the user is watching rather than a wall they walk into.
+ *
+ * NO CTA, NO PRICE, NO ADJECTIVE. It states two counts and stops. `left` is the only word, and it is
+ * true whichever end of the range the reader is at.
+ *
+ * BOTH OR NEITHER, AND ONLY WHEN COHERENT: a remainder above the total describes a lease the server
+ * could not have signed, and a zero total is not a denominator. Either way the clause is dropped
+ * rather than clamped into a number that would look authoritative.
+ */
+function countdownClause(f: ReceiptLineFields): string | undefined {
+  const remaining = f.allowanceRemainingTokens;
+  const total = f.allowancePeriodTotalTokens;
+  if (typeof remaining !== "number" || typeof total !== "number") return undefined;
+  if (!Number.isFinite(remaining) || !Number.isFinite(total)) return undefined;
+  if (total <= 0 || remaining < 0 || remaining > total) return undefined;
+  return `${compactTokens(remaining)}/${compactTokens(total)} left`;
+}
+
+/**
+ * Copy a receipt's recorded allowance SNAPSHOT onto the render fields. SHARED by every surface that
+ * renders a per-turn line, for the same reason `receiptCeiling` is: one turn, one countdown, whichever
+ * surface draws it.
+ *
+ * READ OFF THE RECEIPT, never off current device state — the binding precedent is `receiptCeiling`.
+ * A replayed receipt from three weeks ago must show the allowance THAT turn left behind, not today's;
+ * and a statusline that re-read the lease or the journal on every render would put a file read (and,
+ * once renewal is involved, a network call) inside the render loop.
+ *
+ * A PAUSE WINS. The gateway already declines to record a snapshot on a paused turn, and this is the
+ * second half of the same rule, enforced where the line is drawn: a receipt carrying both — a legacy
+ * record, or a future writer that forgets — renders the pause and drops the countdown.
+ */
+function applyAllowanceSnapshot(fields: ReceiptLineFields, receipt: GatewayReceipt): void {
+  const snapshot = receipt.allowance_snapshot;
+  if (snapshot === undefined || receipt.allowance_pause !== undefined) return;
+  fields.allowanceRemainingTokens = snapshot.remaining_tokens;
+  fields.allowancePeriodTotalTokens = snapshot.period_total_tokens;
 }
 
 /**
@@ -566,33 +761,66 @@ function ceilingClause(f: ReceiptLineFields): string | undefined {
 export { upgradeNoticeLines, type UpgradeNoticeInput } from "../upgrade-cta.js";
 
 /**
- * Output, as a before→after when a calibrated saving backs it; otherwise a plain count.
+ * Output, as a before→after when a MEASURED saving backs it; otherwise a plain count.
  *
  * The AFTER is this turn's real, provider-reported output. The BEFORE is DERIVED — actual + the
  * calibrated estimate of what shaping removed — because the unshaped turn was never generated. That is
- * why the clause carries an estimate label (`est.` / `est. · default prior`) while the input before→after
- * beside it does not: the input arrow is
- * measured bytes, this one is a reconstruction.
+ * why the clause carries the `est.` label while the input before→after beside it does not: the input
+ * arrow is measured bytes, this one is a reconstruction.
  *
- * With no calibrated rate the clause stays a plain count: no arrow, no fabricated before.
+ * A DEFAULT-PRIOR BASIS RENDERS NO ARROW. The shipped 0.47 starting rate produces a perfectly specific
+ * `777→412 (−47%)`, and specificity is exactly what makes it read as counted on a device that has counted
+ * nothing. `loadCalibrationReduction` already refuses to hand a prior over as `measured`, so the store path
+ * cannot reach this; the check below holds the rule against every OTHER caller — README examples, onboarding
+ * copy, any future surface — so the constant is unrenderable as a per-run figure through all of them.
+ *
+ * With no applicable rate, a proven-shaped caller requests the explicitly unknown N/A axis. An
+ * unshaped caller stays plain, while the generic prior is independently barred from reconstruction.
  */
+/**
+ * The output clause on a turn with NO defensible saving to show. Two different facts land here, and
+ * they get two different lines.
+ *
+ * SHAPING RAN AND WE CANNOT YET SIZE IT (`unseeded` / `calibrating`). The axis stays, with both unknown
+ * slots stated as unknown: `output N/A→412 (N/A%, est.)`. A plain `output 412` is not wrong, but it is
+ * the same line an unshaped turn prints, so it silently deletes the one thing this turn does know —
+ * that shaping ran on it. `N/A` fabricates nothing: it is a refusal to fill the slot, in the slot.
+ *
+ * EMPIRICAL EVIDENCE FOUND NO REDUCTION (`measured-no-effect`), or we do not know which case this
+ * is (state ABSENT): a plain `output 412`. Drawing `N/A→` over a measured null would overwrite the
+ * device's own answer with our uncertainty — the same substitution, in the same direction, that the
+ * default prior was withdrawn for. The shared resolver never returns that prior; this is the same rule
+ * at the render site.
+ *
+ * The arrow requires `estimatedOutputSavedRequested`, so a record turn, an unshaped turn, or a surface
+ * that cannot prove shaping ran never reaches the unknown form at all.
+ */
+function unmeasuredOutputClause(f: ReceiptLineFields): string {
+  const plain = `output ${group(f.outputTokens as number)}`;
+  if (f.estimatedOutputSavedRequested !== true) return plain;
+  const state = f.estimatedOutputSavedState;
+  if (state !== "unseeded" && state !== "calibrating") return plain;
+  return `output ${NOT_AVAILABLE}→${group(f.outputTokens as number)} (${NOT_AVAILABLE}%, ${CALIBRATED_ESTIMATE_MARKER})`;
+}
+
 function outputClause(f: ReceiptLineFields): string | undefined {
   if (f.outputTokens === undefined) return undefined;
   const saved = f.estimatedOutputTokensSaved;
   const calibrated =
     f.estimatedOutputSavedRequested === true &&
     f.estimatedOutputSavedCalibrated === true &&
+    f.estimatedOutputSavedBasis !== "default-prior" &&
     typeof saved === "number" &&
     Number.isFinite(saved) &&
     saved > 0;
-  if (!calibrated) return `output ${group(f.outputTokens)}`;
+  if (!calibrated) return unmeasuredOutputClause(f);
   const before = f.outputTokens + (saved as number);
   // The percentage is derived from the SAME pair shown, so the arrow and the % can never disagree.
   // The estimate label is what separates this from the input clause's measured `−PP%` — same glyph,
-  // different provenance, and the label is the only thing carrying that difference to the reader. Its
-  // EXACT form encodes WHOSE evidence backs the rate (G7): `est.` for this device's own A/B, and
-  // `est. · default prior` for the shipped starting rate — a default prior must never read as measured.
-  const marker = outputEstimateMarker(f.estimatedOutputSavedBasis);
+  // different provenance, and the label is the only thing carrying that difference to the reader. It is
+  // unconditional now: an arrow reaching this point is backed by exact-key confirmed A/B evidence, because a prior
+  // was refused above.
+  const marker = CALIBRATED_ESTIMATE_MARKER;
   //
   // INTEGER ROUNDING MUST NOT REACH AN IMPOSSIBLE ENDPOINT. One saved
   // token out of 1,000 rounds to `−0%`, which erases a real saving; a large ratio rounds to `−100%`,
@@ -614,18 +842,41 @@ function outputClause(f: ReceiptLineFields): string | undefined {
  */
 function applyEstimatedSaved(
   fields: ReceiptLineFields,
-  estimatedSaved: { calibrated: boolean; tokensSaved?: number; basis?: OutputEstimateBasis } | undefined
+  estimatedSaved: InjectedOutputEstimate | undefined
 ): void {
   if (!estimatedSaved) return;
   fields.estimatedOutputSavedRequested = true;
   fields.estimatedOutputSavedCalibrated = estimatedSaved.calibrated;
   if (typeof estimatedSaved.tokensSaved === "number") fields.estimatedOutputTokensSaved = estimatedSaved.tokensSaved;
   if (estimatedSaved.basis !== undefined) fields.estimatedOutputSavedBasis = estimatedSaved.basis;
+  if (estimatedSaved.state !== undefined) fields.estimatedOutputSavedState = estimatedSaved.state;
+}
+
+/**
+ * A receipt that proves shaping active owns an output-counterfactual axis even when its caller could
+ * not resolve calibration. Keep that axis explicitly unavailable instead of silently making the turn
+ * look unshaped. An explicit estimate (including a measured-no-effect result) always wins.
+ */
+function applyReceiptEstimatedSaved(
+  fields: ReceiptLineFields,
+  receipt: GatewayReceipt,
+  estimatedSaved: InjectedOutputEstimate | undefined
+): void {
+  applyEstimatedSaved(
+    fields,
+    estimatedSaved ??
+      (outputShapingActiveForTurn(receipt, false)
+        ? { calibrated: false, state: "unseeded" }
+        : undefined)
+  );
 }
 
 /**
  * Below this the two-decimal render would read `−$0.00`, so the clause is omitted entirely. Half a cent
  * is the smallest amount that rounds up to a displayable `−$0.01`.
+ *
+ * APPLIED IN `valueClause`, which is the ONE place the clause is rendered. It used to be applied at a
+ * single call site instead, so the second builder that set the same field skipped it.
  */
 const MIN_RENDERABLE_USD = 0.005;
 
@@ -647,7 +898,7 @@ function valueClause(f: ReceiptLineFields): string | undefined {
   if (
     typeof f.costReductionUsd === "number" &&
     Number.isFinite(f.costReductionUsd) &&
-    f.costReductionUsd > 0
+    f.costReductionUsd >= MIN_RENDERABLE_USD
   ) {
     return `${formatUsd(f.costReductionUsd)} (list price)`;
   }
@@ -658,7 +909,7 @@ function valueClause(f: ReceiptLineFields): string | undefined {
  * Render the canonical per-turn receipt line from content-free fields. Joins only the clauses that are
  * available with ` · `; omits any clause whose axis is unavailable. Never fabricates a field.
  *
- * Clause order: input · output · [cost] · [tier-label] · [ceiling] · id. The cost clause is the apply
+ * Clause order: input · output · [cost] · [tier-label] · [countdown] · [ceiling] · id. The cost clause is the apply
  * input cost reduction; the output saving rides the output clause, so the two are NOT mutually exclusive
  * and an apply turn renders both. The tier label is the open-core apply-posture (`apply off` /
  * `basic shaping` / `full apply`).
@@ -673,6 +924,11 @@ export function formatReceiptLine(f: ReceiptLineFields): string {
   if (value) parts.push(value);
   const tier = tierClause(f);
   if (tier) parts.push(tier);
+  // The countdown rides with the tier label it belongs to — it is a fact about the Community
+  // allowance, not about this turn's tokens — and it is mutually exclusive with the ceiling clause
+  // below, which describes the same allowance once it has stopped counting down.
+  const countdown = countdownClause(f);
+  if (countdown) parts.push(countdown);
   // The ceiling explanation rides IMMEDIATELY after the tier label it explains, so `apply off` is
   // never read as the user's chosen posture when it is actually a refusal.
   const ceiling = ceilingClause(f);
@@ -686,9 +942,8 @@ export function formatReceiptLine(f: ReceiptLineFields): string {
  *
  * THE QUESTION `isRealApply` CANNOT ANSWER. Output shaping mutates the request too, and it writes the
  * same `estimated_input_tokens_before/after` pair — of a body it made BIGGER. So "mutated, and both
- * estimates are present" is true of a turn that compacted nothing, and reading it as an input apply is
- * what produced the shipped defect: a shaping-only turn rendered `input 75,777→75,883 (−0%)`, an input
- * savings axis over a body that grew. The axis must describe a capability that actually ran.
+ * estimates are present" is true of a turn that compacted nothing, and reading it as an input apply
+ * would render a savings axis over a body that grew. The axis must describe a capability that actually ran.
  *
  * THE SIGNAL IS THE COMPONENT SET, not the arithmetic. `applied_components` is what the engine reports
  * it did, and `lcm-compaction` / `deterministic-compaction` are the components that touch input;
@@ -701,7 +956,7 @@ export function formatReceiptLine(f: ReceiptLineFields): string {
  * historical reduction renderable while refusing the axis to exactly the flat/grown bodies the defect
  * was made of. It is a fallback, not the rule: every live apply path sets components.
  *
- * Mirrors the gateway's own `compactsInput` (server.ts), which decides what `optimized-input-v1` meters.
+ * Mirrors the gateway's own `compactsInput` (server.ts), which decides what the allowance meters.
  * The line and the meter must not disagree about whether input was compacted.
  */
 export function receiptCompactedInput(receipt: GatewayReceipt): boolean {
@@ -772,14 +1027,13 @@ export function receiptLineFromGatewayReceipt(
   /** The allowance RESET date, when this `observe` line is a ceiling refusal rather than the user's
    * chosen posture (see `ReceiptLineFields.allowanceResetsOn`). */
   allowanceResetsOn?: string,
-  /** Which traffic that pause covers (see `AllowancePauseScope`); defaults to the broader `all-routes`. */
-  allowancePauseScope?: AllowancePauseScope,
   /**
    * The calibrated output-saving estimate for this turn, so the line can carry the output before→after
    * arrow. INJECTED because reading the calibration store is async and this renderer is not; callers
-   * that have already loaded it pass it through. Omitted ⇒ a plain `output N`, never a fabricated arrow.
+   * that have already loaded it pass it through. Omitted on a receipt that proves shaping active ⇒
+   * `output N/A→N`; omitted on an unshaped receipt ⇒ plain actual.
    */
-  estimatedSaved?: { calibrated: boolean; tokensSaved?: number; basis?: OutputEstimateBasis },
+  estimatedSaved?: InjectedOutputEstimate,
   /**
    * The allowance ceiling this turn hit, when it hit one. Supersedes the two positional allowance
    * parameters above (which predate the `insufficient` case and cannot express it); pass one or the
@@ -813,27 +1067,207 @@ export function receiptLineFromGatewayReceipt(
     // the published input price. Undefined (⇒ clause omitted) when the model is unpriced or the delta is
     // non-positive — never a fabricated `−$0`.
     //
-    // SUB-CENT REDUCTIONS ARE OMITTED TOO. `formatUsd` rounds to two
-    // decimals, so a real-but-tiny reduction — 1,000 estimated tokens on a $0.15/M model is $0.00015 —
-    // rendered as `−$0.00 (est)`: a value clause announcing no value, which is exactly the fabricated
-    // zero this path is supposed to avoid. Anything that would not round to at least one cent is dropped.
+    // SUB-CENT REDUCTIONS ARE OMITTED TOO — enforced in `valueClause`, not here. `formatUsd` rounds to
+    // two decimals, so a real-but-tiny reduction (1,000 estimated tokens on a $0.15/M model is
+    // $0.00015) rendered as `−$0.00 (list price)`: a value clause announcing no value, which is
+    // exactly the fabricated zero this path exists to avoid. The floor used to live at THIS call site
+    // alone, so the Community full-apply builder below — which sets the same field from the same
+    // function — rendered the zero this one refused to. One rule, one place, both builders.
     const usd = applyInputCostReductionUsd(receipt);
-    if (usd !== undefined && usd >= MIN_RENDERABLE_USD) fields.costReductionUsd = usd;
+    if (usd !== undefined) fields.costReductionUsd = usd;
   } else if (t.prompt_input !== undefined) {
     if (openTier) fields.observedInput = t.prompt_input;
     else fields.inputTokens = t.prompt_input;
   }
 
   if (t.output !== undefined) fields.outputTokens = t.output;
-  applyEstimatedSaved(fields, estimatedSaved);
+  applyReceiptEstimatedSaved(fields, receipt, estimatedSaved);
   if (open === "observe" || open === "basic") fields.tier = open;
-  if (allowanceResetsOn !== undefined) {
-    fields.allowanceResetsOn = allowanceResetsOn;
-    if (allowancePauseScope !== undefined) fields.allowancePauseScope = allowancePauseScope;
-  }
+  if (allowanceResetsOn !== undefined) fields.allowanceResetsOn = allowanceResetsOn;
   applyCeiling(fields, ceiling);
 
   // Nothing honest to print (no input axis, no output) → no line.
+  if (
+    fields.inputTokens === undefined &&
+    fields.observedInput === undefined &&
+    fields.inputBefore === undefined &&
+    fields.outputTokens === undefined
+  ) {
+    return undefined;
+  }
+  return formatReceiptLine(fields);
+}
+
+/**
+/**
+ * The line for a gateway receipt that is NOT a real apply — the turn's counts, with NO posture label.
+ *
+ * CONTRACT. A non-apply receipt renders no tier label at all: never `apply off`, never `full apply`.
+ * `full apply` stays reserved for a REAL apply receipt and is emitted only from
+ * `communityFullApplyReceiptLine` (see the TIER LABELS rule in this file's header — the label rides a
+ * real input before→after, never entitlement alone). `apply off` is the Open OBSERVE posture, the
+ * user's choice of no model-visible mutation; it is not a description of one record-mode call, and a
+ * full-tier device must never emit it. Omitting the label is the honest middle: the line says what the
+ * turn had and claims nothing about what the device is entitled to.
+ *
+ * `communityFullApplyReceiptLine` returns `undefined` on a receipt that mutated nothing. Record-mode
+ * receipts can interleave with apply receipts inside one user task, so a hardcoded fallback posture
+ * would let an auxiliary call take over the visible result. This builder withholds that unsupported
+ * posture claim.
+ *
+ * A PER-RECEIPT FALLBACK, NOT THE POSTURE SURFACE. No single receipt can state the device's posture
+ * across a whole task; that is a run-level statement, over every call between `UserPromptSubmit` and
+ * `Stop`. This builder's only job is to stop one receipt from lying in the gaps between applies.
+ *
+ * NO APPLY AXIS, EVER. There is no before→after and no cost clause here by construction — this builder
+ * is reached precisely when nothing was applied, and `inputTokens` (not `inputBefore`/`inputAfter`) is
+ * the only input form it can set. It cannot fabricate a saving because it has no field to put one in.
+ * `inputAxisOwned` stays true: the gateway saw the request, so `input paused` remains sayable, and the
+ * ceiling / allowance / pause clauses ride the line exactly as on the other gateway builders.
+ *
+ * The numeric OUTPUT arrow rides `estimatedSaved`. Without one, durable shaping provenance produces
+ * the explicit N/A axis; a receipt that does not prove shaping stays plain.
+ */
+export function nonApplyReceiptLine(
+  receipt: GatewayReceipt,
+  /** See `receiptLineFromGatewayReceipt`: injected, and the ONLY route to an output arrow on this line. */
+  estimatedSaved?: InjectedOutputEstimate,
+  /** The allowance RESET date, when this turn was a ceiling refusal (kept so the pause clause survives). */
+  allowanceResetsOn?: string,
+  /** The allowance ceiling this turn hit, when it hit one. */
+  ceiling?: ReceiptLineCeiling
+): string | undefined {
+  const t = receipt.tokens;
+  const fields: ReceiptLineFields = {
+    // A GATEWAY RECEIPT: we saw this request, so `input paused` stays sayable even with no number.
+    // No `tier`: a non-apply receipt carries no posture label (see the contract above).
+    inputAxisOwned: true,
+    shortReceiptId: receipt.receipt_id.slice(0, 8)
+  };
+  if (t.prompt_input !== undefined) fields.inputTokens = t.prompt_input;
+  if (t.output !== undefined) fields.outputTokens = t.output;
+  applyReceiptEstimatedSaved(fields, receipt, estimatedSaved);
+  if (allowanceResetsOn !== undefined) fields.allowanceResetsOn = allowanceResetsOn;
+  applyCeiling(fields, ceiling);
+  applyAllowanceSnapshot(fields, receipt);
+  // Nothing honest to print (no input count, no output) → no line, exactly as the other builders.
+  if (fields.inputTokens === undefined && fields.outputTokens === undefined) return undefined;
+  return formatReceiptLine(fields);
+}
+
+/**
+ * THE RUN LINE — one user request, not one provider call.
+ *
+ * This is the PRIMARY user-facing surface. A single prompt sends Claude Code through many provider
+ * calls, and rendering whichever receipt landed last made the persistent line flicker
+ * `full apply → apply off → full apply` mid-task, because Claude Code's own auxiliary record-mode
+ * calls mutate nothing. Those are micro-events inside one piece of work. The receipts stay exactly as
+ * they are — they are the evidence ledger — and this renders the derived total over them.
+ *
+ * THE POSTURE IS THE RUN'S, NOT THE LAST RECEIPT'S. It is passed in from the device's actual product
+ * tier, so a no-op call inside a full-tier run cannot restate the whole run as `apply off`. That is
+ * also why the posture is NOT derived here from the aggregate's own numbers: a full-tier run that
+ * happened to find nothing to compact is still a full-tier run.
+ *
+ * EVERY NUMBER COMES FROM TOTALS. The percentages are computed once, here, from summed before/after —
+ * never averaged or summed from per-call percentages. The allowance is the run's ENDING level, never
+ * a sum. An axis with no reduction renders as a plain total rather than a `−0%` arrow, so a run that
+ * saved nothing on one axis says so by omission instead of claiming a zero.
+ *
+ * THE TIER GRAMMAR IS THE SAME GRAMMAR THE PER-RECEIPT LINES USE. `input B→A (−PP%)` is reserved for a
+ * real measured input apply regardless of output posture; a non-reducing `observe`/`basic` run reads
+ * `observed input N`.
+ * The allowance CEILING is rendered from the run's own paused call through `receiptCeiling`, so a
+ * blocked user reads the same reason, reset date and conversion path the per-receipt line would show.
+ *
+ * A KNOWN-PARTIAL AGGREGATE CARRIES NO RATE. `incomplete` is the caller saying its read of the ledger
+ * cut the run off; a percentage over part of a run would be a claim the evidence cannot carry, so both
+ * axes fall back to plain totals.
+ */
+export function runAggregateLine(params: {
+  aggregate: RunAggregate;
+  /** The run's posture, derived from its durable receipts — never from the current device setting. */
+  tier?: ReceiptTier;
+  /**
+   * Estimate provenance for the OUTPUT axis. REQUIRED for the run line to draw an output arrow at all:
+   * without it there is no evidence that a rate — let alone a device-measured one — produced the summed
+   * `before`, and the line renders its plain total. This used to be optional decoration on an arrow that
+   * was drawn unconditionally, which was safe only because the one caller happened to set the rate and
+   * the basis together. That coupling was an invariant nothing enforced; this enforces it.
+   */
+  outputBasis?: OutputEstimateBasis;
+  /**
+   * What the run's exact applicability keys resolve about shaping, when shaped calls have no
+   * defensible counterfactual backs. `unseeded`/`calibrating` ⇒ the run states its unknown axis;
+   * `measured-no-effect` or absent ⇒ a plain total.
+   */
+  outputState?: OutputEstimateState;
+  ceiling?: ReceiptLineCeiling;
+  /**
+   * The caller KNOWS the aggregate is missing some of the run's calls (its bounded read cut the run
+   * off). Plain totals only: a rate over a partial run is a claim the evidence cannot carry.
+   */
+  incomplete?: boolean;
+}): string | undefined {
+  const { aggregate } = params;
+  const fields: ReceiptLineFields = { inputAxisOwned: true };
+  if (params.tier !== undefined) fields.tier = params.tier;
+  const rateAllowed = params.incomplete !== true;
+
+  const input = aggregate.input;
+  if (input !== undefined) {
+    // THE INPUT GRAMMAR HOLDS ON THE RUN LINE. Any exact real reduction keeps its measured arrow,
+    // including public explicit deterministic apply; posture changes only the label, never the input
+    // evidence. A non-reducing observe/basic run uses the Open `observed input N` vocabulary.
+    if (rateAllowed && input.after < input.before) {
+      // A real reduction gets the before→after arrow; no reduction gets the plain total it earned.
+      fields.inputBefore = input.before;
+      fields.inputAfter = input.after;
+    } else if (params.tier === "observe" || params.tier === "basic") {
+      fields.observedInput = input.after;
+    } else {
+      fields.inputTokens = input.after;
+    }
+  }
+
+  const output = aggregate.output;
+  if (output !== undefined) {
+    fields.outputTokens = output.after;
+    // The counterfactual rides ONLY on calls whose provenance proved shaping active (`aggregateRun`
+    // fails closed for `absent` and for legacy receipts), so an unshaped run shows a plain total — and
+    // shows it WITHOUT an unknown axis, because nothing was shaped and so no measurement is missing.
+    if (rateAllowed && aggregate.shapedCallCount > 0) {
+      if (output.before > output.after && params.outputBasis !== undefined) {
+        // `calibrated` here means "a usable rate produced this number", NOT "the rate was
+        // device-measured": `basis` is what carries measured-vs-prior to the label, and the caller
+        // decides whether a rate exists at all. Requiring the basis EXPLICITLY is what keeps that
+        // decision the caller's; a summed `before` alone proves only that arithmetic happened.
+        applyEstimatedSaved(fields, {
+          calibrated: true,
+          tokensSaved: output.before - output.after,
+          basis: params.outputBasis,
+          ...(params.outputState !== undefined ? { state: params.outputState } : {})
+        });
+      } else {
+        // SHAPED CALLS, NO DEFENSIBLE COUNTERFACTUAL. The run must not read as a plain total — that is
+        // the line an unshaped run prints — and must not read as `−0%`, which would claim evidence
+        // measured a null it has not measured. `applyEstimatedSaved` with no saving lets the formatter
+        // decide from the state alone, so the run line and the per-call lines reach the unknown axis
+        // through one rule rather than two.
+        applyEstimatedSaved(fields, {
+          calibrated: false,
+          ...(params.outputState !== undefined ? { state: params.outputState } : {})
+        });
+      }
+    }
+  }
+
+  if (aggregate.allowance !== undefined) {
+    fields.allowanceRemainingTokens = aggregate.allowance.remaining_tokens;
+    fields.allowancePeriodTotalTokens = aggregate.allowance.period_total_tokens;
+  }
+  applyCeiling(fields, params.ceiling);
+
   if (
     fields.inputTokens === undefined &&
     fields.observedInput === undefined &&
@@ -858,7 +1292,7 @@ export function receiptLineFromGatewayReceipt(
 export function communityFullApplyReceiptLine(
   receipt: GatewayReceipt,
   /** See `receiptLineFromGatewayReceipt`: injected so the full-apply line can carry the output arrow. */
-  estimatedSaved?: { calibrated: boolean; tokensSaved?: number; basis?: OutputEstimateBasis },
+  estimatedSaved?: InjectedOutputEstimate,
   /**
    * The allowance ceiling, for symmetry with the Open builder. A real full apply and an allowance
    * pause cannot co-occur (a paused turn compacts no input, so `isRealApply` is false and this builder
@@ -894,8 +1328,13 @@ export function communityFullApplyReceiptLine(
   const usd = compactedInput ? applyInputCostReductionUsd(receipt) : undefined;
   if (usd !== undefined) fields.costReductionUsd = usd;
   if (t.output !== undefined) fields.outputTokens = t.output;
-  applyEstimatedSaved(fields, estimatedSaved);
+  applyReceiptEstimatedSaved(fields, receipt, estimatedSaved);
   applyCeiling(fields, ceiling);
+  // READ FROM THE RECEIPT HERE, not passed in like `ceiling`. The countdown needs no environment and
+  // no period arithmetic, so taking it straight off the receipt gives all four surfaces that call this
+  // builder (gateway inline, Claude Code statusline, the Stop-hook capture, `watch`) the same clause
+  // by construction rather than by four call sites remembering to.
+  applyAllowanceSnapshot(fields, receipt);
   return formatReceiptLine(fields);
 }
 
@@ -907,11 +1346,10 @@ export function communityFullApplyReceiptLine(
  *
  * When the caller opts into the estimated-output-saved clause (`estimatedSaved`), the output clause
  * becomes a before→after whose BEFORE is reconstructed from the calibrated rate:
- *   `compaction · output 652→512 (−21%, est.)`                (device-calibrated rate)
- *   `compaction · output 652→512 (−21%, est. · default prior)` (shipped starting prior, no A/B yet)
- *   `compaction · output 512`                                 (no rate at all — plain count, no before)
- * The caller derives `tokensSaved` from the LEARNING calibration rate applied to this turn's output;
- * passing `calibrated: false` (no sample yet) forces the plain count regardless of any count supplied.
+ *   `compaction · output 652→512 (−21%, est.)` (an exact-key confirmed rate)
+ *   `compaction · output N/A→512 (N/A%, est.)` (known exact miss)
+ * The caller derives `tokensSaved` from the shared exact calibration rate applied to this turn's output;
+ * passing `calibrated: false` preserves its explicit state, so every proven-shaped miss renders N/A.
  * The arrow is emitted ONLY when shaping was ACTIVE this turn (a stopped/killed turn was not shaped).
  *
  * Returns undefined when there is no output count to print (nothing honest to say).
@@ -925,15 +1363,13 @@ export function receiptLineOutputOnly(params: {
    * rendered on the line under the canonical grammar. */
   shapingActive: boolean;
   /** Opt-in estimated-output-saved clause (only honored when `shapingActive`). */
-  estimatedSaved?: { calibrated: boolean; tokensSaved?: number; basis?: OutputEstimateBasis };
+  estimatedSaved?: InjectedOutputEstimate;
   /** Open tier label (`observe` → `apply off`, `basic` → `basic shaping`). Omitted → no label. `full`
    * is not accepted on the hook-only path (a real full-apply line comes from the gateway apply route). */
   tier?: "observe" | "basic";
   /** The allowance RESET date, when this `observe` line is a ceiling refusal rather than the user's
    * chosen posture (see `ReceiptLineFields.allowanceResetsOn`). */
   allowanceResetsOn?: string;
-  /** Which traffic that pause covers (see `AllowancePauseScope`); defaults to the broader `all-routes`. */
-  allowancePauseScope?: AllowancePauseScope;
   /**
    * The allowance ceiling, when this surface knows it. Supersedes the two fields above; pass one form
    * or the other. Omitted ⇒ no ceiling clause and no conversion CTA.
@@ -945,23 +1381,15 @@ export function receiptLineOutputOnly(params: {
     outputTokens: params.outputTokens,
     shortReceiptId: undefined,
     ...(params.tier ? { tier: params.tier } : {}),
-    ...(params.allowanceResetsOn ? { allowanceResetsOn: params.allowanceResetsOn } : {}),
-    ...(params.allowanceResetsOn && params.allowancePauseScope
-      ? { allowancePauseScope: params.allowancePauseScope }
-      : {}),
-    ...(params.shapingActive && params.estimatedSaved
-      ? {
-          estimatedOutputSavedRequested: true,
-          estimatedOutputSavedCalibrated: params.estimatedSaved.calibrated,
-          ...(typeof params.estimatedSaved.tokensSaved === "number"
-            ? { estimatedOutputTokensSaved: params.estimatedSaved.tokensSaved }
-            : {}),
-          ...(params.estimatedSaved.basis !== undefined
-            ? { estimatedOutputSavedBasis: params.estimatedSaved.basis }
-            : {})
-        }
-      : {})
+    ...(params.allowanceResetsOn ? { allowanceResetsOn: params.allowanceResetsOn } : {})
   };
+  // THROUGH THE SHARED HELPER, not a hand-spread copy of it. This builder used to enumerate the four
+  // estimate fields itself, so every field added to the estimate had to be remembered in two places —
+  // and this is the HOOK-ONLY path, the first line a fresh subscription install ever prints, which is
+  // exactly the install whose calibration state the omission would have dropped. `shapingActive` still
+  // gates it: a stopped or killed turn was not shaped, so nothing about its output axis may be claimed,
+  // unknown included.
+  if (params.shapingActive) applyEstimatedSaved(fields, params.estimatedSaved);
   applyCeiling(fields, params.ceiling);
   return formatReceiptLine(fields);
 }

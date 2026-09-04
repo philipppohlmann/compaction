@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runStatus } from "../../src/cli/commands/upgrade-status.js";
+import { collectReadinessReport } from "../../src/cli/commands/readiness.js";
 import { CLAUDE_CODE_SHAPING_HOOK_COMMAND } from "../../src/core/claude-code-hooks.js";
 import { SHAPING_STATE_VERSION } from "../../src/core/subscription-shaping-state.js";
 import { SHIM_MARKER } from "../../src/core/tool-shim.js";
@@ -622,5 +623,82 @@ describe("compaction status - shaping state follows the INJECTED env, not the am
     await capture(baseEnv());
     await capture({ ...baseEnv(), COMPACTION_SHAPING_HOOKS: "0" });
     expect(readFileSync(settingsPath, "utf8")).toBe(before);
+  });
+});
+
+/**
+ * THE SAME DEFECT, ONE FIELD OVER: the stored auto-apply AUTHORIZATION.
+ *
+ * The authorization store moved off the working directory and onto the device
+ * (`authorizationStoreDirectory`), which is what let a device-level opt-in be seen from every project.
+ * But the readiness report is built for the env it was HANDED, and its optimization-mode and
+ * connected-workflow fields already honour that env — so resolving the authorization store from the
+ * ambient `process.env` would put two different devices in one report and print next-step commands for
+ * the wrong one ("authorize with `compaction init --authorize-auto-apply claude-code`" to a user who
+ * already has, or silence for a user who has not).
+ *
+ * The two homes below hold OPPOSITE authorization states, so the report cannot be right by coincidence.
+ */
+describe("compaction status - the stored authorization follows the INJECTED env, not the ambient one", () => {
+  let ambientConfigDir: string;
+  let injectedConfigDir: string;
+  let previousAmbient: string | undefined;
+
+  /** The exact record `init --authorize-auto-apply claude-code` writes. */
+  function authorizeIn(dir: string): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "policy-preferences.json"),
+      `${JSON.stringify({
+        preferences: [
+          {
+            id: "pref-000000000000000000000000",
+            scope: { tool: "claude-code", policy_type: "deterministic-dedupe" },
+            preference: "auto-when-gates-pass",
+            enabled: true,
+            gates_required: [
+              "scope-match",
+              "supported-shape",
+              "deterministic-policy",
+              "original-retainable",
+              "change-produced"
+            ]
+          }
+        ]
+      })}\n`,
+      "utf8"
+    );
+  }
+
+  beforeEach(() => {
+    ambientConfigDir = mkdtempSync(join(tmpdir(), "authz-ambient-"));
+    injectedConfigDir = mkdtempSync(join(tmpdir(), "authz-injected-"));
+    previousAmbient = process.env.COMPACTION_CONFIG_DIR;
+    process.env.COMPACTION_CONFIG_DIR = ambientConfigDir;
+  });
+
+  afterEach(() => {
+    if (previousAmbient === undefined) delete process.env.COMPACTION_CONFIG_DIR;
+    else process.env.COMPACTION_CONFIG_DIR = previousAmbient;
+    for (const d of [ambientConfigDir, injectedConfigDir]) rmSync(d, { recursive: true, force: true });
+  });
+
+  async function authorizationsFor(configDirForEnv: string): Promise<Record<string, { authorized: boolean }>> {
+    const report = await collectReadinessReport(
+      mkdtempSync(join(tmpdir(), "authz-cwd-")),
+      { ...process.env, COMPACTION_CONFIG_DIR: configDirForEnv, COMPACTION_HOME: configDirForEnv },
+      join(injectedConfigDir, "no-projects")
+    );
+    return report.authorizations as unknown as Record<string, { authorized: boolean }>;
+  }
+
+  it("reports NOT authorized for an injected device that has no authorization, even when the ambient one does", async () => {
+    authorizeIn(ambientConfigDir); // the machine running the test "has" an authorization
+    expect((await authorizationsFor(injectedConfigDir))["claude-code"].authorized).toBe(false);
+  });
+
+  it("reports AUTHORIZED for an injected device that has one, even when the ambient one does not", async () => {
+    authorizeIn(injectedConfigDir); // …and the opposite arrangement, so neither answer can be a constant
+    expect((await authorizationsFor(injectedConfigDir))["claude-code"].authorized).toBe(true);
   });
 });

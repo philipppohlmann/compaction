@@ -30,7 +30,8 @@ export const READY_METRIC_SURFACES = ["claude_code", "codex", "cursor", "cli"] a
  *  - Claude Code / Codex print a per-turn line (input+output) ONLY on the Gateway route. An input `−NN%`
  *    before→after is a REAL apply reduction only; on an apply turn the value clause is the computed
  *    provider-priced cost reduction `−$X (est)`; output is never a reduction.
- *  - Cursor prints NO per-turn line, it is session-level only (no per-call route the vendor exposes).
+ *  - Cursor prints NO inline per-turn line because its post-turn hook exposes no display field;
+ *    Compaction's reliable shaping path remains the session-level `sessionStart` hook.
  *  - No per-turn output-reduction %, ever.
  */
 export const READY_PER_TURN_HEADER = "After each turn you'll see one content-free receipt line:";
@@ -44,8 +45,9 @@ const READY_PER_TURN_HEADER_SOME =
   "After each turn you'll see one content-free receipt line from the workflows below that print one:";
 
 /**
- * The header for a set with no unhedged per-turn line - a Cursor-only setup (Cursor has no display
- * channel at all), or a Codex-only one (its own body line is hedged on whether the build renders it).
+ * The header for a set with no unhedged per-turn line - a Cursor-only setup (Cursor's post-turn hook
+ * has no inline display field), or a Codex-only one (its own body line is hedged on whether the build
+ * renders it).
  * A promise here is withdrawn or qualified by the very next line, so the block is LABELLED rather than
  * promised; the body states, per workflow, what is printed instead and where the counts do show up.
  */
@@ -83,14 +85,11 @@ export const READY_PER_TURN_LINES = [
 ] as const;
 
 /**
- * The Cursor per-turn line. CORRECTED 2026-08-04 against the Cursor app bundle, not assumption.
- *
- * The old copy blamed "no per-call route". The route gap is real but it is not what stops the line:
- * Cursor HAS a post-turn hook (`stop`), and its payload even carries the turn's input/output/cache
- * token counts. What it lacks is any way to SAY something - the whole `stop` response schema is
- * `{followup_message?}`, and that is submitted as a new user turn rather than displayed. So there is
- * no inline line because there is no display channel, and Cursor's numbers belong in `compaction
- * watch` / `status` instead.
+ * Cursor exposes `beforeSubmitPrompt`, whose response accepts `additional_context`, and it also has a
+ * post-turn `stop` hook whose payload carries the turn's input/output/cache token counts. Inline
+ * display is a separate limitation: the whole `stop` response schema is `{followup_message?}`, and
+ * that is submitted as a new user turn rather than displayed. Cursor's numbers therefore belong in
+ * `compaction watch` / `status` instead.
  */
 const READY_PER_TURN_CURSOR_LINE =
   "  Cursor: no inline line - Cursor has no channel to display one; see `compaction watch`. Session-level only (one instruction per session, not per turn); local-estimate counts only.";
@@ -188,7 +187,8 @@ function readyPerTurnHeader(enabledToolKeys: readonly ReadyToolKey[]): string {
  * Boundaries preserved:
  *  - Claude Code (Gateway route + hook-only): input reduction is provider-cache/before→after, never output.
  *  - Codex (Gateway route): a per-turn line only on the Gateway route.
- *  - Cursor: NO per-turn line (session-level only; no per-call route the vendor exposes).
+ *  - Cursor: NO inline per-turn line because the post-turn response has no display field; the shipped
+ *    shaping path remains the reliable session-level hook.
  *  - Content-free scope + the COMPACTION_RECEIPT_LINE=0 silence line always close the block.
  * The dropped "Input reduction is shown only on the Gateway route…" meta line is not needed once the
  * block is scoped to the enabled tool(s); the per-example labels already carry that boundary.

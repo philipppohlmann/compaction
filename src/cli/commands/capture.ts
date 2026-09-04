@@ -100,7 +100,7 @@ async function handleCaptureFromShim(
 function applyOutputShapingFlag(
   commandParts: string[],
   options: { outputShaping?: boolean; verbosityBudget?: string; outputShapingPolicies?: string }
-): { commandParts: string[]; lines: string[]; policyNames: string[] } {
+): { commandParts: string[]; lines: string[]; policyNames: string[]; policyVersion?: string } {
   if (!options.outputShaping) return { commandParts, lines: [], policyNames: [] };
   const budget = options.verbosityBudget !== undefined ? Number.parseInt(options.verbosityBudget, 10) : undefined;
   const policies = options.outputShapingPolicies
@@ -116,7 +116,12 @@ function applyOutputShapingFlag(
         chalk.gray(`  ${OUTPUT_SHAPING_HONESTY_NOTE}`)
       ]
     : [chalk.yellow(`  Output-shaping NOT attached: ${att.reason}.`)];
-  return { commandParts: att.commandParts, lines, policyNames: att.applied.map((a) => a.policy_name) };
+  return {
+    commandParts: att.commandParts,
+    lines,
+    policyNames: att.applied.map((a) => a.policy_name),
+    ...(att.policyVersion !== undefined ? { policyVersion: att.policyVersion } : {})
+  };
 }
 
 /**
@@ -128,7 +133,8 @@ async function writeCaptureUsageSidecar(
   outDir: string,
   tool: ToolName,
   usage: UsageMetadata,
-  policyNames: string[]
+  policyNames: string[],
+  policyVersion?: string
 ): Promise<string> {
   const sidecar = buildCaptureUsageSidecar({
     tool,
@@ -139,7 +145,7 @@ async function writeCaptureUsageSidecar(
     providerReported: usage.provider_reported_tokens === true,
     tokenSource: captureTokenSource(usage),
     tokenMetadataStatus: usage.provider_reported_tokens === true ? "present" : "missing",
-    ...(policyNames.length > 0 ? { policyNames } : {})
+    ...(policyNames.length > 0 && policyVersion ? { policyNames, policyVersion } : {})
   });
   const sidecarPath = path.join(outDir, "capture-usage.json");
   await writeFile(sidecarPath, JSON.stringify(sidecar, null, 2), "utf8");
@@ -252,7 +258,7 @@ export function registerCaptureCommand(program: Command): void {
       console.log(chalk.green(`Wrote ${tracePath}`));
 
       // Content-free A/B evidence sidecar (provider-reported counts + policy names) for output-shaping-ab.
-      const usagePath = await writeCaptureUsageSidecar(outDir, "codex", result.usageMetadata, shaped.policyNames);
+      const usagePath = await writeCaptureUsageSidecar(outDir, "codex", result.usageMetadata, shaped.policyNames, shaped.policyVersion);
       console.log(chalk.green(`Wrote ${usagePath}`));
 
       // Unified flow: content-free record (input/output separate + honest source) when hosted-configured.
@@ -273,7 +279,7 @@ export function registerCaptureCommand(program: Command): void {
     .command("cursor")
     .description(
       "Capture a LIVE Cursor headless CLI run (or saved output) into AgentTrace - no manual import. " +
-        "LOCAL-ESTIMATE tokens only (Cursor emits no usage); output counted from the result field where " +
+        "LOCAL-ESTIMATE tokens only because Compaction does not ingest Cursor's conditional result.usage; output counted from the result field where " +
         "separable (use --output-format json), else marked unavailable. Local only, no upload, no SQLite."
     )
     .option("--out <dir>", "Output directory for capture artifacts")
@@ -293,7 +299,7 @@ export function registerCaptureCommand(program: Command): void {
       }
 
       console.log(chalk.cyan("compaction capture cursor"));
-      console.log("Capturing a local Cursor headless run. LOCAL-ESTIMATE tokens only (Cursor emits no provider usage). No upload, no SQLite. Review the artifact before sharing.");
+      console.log("Capturing a local Cursor headless run. LOCAL-ESTIMATE tokens only because Compaction does not ingest Cursor's conditional result.usage. No upload, no SQLite. Review the artifact before sharing.");
 
       if (!options.out) {
         console.error("error: --out <dir> is required (except with --from-shim).");
@@ -364,7 +370,7 @@ export function registerCaptureCommand(program: Command): void {
 
       // Content-free sidecar. Cursor is local-estimate (providerReported=false) → A/B treats it as
       // unavailable for a provider-reported savings number; it can never produce a confirmed claim.
-      const usagePath = await writeCaptureUsageSidecar(outDir, "cursor", result.usageMetadata, shaped.policyNames);
+      const usagePath = await writeCaptureUsageSidecar(outDir, "cursor", result.usageMetadata, shaped.policyNames, shaped.policyVersion);
       console.log(chalk.green(`Wrote ${usagePath}`));
 
       if (hostedConfigured()) {

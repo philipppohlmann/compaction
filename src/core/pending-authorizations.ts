@@ -25,9 +25,13 @@
  *  - THE AUTHORIZATION IT WRITES IS IDENTICAL. Same `savePolicyPreference` call, same narrow per-tool
  *    scope, same `AUTO_APPLY_ELIGIBILITY_GATES`. The gateway still evaluates every gate per request.
  *
- * WHERE IT LIVES. Beside the authorization store it feeds (`.compaction/policy-preferences.json`), so a
- * consent given in one project redeems into that same project's authorizations and nowhere else. The
- * directory is the only scoping either store has.
+ * WHERE IT LIVES. Beside the authorization store it feeds (`policy-preferences.json`), which is the
+ * DEVICE store — `~/.compaction`, `COMPACTION_CONFIG_DIR`-overridable. Both used to default to the
+ * RELATIVE `.compaction`, so a consent recorded in one project could only ever redeem while the user
+ * happened to be standing in that same project, and the authorization it wrote was invisible from
+ * everywhere else (the 0.6.6 apply blocker, in its Codex-shaped form). The directory was never a scope
+ * anyone chose; the authorization record carries its own scope (`tool`, `policy_type`, `repo` when
+ * pinned), and the shim whose activation redeems the consent is itself device-wide.
  *
  * FAIL-OPEN, NEVER FAIL-CLOSED-INTO-AUTHORIZING. Every read path treats a missing/corrupt/foreign file
  * as "no pending consent". Local file I/O only; no network.
@@ -36,7 +40,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   AUTO_APPLY_ELIGIBILITY_GATES,
-  DEFAULT_POLICY_PREFERENCES_DIRECTORY,
+  authorizationStoreDirectory,
   savePolicyPreference
 } from "./policy-preferences.js";
 import { DEDUPE_POLICY } from "./gateway/request-shape.js";
@@ -74,7 +78,7 @@ function storePath(directory: string): string {
  * dropped. Order is canonical, not file order.
  */
 export async function readPendingConsents(
-  directory: string = DEFAULT_POLICY_PREFERENCES_DIRECTORY
+  directory: string = authorizationStoreDirectory()
 ): Promise<CarryableConsentWorkflow[]> {
   let raw: string;
   try {
@@ -117,7 +121,7 @@ async function writePendingConsents(
  */
 export async function recordPendingConsent(
   workflow: CarryableConsentWorkflow,
-  directory: string = DEFAULT_POLICY_PREFERENCES_DIRECTORY
+  directory: string = authorizationStoreDirectory()
 ): Promise<void> {
   const existing = await readPendingConsents(directory);
   if (existing.includes(workflow)) return;
@@ -131,7 +135,7 @@ export async function recordPendingConsent(
  */
 export async function clearPendingConsent(
   workflow: CarryableConsentWorkflow,
-  directory: string = DEFAULT_POLICY_PREFERENCES_DIRECTORY
+  directory: string = authorizationStoreDirectory()
 ): Promise<void> {
   const existing = await readPendingConsents(directory);
   if (!existing.includes(workflow)) return;
@@ -157,7 +161,7 @@ export interface RedeemResult {
  * the user can act on it.
  */
 export async function redeemPendingConsents(
-  directory: string = DEFAULT_POLICY_PREFERENCES_DIRECTORY,
+  directory: string = authorizationStoreDirectory(),
   env: NodeJS.ProcessEnv = process.env
 ): Promise<RedeemResult> {
   const pending = await readPendingConsents(directory);

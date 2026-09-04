@@ -1,4 +1,6 @@
-node_modules/
+# No trailing slash: a trailing slash matches directories only, and a node_modules
+# SYMLINK (as worktrees use) is a file entry that slips straight past it.
+node_modules
 dist/
 .compaction/
 .env

@@ -35,7 +35,7 @@ afterEach(() => {
   for (const d of [configDir, cwd]) if (d) rmSync(d, { recursive: true, force: true });
 });
 
-/** The narrow authorization onboarding writes for a Full-optimization run, in this temp cwd. */
+/** The narrow authorization onboarding writes for a Full-optimization run, on this temp DEVICE. */
 async function authorize(tool: string): Promise<void> {
   const result = await savePolicyPreference(
     {
@@ -44,7 +44,7 @@ async function authorize(tool: string): Promise<void> {
       enabled: true,
       gates_required: [...AUTO_APPLY_ELIGIBILITY_GATES]
     },
-    join(cwd, ".compaction")
+    configDir // device-scoped: the authorization is not a property of any working directory
   );
   expect(result.saved, "the fixture authorization must actually persist").toBe(true);
 }
@@ -52,42 +52,42 @@ async function authorize(tool: string): Promise<void> {
 describe("pendingFullApplyGate — the local gates between a valid lease and a real full apply", () => {
   it("the DEFAULT Output-only mode holds full apply back, and says which setting does it", async () => {
     // Nothing persisted: the default optimization mode is `cache`, i.e. the stepper's "Output only".
-    expect(await pendingFullApplyGate(["claude-code"], cwd, env)).toBe(FULL_APPLY_PENDING_REASONS.optimizationMode);
+    expect(await pendingFullApplyGate(["claude-code"], env)).toBe(FULL_APPLY_PENDING_REASONS.optimizationMode);
   });
 
   it("Output-only holds it back even WITH an authorization saved (both gates are required)", async () => {
     await authorize("claude-code");
     writeOptimizationMode("cache", env);
-    expect(await pendingFullApplyGate(["claude-code"], cwd, env)).toBe(FULL_APPLY_PENDING_REASONS.optimizationMode);
+    expect(await pendingFullApplyGate(["claude-code"], env)).toBe(FULL_APPLY_PENDING_REASONS.optimizationMode);
   });
 
   it("Full optimization with NO stored authorization reports the authorization gate", async () => {
     writeOptimizationMode("cache-plus-context", env);
-    expect(await pendingFullApplyGate(["claude-code"], cwd, env)).toBe(FULL_APPLY_PENDING_REASONS.applyAuthorization);
+    expect(await pendingFullApplyGate(["claude-code"], env)).toBe(FULL_APPLY_PENDING_REASONS.applyAuthorization);
   });
 
   it("an authorization for a DIFFERENT workflow does not count for the one that was enabled", async () => {
     writeOptimizationMode("cache-plus-context", env);
     await authorize("codex");
-    expect(await pendingFullApplyGate(["claude-code"], cwd, env)).toBe(FULL_APPLY_PENDING_REASONS.applyAuthorization);
+    expect(await pendingFullApplyGate(["claude-code"], env)).toBe(FULL_APPLY_PENDING_REASONS.applyAuthorization);
   });
 
   it("nothing enabled ⇒ no turn on this device can be a full apply", async () => {
     writeOptimizationMode("cache-plus-context", env);
     await authorize("claude-code");
-    expect(await pendingFullApplyGate([], cwd, env)).toBe(FULL_APPLY_PENDING_REASONS.applyAuthorization);
+    expect(await pendingFullApplyGate([], env)).toBe(FULL_APPLY_PENDING_REASONS.applyAuthorization);
   });
 
   it("BOTH gates satisfied ⇒ nothing pending, and only then may the screen say `full apply`", async () => {
     writeOptimizationMode("cache-plus-context", env);
     await authorize("claude-code");
-    expect(await pendingFullApplyGate(["claude-code"], cwd, env)).toBeUndefined();
+    expect(await pendingFullApplyGate(["claude-code"], env)).toBeUndefined();
   });
 
   it("any one enabled workflow being authorized is enough (the gateway applies per workflow)", async () => {
     writeOptimizationMode("cache-plus-context", env);
     await authorize("codex");
-    expect(await pendingFullApplyGate(["claude-code", "codex"], cwd, env)).toBeUndefined();
+    expect(await pendingFullApplyGate(["claude-code", "codex"], env)).toBeUndefined();
   });
 
   it("every reason it can return is a fixed, content-free label (no path, no id, no count)", async () => {

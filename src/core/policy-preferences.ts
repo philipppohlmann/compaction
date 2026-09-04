@@ -21,10 +21,42 @@
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { compactionConfigDir } from "./config-dir.js";
 
 /** Default local preference file (under the gitignored `.compaction/`). */
 export const DEFAULT_POLICY_PREFERENCES_DIRECTORY = ".compaction";
 export const POLICY_PREFERENCES_FILENAME = "policy-preferences.json";
+
+/**
+ * WHERE AN AUTHORIZATION LIVES: the DEVICE, and ONLY the device.
+ *
+ * An auto-apply authorization is the permission to mutate the user's real request bytes before they
+ * reach the provider. Two properties follow, and this resolver is where both are enforced.
+ *
+ * IT IS DEVICE-SCOPED, NOT DIRECTORY-SCOPED. The record carries its own scope (`{tool, policy_type}`,
+ * plus `repo` when the user narrows it) and every other condition the apply guard checks — optimization
+ * mode, connected workflows, the entitlement lease, `compaction stop` — is device-level under
+ * `~/.compaction`. The store was the one exception: it defaulted to the RELATIVE `.compaction`, so the
+ * authorization landed in whatever cwd `compaction init --authorize-auto-apply` happened to run in and
+ * was invisible from everywhere else. Authorizing from `$HOME` and then running `claude` inside a
+ * project silently dropped that project to record-only, with `compaction policies list` unable to even
+ * show the authorization that existed (the 0.6.6 release blocker). The directory was never a scope the
+ * user chose; it was the cwd of one command.
+ *
+ * AND NOTHING UNDER A WORKING DIRECTORY MAY GRANT IT. `<cwd>/.compaction/policy-preferences.json` is a
+ * file a repository can commit, and a clone is not consent: content that arrives with a checkout must
+ * never be able to arm input mutation on a device whose owner never authorized it. So the legacy
+ * project-local store is not read as an authorization source at all — not as a fallback, not when the
+ * device store is missing, never. There is no ancestor walk and no cwd lookup on this path. A user
+ * whose only authorization was written into a project by an earlier version fails CLOSED (record-only)
+ * and authorizes once more; that is strictly preferable to repository content granting mutation.
+ *
+ * `COMPACTION_CONFIG_DIR` overrides the location exactly as it does for every other content-free store
+ * (tests point it at a tmpdir; the real `~/.compaction` is never touched by tests).
+ */
+export function authorizationStoreDirectory(env: NodeJS.ProcessEnv = process.env): string {
+  return compactionConfigDir(env);
+}
 
 /** The binary preference (mirror of `AUTO_APPLY_PREFERENCES` in activity-event.ts). Default = ask. */
 export const POLICY_PREFERENCE_VALUES = ["ask-each-time", "auto-when-gates-pass"] as const;
@@ -169,7 +201,7 @@ function preferencesPath(directory: string): string {
 
 /** Read all stored preferences. A missing file means "none saved yet" (empty, not an error). */
 export async function readPolicyPreferences(
-  directory: string = DEFAULT_POLICY_PREFERENCES_DIRECTORY
+  directory: string = authorizationStoreDirectory()
 ): Promise<{ preferences: PolicyPreference[] }> {
   let raw: string;
   try {
@@ -214,7 +246,7 @@ export type SavePolicyPreferenceResult =
  */
 export async function savePolicyPreference(
   input: SavePolicyPreferenceInput,
-  directory: string = DEFAULT_POLICY_PREFERENCES_DIRECTORY
+  directory: string = authorizationStoreDirectory()
 ): Promise<SavePolicyPreferenceResult> {
   const problems = validatePolicyPreferenceScope(input.scope).problems;
   if (!POLICY_PREFERENCE_VALUES.includes(input.preference)) {
@@ -259,7 +291,7 @@ export type DisablePolicyPreferenceResult =
  */
 export async function disablePolicyPreference(
   id: string,
-  directory: string = DEFAULT_POLICY_PREFERENCES_DIRECTORY
+  directory: string = authorizationStoreDirectory()
 ): Promise<DisablePolicyPreferenceResult> {
   const { preferences } = await readPolicyPreferences(directory);
   const index = preferences.findIndex((entry) => entry.id === id);
@@ -281,7 +313,7 @@ export async function disablePolicyPreference(
 /** Look up one preference by id (read-only). */
 export async function findPolicyPreference(
   id: string,
-  directory: string = DEFAULT_POLICY_PREFERENCES_DIRECTORY
+  directory: string = authorizationStoreDirectory()
 ): Promise<PolicyPreference | undefined> {
   const { preferences } = await readPolicyPreferences(directory);
   return preferences.find((entry) => entry.id === id);

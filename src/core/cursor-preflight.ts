@@ -14,9 +14,9 @@
  * - **SAFE probes only.** Probing is limited to `--help` / `-v` / `--version` style invocations. This
  *   module NEVER runs a real `-p` prompt, NEVER runs `cursor agent login`, and NEVER reads, sets, or
  *   prints `CURSOR_API_KEY`.
- * - **Auth-state is NOT detected.** Cursor's auth state cannot be observed without a real (spending)
- *   call, so this module detects **CLI-presence + capability only** and tells the operator to run
- *   `cursor agent login` (or set `CURSOR_API_KEY`) and retry. It never guesses "authenticated".
+ * - **Auth-state is NOT checked here.** Cursor exposes a read-only `status|whoami` command, but this
+ *   preflight deliberately limits itself to help/version capability probes. It points the operator to
+ *   `cursor-agent status` and Cursor's normal authentication flow; it never guesses "authenticated".
  * - **Fail friendly.** A probe that errors/crashes is treated as "not detectable", never a thrown
  *   exception, the pure logic here is total over its synthetic inputs.
  * - **Content-free.** No prompt, no output, no credential value is ever read or emitted.
@@ -64,8 +64,8 @@ export interface CursorPreflightReport {
   /** Whether the resolved CLI advertises the headless capability (`-p`/`--print` + `--output-format`). */
   capabilityPresent: boolean;
   /**
-   * Auth is intentionally NEVER probed (would require a real, spending call). Always "not-checked" so
-   * no caller can mistake this for an "authenticated" signal.
+   * Auth is intentionally NEVER probed by this help-only preflight. Always "not-checked" so no caller
+   * can mistake CLI capability for an "authenticated" signal.
    */
   authState: "not-checked";
   /** Overall readiness of the LOCAL PREP surface: ready = CLI resolvable AND capability present. */
@@ -108,7 +108,7 @@ export function classifyCursorPreflight(probes: CursorProbeResult[]): CursorPref
   );
   // Auth is deliberately NOT probed - say so explicitly so nobody reads readiness as "authenticated".
   guidance.push(
-    "  - Auth: NOT checked here (detecting it needs a real, spending call). After the steps below, run `cursor agent login` (or set CURSOR_API_KEY) and retry."
+    "  - Auth: NOT checked here. Check with `cursor-agent status`; if signed out, use Cursor's normal authentication flow (`cursor-agent login`, or `cursor agent login` from the editor launcher) and retry."
   );
 
   if (!cliResolvable) {
@@ -135,12 +135,12 @@ export function classifyCursorPreflight(probes: CursorProbeResult[]): CursorPref
     guidance.push(`       ${CURSOR_EXAMPLE_RUN_COMMAND}`);
   } else {
     guidance.push("");
-    guidance.push("The Cursor headless CLI is present and capable. Auth is the only remaining prerequisite (not checked here):");
-    guidance.push("  1. Authenticate: run `cursor agent login`, OR export CURSOR_API_KEY.");
+    guidance.push("The Cursor headless CLI is present and capable. This preflight does not check auth:");
+    guidance.push("  1. Check auth: run `cursor-agent status`. If signed out, use Cursor's normal authentication flow (`cursor-agent login`, or `cursor agent login` from the editor launcher), OR export CURSOR_API_KEY.");
     guidance.push("  2. Then run the live flow:");
     guidance.push(`       ${CURSOR_EXAMPLE_RUN_COMMAND}`);
     guidance.push(
-      "  Note: Cursor tokens are LOCAL-ESTIMATE only (Cursor emits no provider usage) - provider-reported tokens are unavailable and no savings is claimed."
+      "  Note: Cursor tokens are LOCAL-ESTIMATE only because Compaction does not ingest Cursor's conditional result.usage fields - no provider-reported tokens or savings are claimed."
     );
   }
 

@@ -5,23 +5,19 @@ import type { CodexHookGroup, CodexHooksConfig } from "./subscription-shaping-ho
  *
  * Gives Codex the per-turn receipt line Claude Code gets from its `statusLine`.
  *
- * WHY A HOOK AND NOT A STATUS LINE — verified against codex-cli 0.144.1, not assumed. Codex DOES have
+ * WHY A HOOK AND NOT A STATUS LINE — verified against the installed Codex artifact, not assumed. Codex DOES have
  * a status line, but `[tui] status_line` is an ARRAY OF STRINGS selecting Codex's own built-in
  * segments (`StatusLineGitSummary`, `StatusLineBranchUpdated`, `StatusLinePullRequest`,
  * `StatusLineWorkspaceHeadline`). Every command-shaped form fails to load; only an array of strings
  * parses. There is no external-command seam there, so a status line is not available to us.
  *
- * The HOOK protocol is. Codex's hook events are `PreToolUse`, `PreCompact`, `PostCompact`,
- * `SessionStart`, `UserPromptSubmit`, `SubagentStart`, `SubagentStop`, and `Stop` — and the embedded
- * output schemas carry `systemMessage` (a string, default null) beside `continue`, `stopReason` and
- * `suppressOutput`. That is the same shape Claude Code uses for a USER-FACING message, as distinct
- * from `additionalContext`, which injects into the model. `Stop` fires after the turn, which is when
- * the counts exist.
+ * The HOOK protocol is. Codex 0.153 supplies `session_id` and `turn_id` on UserPromptSubmit and Stop,
+ * plus `transcript_path` and `model` on Stop; its output schema carries `systemMessage`. The matching
+ * rollout's final `token_usage_record.turn_token_usage` is durable before Stop and is cumulative for
+ * the full turn. These are the exact identity and count fields the adapter validates.
  *
- * UNVALIDATED, DELIBERATELY. The schema proves Codex ACCEPTS `systemMessage`; only a live run proves
- * it RENDERS it. That is a dogfooding question, and this ships to answer it. If Codex ignores the
- * field the hook is inert — it prints valid JSON, changes nothing, and `compaction watch` remains the
- * guaranteed Codex surface. Nothing about the turn depends on the answer.
+ * The existing live acceptance proved Codex renders `systemMessage`; settlement now reads the exact
+ * stopped turn rather than a cwd-latest receipt or an in-progress placeholder.
  *
  * CONTENT-FREE + FAIL-OPEN, exactly like the shaping hook: the emitted string is the same canonical
  * receipt line every other surface renders (counts, fixed labels, a short receipt id), and any error
@@ -33,7 +29,7 @@ export function codexTurnLineCommand(): string {
   return "compaction hooks line codex";
 }
 
-/** Codex `Stop` hook timeout (seconds). Reading a local receipt is fast; this is generous headroom. */
+/** Codex `Stop` hook timeout (seconds). The local rollout read is bounded; this is generous headroom. */
 export const CODEX_TURN_LINE_HOOK_TIMEOUT_SECONDS = 5;
 
 /**

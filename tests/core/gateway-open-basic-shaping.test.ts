@@ -20,14 +20,7 @@ import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import { readRecovery } from "../../src/core/gateway/recovery.js";
 import { OUTPUT_SHAPING_POLICY_MARKER } from "../../src/core/output-shaping.js";
 import { writeProductMode, type ProductMode } from "../../src/core/onboarding-preferences.js";
-import { updateCalibrationFromAbSummary } from "../../src/core/output-shaping-calibration-store.js";
-import {
-  addOutputShapingAbRun,
-  initOutputShapingAbExperiment,
-  summarizeOutputShapingAb,
-  type OutputShapingAbExperiment,
-  type OutputShapingAbRun
-} from "../../src/core/output-shaping-ab.js";
+import { seedOutputCalibration } from "../helpers/output-calibration-fixture.js";
 
 /** Provider-reported output of 400 on the turn, so the line has a real count to render. */
 const UPSTREAM_REPLY = JSON.stringify({ id: "msg_fake", usage: { input_tokens: 1200, output_tokens: 400 } });
@@ -56,18 +49,13 @@ function post(port: number, path: string, body: string): Promise<number> {
 
 /** Seed a calibrated rate through the REAL store API (never a hand-written fixture). */
 async function seedCalibration(configDir: string, control: number, treatment: number): Promise<void> {
-  let exp: OutputShapingAbExperiment = initOutputShapingAbExperiment({ experimentId: "e-seed", taskShape: "code" });
-  const run = (arm: "control" | "treatment", outputTokens: number): OutputShapingAbRun => ({
-    arm,
-    outputTokens,
-    inputTokens: 1000,
-    providerReported: true,
-    tokenSource: "provider-reported",
-    ...(arm === "treatment" ? { policyFamily: "output_shaping" as const, policyNames: ["concise_response"], evalMarkersPreserved: true } : {})
+  await seedOutputCalibration({ COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv, {
+    provider: "anthropic",
+    model: "claude-x",
+    regime: "default-shapeable",
+    control: [control, control, control],
+    treatment: [treatment, treatment, treatment]
   });
-  for (let i = 0; i < 3; i++) exp = addOutputShapingAbRun(exp, run("control", control));
-  for (let i = 0; i < 3; i++) exp = addOutputShapingAbRun(exp, run("treatment", treatment));
-  await updateCalibrationFromAbSummary(summarizeOutputShapingAb(exp), { COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv);
 }
 
 describe("gateway Open `basic` output shaping — engine-free, account-free, no lease", () => {
@@ -164,10 +152,16 @@ describe("gateway Open `basic` output shaping — engine-free, account-free, no 
     expect(line, "a per-turn line must be emitted").toBeDefined();
     expect(line).toContain("basic shaping");
     expect(line).toContain("observed input 1,200"); // a plain count, never a reduction
-    // The OUTPUT arrow now renders from the shipped default prior, so a fresh install shows a
-    // reduction rather than a bare count. Its label carries the PROVENANCE
-    // `est. · default prior` (G7) — a default prior must never read as this device's measured evidence.
-    expect(line).toMatch(/output [\d,]+→400 \(−\d+%, est\. · default prior\)/);
+    // THIS DEVICE HAS MEASURED NOTHING, SO THE LINE SHOWS NO REDUCTION FIGURE — and says that is what
+    // is missing. The arrow used to render here from the shipped 0.47 prior, disclosed as
+    // `est. · default prior`; a fully specific `755→400 (−47%)` reads as counted whatever label sits
+    // beside it, so the FIGURE is withheld. The AXIS is not: shaping ran (`basic shaping` says so from
+    // the receipt), the after is the provider's own, and the before is stated as unknown rather than
+    // omitted — a plain `output 400` is indistinguishable from the line an unshaped turn prints.
+    expect(line).toContain("output N/A→400 (N/A%, est.)");
+    expect(line, "no reduction figure without a measurement").not.toMatch(/output [\d,]+→/);
+    expect(line, "the prior's reconstruction must not appear").not.toContain("755");
+    expect(line).not.toContain("−47%");
     // NO INPUT REDUCTION on an Open line -- the load-bearing Open guarantee. Anchored to the input
     // clause itself: the previous `/input .*→/` spanned across the ` · output …→…` arrow and would now
     // fail on a correct line, which would have looked like a regression and was not one.
@@ -180,12 +174,12 @@ describe("gateway Open `basic` output shaping — engine-free, account-free, no 
     const plain = await setup("basic");
     expect(await post(plain.port, "/v1/messages", BODY)).toBe(200);
     await settle(plain.receipts, plain.logs);
-    // "Uncalibrated" no longer means "no arrow": a fresh install carries the shipped prior, so the
-    // arrow renders immediately. What still distinguishes it is the RATE -- the prior's 47% here vs
-    // the device's own 40% below once it has measured.
+    // A FIGURE IS EARNED BY EVIDENCE, and this device has none. The shipped 0.47 prior still exists
+    // and still backs internal estimation; what it may not do is put a `−47%` on this user's turn.
     const plainLine = plain.logs.find((l) => l.startsWith("compaction · "));
-    // The default prior is labelled AS a default prior (provenance honesty, G7).
-    expect(plainLine).toMatch(/output [\d,]+→400 \(−47%, est\. · default prior\)/);
+    expect(plainLine).toContain("output N/A→400 (N/A%, est.)");
+    expect(plainLine, "the shipped prior may not render as this device's result").not.toContain("−47%");
+    expect(plainLine, "no reconstructed before on an unmeasured device").not.toMatch(/output [\d,]+→/);
 
     // Now a real measured 40% A/B (1000→600), folded through the real store.
     const calibrated = await setup("basic");
@@ -197,11 +191,11 @@ describe("gateway Open `basic` output shaping — engine-free, account-free, no 
     expect(calLine).toContain("output 667→400");
     expect(calLine, "the measured rate displaces the prior").not.toContain("−47%");
     expect(calLine).toContain("basic shaping");
-    // F7 (the defect): a measured turn and a default-prior turn must render DIFFERENTLY. The measured
-    // turn carries the plain calibrated `est.` and NOT the `default prior` provenance suffix.
+    // A MEASURED DEVICE IS UNCHANGED by this rule: it keeps the arrow its own A/B earned, labelled
+    // `est.` because the before is still a reconstruction. Measuring is what turns the figure on.
     expect(calLine).toContain("(−40%, est.)");
-    expect(calLine, "a device measurement is not a default prior").not.toContain("default prior");
-    expect(plainLine, "the two provenances render differently").not.toBe(calLine);
+    expect(calLine, "no prior wording survives anywhere").not.toContain("default prior");
+    expect(plainLine, "measured and unmeasured devices render differently").not.toBe(calLine);
   });
 
   it("DOUBLE-SHAPING GUARD: a body the tool's hook already shaped is forwarded unchanged", async () => {

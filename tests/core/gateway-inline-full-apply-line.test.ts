@@ -1,19 +1,17 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { perTurnLineFromReceipt } from "../../src/core/gateway/server.js";
+import { receiptLinesFromJsonl } from "../../src/cli/commands/watch.js";
 import { buildGatewayReceipt } from "../../src/core/gateway/receipt.js";
 import { buildApplyReceipt } from "../../src/core/gateway/apply-receipt.js";
 import type { ApplyActivation } from "../../src/core/gateway/apply-receipt.js";
 import type { DedupePlan } from "../../src/core/gateway/request-shape.js";
 import type { OpenAiUsageBreakdown } from "../../src/core/gateway/usage.js";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
-import {
-  OUTPUT_SHAPING_CALIBRATION_SCHEMA,
-  calibrationStorePath,
-  type OutputShapingCalibration
-} from "../../src/core/output-shaping-calibration-store.js";
+import { seedOutputCalibration, TEST_OUTPUT_POLICY_VERSION } from "../helpers/output-calibration-fixture.js";
+import { loadOutputCalibrationResolver } from "../../src/core/output-shaping-savings.js";
 
 /**
  * THE GATEWAY MUST DESCRIBE A TURN THE SAME WAY EVERY OTHER SURFACE DOES.
@@ -47,12 +45,18 @@ const plan: DedupePlan = {
   removedBlocks: 1,
   charsBefore: 164840,
   charsAfter: 87504,
-  estTokensBefore: 41210,
-  estTokensAfter: 21876,
+  estTokensBefore: 12_000,
+  estTokensAfter: 9_000,
   reductionPercent: 47
 };
 
-function realApplyReceipt(outputTokens = 512) {
+/**
+ * A real Community full-apply turn. `route` is the UPSTREAM BILLING ROUTE the gateway forwarded on and
+ * defaults to the user's own API key, because that is the route every pre-existing assertion here was
+ * written against. Pass `"subscription"` to exercise the flat-fee route, where no per-token amount is
+ * billed and the list-price cost clause therefore has nothing to describe.
+ */
+function realApplyReceipt(outputTokens = 512, route: "api-key" | "subscription" = "api-key") {
   const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens, model: "gpt-4o" };
   return buildApplyReceipt({
     provider: "openai",
@@ -62,6 +66,11 @@ function realApplyReceipt(outputTokens = 512) {
     activation: applyActivation,
     plan,
     applied: true,
+    appliedComponents: ["deterministic-compaction"],
+    outputShapingState: "already-active",
+    outputShapingPolicyVersion: TEST_OUTPUT_POLICY_VERSION,
+    outputShapingRegime: "default-shapeable",
+    upstreamRouteType: route,
     id: fixedId,
     now: fixedNow
   });
@@ -89,17 +98,14 @@ function writeBasicTierDevice(): void {
  * the line correctly degrades to a plain `output N` - which is the point of the "no estimate" case
  * below, and the reason this fixture is opt-in rather than always present.
  */
-function writeCalibration(controlTokens: number, treatmentTokens: number, turns: number): void {
-  const calibration: OutputShapingCalibration = {
-    schema: OUTPUT_SHAPING_CALIBRATION_SCHEMA,
-    sampleCount: 3,
-    totalControlOutputTokens: controlTokens,
-    totalTreatmentOutputTokens: treatmentTokens,
-    totalTurns: turns,
-    experimentIds: ["exp-a", "exp-b", "exp-c"],
-    updatedAt: "2026-07-29T00:00:00.000Z"
-  };
-  writeFileSync(calibrationStorePath(env()), `${JSON.stringify(calibration, null, 2)}\n`, "utf8");
+async function writeCalibration(controlTokens: number, treatmentTokens: number): Promise<void> {
+  await seedOutputCalibration(env(), {
+    provider: "openai",
+    model: "gpt-4o",
+    regime: "default-shapeable",
+    control: [controlTokens, controlTokens, controlTokens],
+    treatment: [treatmentTokens, treatmentTokens, treatmentTokens]
+  });
 }
 
 function env(): NodeJS.ProcessEnv {
@@ -118,7 +124,7 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
   it("carries the input arrow, the `full apply` label and the receipt id", async () => {
     writeFullTierDevice();
     const line = await perTurnLineFromReceipt(realApplyReceipt(), { entitlementEnv: env() });
-    expect(line).toContain("input 41,210→21,876 (−47%)");
+    expect(line).toContain("input 12,000→9,000 (−25%)");
     expect(line).toContain("full apply");
     expect(line).toContain("id 8f4c2f6e");
   });
@@ -129,28 +135,99 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
    * calibrated rate, so it must carry an estimate label and never the bare measured `(−PP%)` the input
    * arrow uses.
    */
-  it("carries the OUTPUT arrow too, and a DEVICE-CALIBRATED rate drops the `default prior` qualifier", async () => {
+  it("carries the OUTPUT arrow too, on a DEVICE-CALIBRATED rate", async () => {
     writeFullTierDevice();
-    writeCalibration(1000, 790, 40); // a measured 21% reduction on THIS device
+    await writeCalibration(1000, 790); // a measured 21% reduction on THIS device
     const line = await perTurnLineFromReceipt(realApplyReceipt(512), { entitlementEnv: env() });
     expect(line).toMatch(/output [\d,]+→512 \(−\d+%, est\.\)/);
     expect(line).not.toContain("default prior");
     expect(line).toContain("full apply");
     // The input arrow stays UNLABELLED: it is a real before→after, not a reconstruction.
-    expect(line).toContain("input 41,210→21,876 (−47%)");
+    expect(line).toContain("input 12,000→9,000 (−25%)");
   });
 
   /**
-   * PROVENANCE, not presence. With no A/B on this device the rate is the SHIPPED DEFAULT PRIOR, which is
-   * an honest estimate - so the arrow still renders, but it must say whose evidence backs it. The
-   * difference between this case and the one above is the whole point of the two labels: `est. · default
-   * prior` is the shipped starting figure, `est.` is what THIS device measured.
+   * PRESENCE, not provenance — the axis this case was decided on twice, differently. It used to render
+   * the shipped prior's arrow with an `est. · default prior` qualifier, on the reasoning that a
+   * disclosed prior is an honest estimate. It is honest about WHOSE number it is and silent about the
+   * fact that nothing on this device was counted, which a reconstructed numerical arrow would imply.
+   *
+   * So a device with no A/B renders NO output FIGURE — while the INPUT arrow beside it survives
+   * untouched, because that one has two measured endpoints on this very receipt. That contrast is the
+   * rule in one line: measured axes render, reconstructed-from-a-prior axes do not.
+   *
+   * The axis itself is not deleted, though. Shaping ran on this turn, and a plain `output 512` is the
+   * same clause an unshaped turn prints — so the unknown is stated as unknown. `N/A` is not a value,
+   * cannot be read as a count, and cannot be arithmetic'd back into one.
    */
-  it("with no calibration on this device: the arrow rides the default prior, and says so", async () => {
+  it("with no calibration on this device: an UNKNOWN output before, and the measured input arrow is untouched", async () => {
     writeFullTierDevice();
     const line = await perTurnLineFromReceipt(realApplyReceipt(512), { entitlementEnv: env() });
-    expect(line).toMatch(/output [\d,]+→512 \(−\d+%, est\. · default prior\)/);
+    expect(line).toContain("output N/A→512 (N/A%, est.)");
+    expect(line, "no reconstruction without this device's own measurement").not.toMatch(/output [\d,]+→/);
+    expect(line, "the prior's reconstructed before must not appear in any form").not.toContain("966");
+    // The MEASURED input arrow is untouched, and its unlabelled `−47%` is not confused with the
+    // output axis's absent one — the two axes are independently evidenced on the same line.
+    expect(line).toContain("input 12,000→9,000 (−25%)");
     expect(line).toContain("full apply");
+  });
+
+  it("keeps the shaped output axis N/A when legacy receipt metadata cannot form an exact key", async () => {
+    writeFullTierDevice();
+    await writeCalibration(1000, 600);
+    const receipt = realApplyReceipt(512);
+    delete receipt.output_shaping_policy_version;
+    const line = await perTurnLineFromReceipt(receipt, { entitlementEnv: env() });
+    expect(line).toContain("output N/A→512 (N/A%, est.)");
+    expect(line).not.toMatch(/output [\d,]+→512/);
+    expect(line).toContain("full apply");
+  });
+
+  it.each(["missing", "absent"] as const)(
+    "keeps output as the plain actual when shaping provenance is %s, even with calibration",
+    async (provenance) => {
+      writeFullTierDevice();
+      await writeCalibration(1000, 790);
+      const receipt = realApplyReceipt(512);
+      delete receipt.output_shaping_policy_version;
+      delete receipt.output_shaping_regime;
+      if (provenance === "missing") delete receipt.output_shaping_state;
+      else receipt.output_shaping_state = "absent";
+
+      const line = await perTurnLineFromReceipt(receipt, { entitlementEnv: env() });
+      expect(line).toContain("output 512");
+      expect(line).not.toContain("→512");
+      expect(line).not.toContain("est.");
+      expect(line).toContain("input 12,000→9,000 (−25%)");
+      expect(line).toContain("full apply");
+    }
+  );
+
+  it.each([
+    { name: "applicable calibration", receipt: () => realApplyReceipt(512) },
+    {
+      name: "proven shaping without an exact calibration key",
+      receipt: () => {
+        const receipt = realApplyReceipt(512);
+        delete receipt.output_shaping_regime;
+        return receipt;
+      }
+    }
+  ])("matches `compaction watch` for $name", async ({ receipt: makeReceipt }) => {
+    writeFullTierDevice();
+    await writeCalibration(1000, 790);
+    const receipt = makeReceipt();
+    const inline = await perTurnLineFromReceipt(receipt, { entitlementEnv: env() });
+    const calibrationResolver = await loadOutputCalibrationResolver(env());
+    const [watched] = receiptLinesFromJsonl(`${JSON.stringify(receipt)}\n`, {
+      productTier: "full",
+      calibrationResolver,
+      env: env()
+    });
+
+    expect(inline).toBe(watched);
+    if (receipt.output_shaping_regime) expect(inline).toContain("output 648→512 (−21%, est.)");
+    else expect(inline).toContain("output N/A→512 (N/A%, est.)");
   });
 
   /**
@@ -169,12 +246,13 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
       activation: applyActivation,
       plan,
       applied: true,
+      upstreamRouteType: "api-key",
       id: fixedId,
       now: fixedNow
     });
     const line = await perTurnLineFromReceipt(receipt, { entitlementEnv: env() });
     expect(line).not.toMatch(/output [\d,]+→/);
-    expect(line).toContain("input 41,210→21,876 (−47%)");
+    expect(line).toContain("input 12,000→9,000 (−25%)");
     expect(line).toContain("full apply");
   });
 
@@ -185,10 +263,14 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
    */
   it("renders the canonical grammar, in order", async () => {
     writeFullTierDevice();
+    // CALIBRATED, so every clause of the grammar is present at once. The output arrow is now the one
+    // clause that requires this device's own evidence, so an uncalibrated device no longer renders the
+    // full line at all - and a pin taken there would silently stop covering the output clause.
+    await writeCalibration(1000, 790);
     const line = await perTurnLineFromReceipt(realApplyReceipt(512), { entitlementEnv: env() });
     expect(line).toBe(
-      "compaction · input 41,210→21,876 (−47%) · output 966→512 (−47%, est. · default prior) · " +
-        "−$0.05 (list price) · full apply · id 8f4c2f6e"
+      "compaction · input 12,000→9,000 (−25%) · output 648→512 (−21%, est.) · " +
+        "−$0.01 (list price) · full apply · id 8f4c2f6e"
     );
   });
 
@@ -201,7 +283,7 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
     writeBasicTierDevice();
     const line = await perTurnLineFromReceipt(realApplyReceipt(), { entitlementEnv: env() });
     expect(line).not.toContain("full apply");
-    expect(line).toContain("input 41,210→21,876 (−47%)");
+    expect(line).toContain("input 12,000→9,000 (−25%)");
   });
 
   /**

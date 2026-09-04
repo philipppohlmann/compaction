@@ -42,6 +42,8 @@ export interface AttachOutputShapingResult {
   commandParts: string[];
   /** The output-shaping policies applied (content-free attribution); empty when not attached. */
   applied: OutputShapingAttribution[];
+  /** Exact identity of the attached model-visible instruction bytes. */
+  policyVersion?: string;
   attached: boolean;
   /** Why attachment did not happen (e.g. no prompt arg, no matching policies). */
   reason?: string;
@@ -53,7 +55,7 @@ export interface AttachOutputShapingResult {
  * with the original command + a reason, never silently shapes the wrong argument.
  */
 export function attachOutputShapingToCommand(commandParts: string[], opts: BuildOutputShapingOptions = {}): AttachOutputShapingResult {
-  const { instructions, applied } = buildOutputShapingPolicy(opts);
+  const { instructions, applied, policyVersion } = buildOutputShapingPolicy(opts);
   if (instructions === "" || applied.length === 0) {
     return { commandParts: [...commandParts], applied: [], attached: false, reason: "no matching output-shaping policies" };
   }
@@ -63,5 +65,5 @@ export function attachOutputShapingToCommand(commandParts: string[], opts: Build
   }
   const next = [...commandParts];
   next[idx] = `${instructions}\n\n${next[idx]}`;
-  return { commandParts: next, applied, attached: true };
+  return { commandParts: next, applied, policyVersion, attached: true };
 }

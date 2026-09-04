@@ -6,8 +6,11 @@
  *  - Reachable ONLY from the gateway apply path (`gateway/server.ts`); NEVER from `mode.ts` /
  *    output-shaping / the pure lease-store. It reads the DEVICE PRIVATE key
  *    (`credentials.device_private_key_pem`) to sign, which is why it must stay off the Open graph.
- *  - `route_type === "api-key"` ONLY. A subscription-labeled apply is REFUSED here (returns
- *    `metered:false`, writes nothing) — subscription apply is never metered/debited.
+ *  - ROUTE-INDEPENDENT. A confirmed Hybrid INPUT apply is debited on every route in
+ *    `DEBITABLE_ROUTE_TYPES` (api-key and Claude Code subscription alike): the allowance pays for use
+ *    of the Hybrid Engine, not for the provider billing route. An unrecognised route label is still
+ *    refused (returns `metered:false`, writes nothing) — an unknown route is an integrity signal.
+ *    OUTPUT SHAPING IS NEVER METERED on any route; only the confirmed-apply site calls this.
  *  - The metered count is ENGINE-AUTHORITATIVE (`metered_optimized_input_tokens`). Only when the
  *    engine omits it does the client fall back to a documented `ceil(chars/4)` estimate stamped with
  *    the DISTINCT fallback meter version — never presented as the engine-authoritative meter.
@@ -27,8 +30,9 @@ import { join } from "node:path";
 import { parseSignedLease } from "../entitlement/lease.js";
 import { publicKeyHash } from "../crypto/key-hash.js";
 import {
-  USAGE_EVENT_SCHEMA_VERSION,
-  METERED_ROUTE_TYPE,
+  USAGE_EVENT_SCHEMA_VERSION_V3,
+  ACTIVE_USAGE_METER_VERSION,
+  DEBITABLE_ROUTE_TYPES,
   canonicalUsageEventBytes,
   resolveMeteredOptimizedInput,
   type UsageEvent
@@ -37,7 +41,7 @@ import { appendUsageEvent } from "./usage-journal.js";
 
 /** The content-free context the gateway hands the meter for one confirmed apply. */
 export interface MeterConfirmedApplyContext {
-  /** Route derived from the configured transport — `api-key` | `subscription`. Only api-key is metered. */
+  /** Route derived from the configured transport — `api-key` | `subscription`. Both are debited. */
   routeType: string;
   workflow: string;
   provider: string;
@@ -49,13 +53,19 @@ export interface MeterConfirmedApplyContext {
    * inside the journal append lock and needs the allowance to subtract the fresh tally from.
    */
   allowanceTokens: number;
-  /** Content-free local id linking the debit to the retained-original / apply receipt (the recovery id). */
-  receiptId: string;
+  /**
+   * Content-free local id of the retained-original record this debit belongs to — the RECOVERY id
+   * (`.compaction/gateway/recovery/<id>.json`). It has always been the recovery id; only the name it
+   * was stored under was wrong (see `usage-event.ts`, schema v1's `receipt_id`).
+   */
+  recoveryId: string;
   /** Engine-reported meter version (present on an engine-authoritative apply). */
   meterVersion?: string;
   /** Engine-authoritative pre-mutation model-visible input tokens (the meter basis). */
   meteredOptimizedInputTokens?: number;
-  /** Engine local-estimate of model-visible input tokens after the mutation. */
+  /** Engine local-estimate of model-visible input before input optimization. */
+  estimatedInputTokensBefore?: number;
+  /** Engine local-estimate after input optimization and before output shaping. */
   estimatedInputTokensAfter?: number;
   /** Engine-reported debit event id (recorded for reconciliation; the client id is authoritative). */
   engineEventId?: string;
@@ -70,6 +80,13 @@ export type MeterResult =
       entryHash: string;
       optimizedInputTokens: number;
       meterVersion: string;
+      /**
+       * Allowance left for the period AFTER this debit, measured under the journal append lock
+       * against the same fresh tally the ceiling refused on. Reporting-only — a countdown surface
+       * needs a number the caller cannot derive, since its own pre-dispatch snapshot predates every
+       * concurrent apply's debit and is stale by the time the engine has answered.
+       */
+      remainingTokens: number;
       /** True when the debit was already recorded (dedupe) — still a success for the caller. */
       duplicate?: boolean;
     }
@@ -101,8 +118,11 @@ export async function meterConfirmedApply(
   env: NodeJS.ProcessEnv = process.env,
   now: Date = new Date()
 ): Promise<MeterResult> {
-  // Subscription route is NEVER metered/debited — refuse defensively even if a caller mis-routes here.
-  if (ctx.routeType !== METERED_ROUTE_TYPE) return { metered: false, reason: `route-not-metered:${ctx.routeType}` };
+  // The ROUTE IS RECORDED, NOT A GATE: both supported upstream routes debit. An UNRECOGNISED label is
+  // still refused — the route that produced this apply would be unknown, and the server's
+  // `usage_debit.route_type` CHECK constraint would reject the entry at reconciliation anyway, which
+  // would silently lose a debit the client had already spent locally.
+  if (!DEBITABLE_ROUTE_TYPES.has(ctx.routeType)) return { metered: false, reason: `route-not-debitable:${ctx.routeType}` };
 
   const credentials = readStoredCredentials(env);
   if (!credentials) return { metered: false, reason: "credentials-unavailable" };
@@ -121,17 +141,30 @@ export async function meterConfirmedApply(
     preMutationBody: ctx.preMutationBody
   });
 
-  const estimatedAfter =
-    typeof ctx.estimatedInputTokensAfter === "number" &&
-    Number.isInteger(ctx.estimatedInputTokensAfter) &&
-    ctx.estimatedInputTokensAfter >= 0
-      ? ctx.estimatedInputTokensAfter
-      : optimizedInputTokens;
+  // Current debits are independently recomputable from a SIGNED input-only pair. An older engine
+  // that omits the pair, a malformed pair, or a pair that disagrees with the claimed active-unit
+  // debit cannot produce a current event: fail closed and leave the original request in place.
+  const estimatedBefore = ctx.estimatedInputTokensBefore;
+  const estimatedAfter = ctx.estimatedInputTokensAfter;
+  if (
+    meterVersion !== ACTIVE_USAGE_METER_VERSION ||
+    typeof estimatedBefore !== "number" ||
+    !Number.isInteger(estimatedBefore) ||
+    estimatedBefore < 0 ||
+    typeof estimatedAfter !== "number" ||
+    !Number.isInteger(estimatedAfter) ||
+    estimatedAfter < 0 ||
+    optimizedInputTokens !== Math.max(0, estimatedBefore - estimatedAfter)
+  ) {
+    return { metered: false, reason: "meter-basis-invalid" };
+  }
 
+  // NEW WRITES ARE SCHEMA v3: v1/v2 entries already on disk keep their frozen bytes and remain
+  // verifiable, while new active-unit debits sign the complete recomputation basis.
   const event: UsageEvent = {
-    schema_version: USAGE_EVENT_SCHEMA_VERSION,
+    schema_version: USAGE_EVENT_SCHEMA_VERSION_V3,
     event_id: randomUUID(),
-    receipt_id: ctx.receiptId,
+    recovery_id: ctx.recoveryId,
     lease_id: leaseIdentity.leaseId,
     lease_sequence: leaseIdentity.leaseSequence,
     device_id: credentials.device_id,
@@ -140,11 +173,12 @@ export async function meterConfirmedApply(
     device_key_hash: publicKeyHash(credentials.device_public_key),
     period_id: ctx.periodId,
     occurred_at: now.toISOString(),
-    route_type: METERED_ROUTE_TYPE,
+    route_type: ctx.routeType,
     workflow: ctx.workflow,
     provider: ctx.provider,
     meter_version: meterVersion,
     optimized_input_tokens: optimizedInputTokens,
+    estimated_input_tokens_before: estimatedBefore,
     estimated_input_tokens_after: estimatedAfter
   };
 
@@ -183,6 +217,7 @@ export async function meterConfirmedApply(
     eventId: appended.event_id,
     entryHash: appended.entry_hash,
     optimizedInputTokens,
-    meterVersion
+    meterVersion,
+    remainingTokens: appended.remaining_tokens
   };
 }

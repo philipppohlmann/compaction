@@ -23,9 +23,9 @@ import { activityLinesFromJsonl, WATCH_ACTIVITY_SURFACES } from "../../src/core/
  * ran.
  *
  * These tests drive the REAL capture bridge (not hand-written JSON), so they prove the actual path a
- * Cursor turn takes, and they pin the tier honesty: Cursor is LOCAL-ESTIMATE only (chars/4; the vendor
- * reports no usage) and `watch` may never relabel that as provider-reported, nor print a zero for an
- * axis that was simply not reported.
+ * Cursor turn takes, and they pin the tier honesty: the current Cursor capture parser records a
+ * LOCAL-ESTIMATE (chars/4) rather than consuming the vendor's per-turn usage, and `watch` may never
+ * upgrade that to provider-reported or print a zero for an unconsumed axis.
  */
 
 let dir: string;
@@ -109,9 +109,12 @@ describe("watch --once surfaces local activity records for the non-gateway surfa
       // Scoped to the measurable form, not "Cursor runs" in general (the IDE session is shaped but
       // never measured, so it can never appear here).
       expect(header).toContain("Cursor runs captured by the shim: `cursor-agent … --output-format json`");
-      expect(header).toContain("Interactive sessions are not measured and do not appear here");
+      expect(header).toContain("Claude Code settles exact Gateway-backed runs");
+      expect(header).toContain("positively reconciled hook-only task-notification continuations");
+      expect(header).toContain("Cursor IDE sessions are not measured");
       expect(header).toContain("Cursor is local-estimate only");
-      expect(header).toContain("never provider-reported");
+      expect(header).toContain("current Cursor parser does not consume the vendor's per-turn usage");
+      expect(header).toContain("never upgrades it to provider-reported");
       // The old unqualified claim must not come back.
       expect(header).not.toContain("captured Codex runs)");
     }
@@ -123,7 +126,8 @@ describe("watch --once surfaces local activity records for the non-gateway surfa
     const text = lines.join("\n");
     expect(text).toContain("codex exec --json");
     expect(text).toContain("cursor-agent … --output-format json");
-    expect(text).toContain("Interactive sessions are not measured");
+    expect(text).toContain("exact Gateway-backed Claude Stop");
+    expect(text).toContain("positively reconciled hook-only Claude task-notification continuation");
     expect(text).not.toContain("a Cursor/Codex session");
   });
 });

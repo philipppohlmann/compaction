@@ -26,6 +26,25 @@ describe("output-shaping task classifier", () => {
     expect(r.decision).toBe("shape");
   });
 
+  // REGRESSION PIN for a false comment corrected in this PR: three source comments asserted that the
+  // task-aware gate "holds shaping back on tool-call turns". It never has. A tool-result turn carries
+  // no planning text and no reasoning field, so it falls through to the default and is SHAPED. The
+  // real reason a shaped turn can show no `output-shaping` component is that the tool's own prompt
+  // hook attached the policy upstream (`already-active`), not a turn-class exclusion.
+  it("shapes a tool_result turn - tool-call turns are NOT a held class", () => {
+    const body = JSON.stringify({
+      model: "m",
+      messages: [
+        { role: "user", content: "Add a retry to fetchUser." },
+        { role: "assistant", content: [{ type: "tool_use", id: "tu_1", name: "read_file", input: { path: "user.ts" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_1", content: "export async function fetchUser() {}" }] }
+      ]
+    });
+    const r = classifyOutputShapingTask("/v1/messages", body);
+    expect(r.decision).toBe("shape");
+    expect(r.signal).toBe("default-shapeable");
+  });
+
   it("holds on a planning/design request (prose plausibly load-bearing)", () => {
     const body = JSON.stringify({ model: "m", messages: [{ role: "user", content: "Help me design the architecture for a rate limiter and weigh the trade-offs." }] });
     const r = classifyOutputShapingTask("/v1/chat/completions", body);

@@ -6,9 +6,8 @@ import type { AgentTrace, TraceMessage } from "./types.js";
  *
  * PURPOSE (evidence integrity): give each captured run a verifiable, non-sensitive
  * distinctness signal so that genuinely-different sessions are distinguishable from
- * re-captures of the SAME session. This prevents over-counting `real_captured` N
- * (the prior failure mode: re-running capture over the same 3 static sessions and
- * reporting them as new because distinctness was asserted by size/date, not verified).
+ * re-captures of the SAME session. Repeated imports of one session must not be counted
+ * as independent evidence merely because capture time or file location changed.
  *
  * PRIVACY (load-bearing): the emitted value is a one-way SHA-256 DIGEST ONLY. Raw
  * message content, prompts, completions, tool output, file contents, and secrets are

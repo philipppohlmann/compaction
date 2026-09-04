@@ -1,6 +1,11 @@
 # Code of Conduct
 
-We want this project to be welcoming, constructive, and safe to work on.
+## Our pledge
+
+We want participation in this project to be welcoming, constructive, and safe
+for everyone.
+
+## Our standards
 
 Participants are expected to:
 
@@ -9,10 +14,22 @@ Participants are expected to:
 - keep examples and reports free of secrets and real customer data; and
 - accept correction when a claim, boundary, or safety concern is raised.
 
-Harassment, discrimination, threats, personal attacks, and deliberately
-sharing private data are not acceptable.
+Harassment, discrimination, threats, personal attacks, and deliberately sharing
+private data are not acceptable.
 
-Report a concern privately to the repository maintainers through the private
-contact channel provided by the repository owner. Do not include secrets or
-customer data in a report. Maintainers may remove content, pause participation,
-or take other proportionate action to keep the project safe.
+## Enforcement
+
+Maintainers may remove content, pause participation, or take other proportionate
+action to keep the project safe.
+
+## Scope
+
+This applies in this repository and other project spaces, and when representing
+the project in public.
+
+## Reporting
+
+Report a concern privately to the maintainers at
+[contact@compaction.dev](mailto:contact@compaction.dev). Do not include secrets or
+customer data in a report. Suspected security vulnerabilities go through
+[SECURITY.md](SECURITY.md) instead.

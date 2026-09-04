@@ -6,6 +6,7 @@ import {
 } from "../../src/cli/onboarding/ready-metrics.js";
 import { buildActivityRows } from "../../src/core/activity-view.js";
 import type { ActivityEvent } from "../../src/core/activity-event.js";
+import { coalesceClaudeLogicalRuns } from "../../src/core/activity-store.js";
 
 // The honest ready-screen metric: real measured receipts OR "unavailable until measured".
 // It must NEVER fabricate a number (no `out -45%`-style figure) and must default to no-data.
@@ -89,5 +90,32 @@ describe("deriveReadyMetric - honest first-run metric (no simulated numbers)", (
     const metric: ReadyMetric = deriveReadyMetric(rows);
     expect(metric.line).toContain("output 100 measured (provider-reported)");
     expect(metric.recordedRuns).toBe(2);
+  });
+
+  it("counts one exact Claude run when its cumulative snapshots evolve derived metadata", () => {
+    const common = {
+      surface: "claude_code" as const,
+      provider: "anthropic" as const,
+      workflow_id: "claude-stop",
+      session_id: `claude-session-${"a".repeat(32)}`,
+      run_id: `claude-stop-${"b".repeat(32)}`,
+      token_source: { input: { source: "provider-reported" as const }, output: { source: "provider-reported" as const } },
+      claim_scope: "run-scoped" as const,
+      evidence_level: "exact correlated gateway run",
+      approval_status: "not-required" as const,
+      recovery: { original_retained: false },
+      sync_status: "local-only" as const,
+      activity_kind: "claude-stop" as const,
+      run_started_at: "2026-07-09T00:00:00.000Z",
+      measurement_source: "gateway-run" as const
+    };
+    const logical = coalesceClaudeLogicalRuns([
+      { ...common, model_label: "claude-opus-5", input_before: 100, output_after: 20, apply_posture: "basic", recorded_at: "2026-07-09T00:01:00.000Z", activity_event_id: `act-${"1".repeat(24)}` },
+      { ...common, input_before: 180, output_after: 35, apply_posture: "full", recorded_at: "2026-07-09T00:02:00.000Z", activity_event_id: `act-${"2".repeat(24)}` }
+    ] as ActivityEvent[]);
+    const metric = deriveReadyMetric(buildActivityRows(logical));
+    expect(metric.recordedRuns).toBe(1);
+    expect(metric.line).toContain("input 180 measured");
+    expect(metric.line).toContain("output 35 measured");
   });
 });

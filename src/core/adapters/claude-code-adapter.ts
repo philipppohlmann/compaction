@@ -175,6 +175,8 @@ interface ProcessEntriesResult {
   truncationCount: number;
   inputTokens: number;
   outputTokens: number;
+  inputUsagePresent: boolean;
+  outputUsagePresent: boolean;
   cacheCreationTokens: number;
   cacheReadTokens: number;
   assistantCount: number;
@@ -377,9 +379,13 @@ function processEntries(
   // comparable basis; a session's input is the sum of every request's input, likewise output).
   let inputTokens = 0;
   let outputTokens = 0;
+  let inputUsagePresent = false;
+  let outputUsagePresent = false;
   let cacheCreationTokens = 0;
   let cacheReadTokens = 0;
   for (const usage of usageByRequest.values()) {
+    if (usage.input_tokens !== undefined) inputUsagePresent = true;
+    if (usage.output_tokens !== undefined) outputUsagePresent = true;
     inputTokens += usage.input_tokens ?? 0;
     outputTokens += usage.output_tokens ?? 0;
     cacheCreationTokens += usage.cache_creation_input_tokens ?? 0;
@@ -397,6 +403,8 @@ function processEntries(
     truncationCount,
     inputTokens,
     outputTokens,
+    inputUsagePresent,
+    outputUsagePresent,
     cacheCreationTokens,
     cacheReadTokens,
     assistantCount,
@@ -579,6 +587,8 @@ export class ClaudeCodeAdapter implements CaptureAdapter {
 
     let inputTokens = main.inputTokens;
     let outputTokens = main.outputTokens;
+    let inputUsagePresent = main.inputUsagePresent;
+    let outputUsagePresent = main.outputUsagePresent;
     let cacheCreationTokens = main.cacheCreationTokens;
     let cacheReadTokens = main.cacheReadTokens;
 
@@ -620,6 +630,8 @@ export class ClaudeCodeAdapter implements CaptureAdapter {
         // Accumulate totals
         inputTokens += sub.inputTokens;
         outputTokens += sub.outputTokens;
+        inputUsagePresent ||= sub.inputUsagePresent;
+        outputUsagePresent ||= sub.outputUsagePresent;
         cacheCreationTokens += sub.cacheCreationTokens;
         cacheReadTokens += sub.cacheReadTokens;
         totalSubagentThinkingBlocks += sub.thinkingBlockCount;
@@ -697,7 +709,10 @@ export class ClaudeCodeAdapter implements CaptureAdapter {
         ? Math.max(0, new Date(lastTimestamp).getTime() - new Date(firstTimestamp).getTime())
         : 0;
 
-    const totalTokens = inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens;
+    const providerReportedTokens = inputUsagePresent || outputUsagePresent;
+    const totalTokens = providerReportedTokens
+      ? inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens
+      : undefined;
 
     const trace: AgentTrace = {
       id: traceId,
@@ -712,17 +727,19 @@ export class ClaudeCodeAdapter implements CaptureAdapter {
     };
 
     const usage = createUsageMetadata({
-      inputTokens,
-      outputTokens,
-      totalTokens,
+      ...(inputUsagePresent ? { inputTokens } : {}),
+      ...(outputUsagePresent ? { outputTokens } : {}),
+      ...(totalTokens !== undefined ? { totalTokens } : {}),
       cacheReadInputTokens: cacheReadTokens,
       cacheCreationInputTokens: cacheCreationTokens,
-      providerReportedTokens: true,
+      providerReportedTokens,
       estimatedTokens: false,
       model,
       provider: "anthropic",
       limitations: [
-        "Token counts are from the Claude Code session JSONL usage fields (actual API response metadata).",
+        providerReportedTokens
+          ? "Token counts are from the Claude Code session JSONL usage fields (actual API response metadata)."
+          : "The Claude Code session JSONL carried no provider usage counts; token axes remain unavailable.",
         "Cost is estimated from the Anthropic price table, not from billing records.",
         "Cache read tokens priced at ~10% of standard input rate (estimated). Cache creation tokens priced at ~125% of standard input rate (estimated). Not billing-confirmed."
       ]

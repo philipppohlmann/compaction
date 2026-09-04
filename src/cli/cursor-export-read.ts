@@ -7,7 +7,8 @@
  *
  * Invariant: a failed read NEVER fabricates a trace or token
  * counts, nothing is written, nothing is counted, no silent zeros. Tokens on the Cursor path
- * remain LOCAL-ESTIMATE / unavailable-with-reason only (Cursor emits no provider usage).
+ * remain LOCAL-ESTIMATE / unavailable-with-reason because Compaction does not ingest Cursor's
+ * conditional `result.usage` fields.
  */
 import { readFile } from "node:fs/promises";
 

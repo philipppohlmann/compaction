@@ -22,6 +22,10 @@ import {
   validateActivityEvent,
   type ActivityEvent
 } from "./activity-event.js";
+import {
+  validClaudeLogicalRunId,
+  validClaudeLogicalSessionId
+} from "./claude-logical-run-id.js";
 
 /** Default local activity directory (sibling of `.compaction/run-records`; gitignored via `.compaction/`). */
 export const DEFAULT_ACTIVITY_DIRECTORY = ".compaction/activity";
@@ -65,7 +69,16 @@ export const ACTIVITY_EVENT_ALLOWED_KEYS: readonly string[] = [
   "approval_status",
   "auto_apply",
   "recovery",
-  "sync_status"
+  "sync_status",
+  "activity_kind",
+  "recorded_at",
+  "run_started_at",
+  "output_shaping_state",
+  "estimated_output_tokens_saved",
+  "output_estimate_basis",
+  "output_estimate_state",
+  "apply_posture",
+  "measurement_source"
 ];
 
 /** Nested-object key allowlists (content can hide one level down just as easily). */
@@ -204,7 +217,10 @@ export async function appendActivityEvent(
     return { appended: false, reason: "metrics-only invariant rejected the event - nothing was written", problems };
   }
   const id = materialized.activity_event_id as string;
-  const { events } = await readActivityEvents(directory);
+  // Physical append idempotency is deliberately checked against the raw validated log. The public
+  // reader coalesces cumulative Claude snapshots by logical run, but an older hidden snapshot must
+  // still prevent its exact physical event id from being appended again.
+  const { events } = await readPhysicalActivityEvents(directory);
   if (events.some((existing) => existing.activity_event_id === id)) {
     return { appended: false, reason: `duplicate activity_event_id ${id} - already recorded (dedupe; nothing written)` };
   }
@@ -225,7 +241,7 @@ export interface SkippedActivityLine {
  * not an error). Invalid lines are SKIPPED with a reason - never guessed at; a duplicate id keeps
  * the FIRST occurrence (defensive read-side dedupe; the write side already prevents this).
  */
-export async function readActivityEvents(
+async function readPhysicalActivityEvents(
   directory: string = DEFAULT_ACTIVITY_DIRECTORY
 ): Promise<{ events: ActivityEvent[]; skipped: SkippedActivityLine[] }> {
   let raw: string;
@@ -263,6 +279,138 @@ export async function readActivityEvents(
     events.push(event);
   });
   return { events, skipped };
+}
+
+const CLAUDE_MONOTONIC_COUNT_FIELDS = [
+  "input_before",
+  "input_after",
+  "output_after"
+] as const;
+
+const CLAUDE_IMMUTABLE_RUN_FIELDS = [
+  "surface",
+  "provider",
+  "workflow_id",
+  "session_id",
+  "run_id",
+  "claim_scope",
+  "evidence_level",
+  "activity_kind",
+  "run_started_at",
+  "measurement_source"
+] as const;
+
+function claudeLogicalPair(event: ActivityEvent): string | undefined {
+  return event.surface === "claude_code" &&
+    validClaudeLogicalSessionId(event.session_id) &&
+    validClaudeLogicalRunId(event.run_id)
+    ? `${event.session_id}\0${event.run_id}`
+    : undefined;
+}
+
+function canonicalRecordedAt(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function orderedCompatibleClaudeSnapshots(events: ActivityEvent[], indices: number[]): boolean {
+  const snapshots = indices.map((index) => events[index]);
+  const first = snapshots[0];
+  if (
+    first.activity_kind !== "claude-stop" ||
+    first.workflow_id !== "claude-stop" ||
+    !canonicalRecordedAt(first.run_started_at) ||
+    !canonicalRecordedAt(first.recorded_at) ||
+    first.recorded_at < first.run_started_at
+  ) return false;
+  if (snapshots.some((event) =>
+    CLAUDE_IMMUTABLE_RUN_FIELDS.some((field) => event[field] !== first[field])
+  )) return false;
+  for (let index = 1; index < snapshots.length; index += 1) {
+    const older = snapshots[index - 1];
+    const newer = snapshots[index];
+    if (
+      !canonicalRecordedAt(older.recorded_at) ||
+      !canonicalRecordedAt(newer.recorded_at) ||
+      newer.recorded_at < first.run_started_at ||
+      newer.recorded_at <= older.recorded_at
+    ) return false;
+    for (const field of CLAUDE_MONOTONIC_COUNT_FIELDS) {
+      const before = older[field];
+      const after = newer[field];
+      if (typeof before === "number" && (typeof after !== "number" || after < before)) return false;
+    }
+  }
+  return true;
+}
+
+function finalClaudeStopCoversLegacySnapshots(events: ActivityEvent[], indices: number[]): boolean {
+  const snapshots = indices.map((index) => events[index]);
+  const final = snapshots[snapshots.length - 1];
+  if (
+    final.activity_kind !== "claude-stop" ||
+    final.workflow_id !== "claude-stop" ||
+    !canonicalRecordedAt(final.run_started_at) ||
+    !canonicalRecordedAt(final.recorded_at) ||
+    final.recorded_at < final.run_started_at ||
+    snapshots.slice(0, -1).some((event) => event.activity_kind !== undefined)
+  ) return false;
+  // A transcript-backed final may be a task-scoped monotonic delta from the immediately preceding
+  // session snapshot. Its earlier legacy parent is still cumulative, so their counts are deliberately
+  // not comparable. The exact hashed session/run pair is the authority; it is derived from the run's
+  // session correlation, sequence, and start identity rather than from a timestamp/content heuristic.
+  if (final.measurement_source === "claude-transcript" && final.claim_scope === "run-scoped") return true;
+  return snapshots.slice(0, -1).every((event) =>
+    CLAUDE_MONOTONIC_COUNT_FIELDS.every((field) => {
+      const before = event[field];
+      const after = final[field];
+      return typeof before !== "number" || (typeof after === "number" && after >= before);
+    })
+  );
+}
+
+/**
+ * Collapse only unambiguous cumulative Claude snapshots for the exact hashed session/logical-run
+ * pair. The physical JSONL remains append-only. Exact run identity/window and comparable cumulative
+ * counts must remain compatible; a validated task-scoped transcript delta supersedes its exact legacy
+ * cumulative parent by identity instead. Derived metadata (model, shaping posture, token-source mix,
+ * policy/calibration result) may legitimately evolve as later calls join the same run; the latest
+ * validated snapshot is authoritative. Missing/legacy/malformed/foreign identity, immutable-identity
+ * conflicts, timestamp ties/inversions, and count regressions remain separate events. One earlier
+ * hook-only legacy snapshot may also be superseded when the later validated Claude Stop carries the
+ * exact same hashed logical identity and nondecreasing cumulative axes; the physical row stays intact.
+ */
+export function coalesceClaudeLogicalRuns(events: ActivityEvent[]): ActivityEvent[] {
+  const groups = new Map<string, number[]>();
+  events.forEach((event, index) => {
+    const pair = claudeLogicalPair(event);
+    if (!pair) return;
+    const group = groups.get(pair) ?? [];
+    group.push(index);
+    groups.set(pair, group);
+  });
+  const suppressed = new Set<number>();
+  for (const indices of groups.values()) {
+    if (
+      indices.length < 2 ||
+      (!orderedCompatibleClaudeSnapshots(events, indices) &&
+        !finalClaudeStopCoversLegacySnapshots(events, indices))
+    ) continue;
+    for (const index of indices.slice(0, -1)) suppressed.add(index);
+  }
+  return events.filter((_, index) => !suppressed.has(index));
+}
+
+/**
+ * Public logical activity reader. Physical ids are validated/deduped first; then exact Claude
+ * cumulative snapshots coalesce to the latest final snapshot for every ordinary activity consumer.
+ */
+export async function readActivityEvents(
+  directory: string = DEFAULT_ACTIVITY_DIRECTORY
+): Promise<{ events: ActivityEvent[]; skipped: SkippedActivityLine[] }> {
+  const physical = await readPhysicalActivityEvents(directory);
+  return { events: coalesceClaudeLogicalRuns(physical.events), skipped: physical.skipped };
 }
 
 /** A content-free one-line summary per event - ids, surface, statuses; never counts recomputed. */

@@ -47,6 +47,8 @@ export interface GatewayOutputShapingPlan {
   /** Model-visible instruction characters added by this treatment. */
   addedInputCharacters: number;
   applied: OutputShapingAttribution[];
+  /** Exact identity of the model-visible policy bytes when attached. */
+  policyVersion?: string;
   reason: string;
   /** Task-aware classification signal (content-free) when task-awareness gated this request. */
   taskSignal?: OutputShapingTaskSignal;
@@ -127,6 +129,85 @@ export function bodyAlreadyCarriesOutputShaping(bodyText: string): boolean {
 }
 
 /**
+ * IS THE CURRENT OUTPUT-SHAPING POLICY ACTIVE ON THIS REQUEST, at instruction level?
+ *
+ * A DIFFERENT QUESTION FROM `bodyAlreadyCarriesOutputShaping`, deliberately kept beside it so the
+ * asymmetry is visible in one place:
+ *  - THE GUARD above is BROAD (marker substring, anywhere). Its bias is to SKIP attaching, and a false
+ *    positive costs one unshaped turn. That bias is correct for a guard and is NOT changed here.
+ *  - THIS PREDICATE is STRICT. It answers what a RECEIPT will durably claim, so its bias is to
+ *    WITHHOLD evidence. A false positive here would put a savings arrow on a turn nothing shaped.
+ * Both biases point the same way: toward not claiming.
+ *
+ * TWO NARROWINGS, both load-bearing:
+ *
+ *  1. THE FULL CURRENT PAYLOAD, not the marker. The marker is one 47-character sentence; a user asking
+ *     about this very feature can write it. The payload is the whole policy `buildOutputShapingPolicy()`
+ *     emits, so a match means the model is reading the instructions we would have attached — not that
+ *     the phrase appears somewhere.
+ *
+ *  2. INSTRUCTION-LEVEL CARRIERS ONLY. Anthropic's top-level `system` (blocks or string), the Responses
+ *     API `instructions`, and `system`/`developer`-role messages. User and assistant turns are NOT
+ *     carriers: transcript history quoting the policy does not instruct the model, and counting it would
+ *     make every long conversation look shaped. This is what "active" means structurally rather than
+ *     textually.
+ *
+ * A policy that was already present may move between supported instruction carriers during input
+ * compaction. It remains active even when this apply pass attached nothing, so
+ * `applied_components` cannot answer this question: it records what MUTATED, not what is ACTIVE.
+ */
+export function outputShapingActiveOnRequest(bodyText: string): boolean {
+  return outputShapingPolicyVersionOnRequest(bodyText) !== undefined;
+}
+
+/** Exact current-policy identity only when the complete emitted bytes are active in an instruction carrier. */
+export function outputShapingPolicyVersionOnRequest(bodyText: string): string | undefined {
+  const policy = buildOutputShapingPolicy();
+  const payload = policy.instructions;
+  if (payload === "") return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const body = parsed as Record<string, unknown>;
+  return instructionCarriers(body).some((carrier) => carrier.includes(payload))
+    ? policy.policyVersion
+    : undefined;
+}
+
+/** Every instruction-level text carrier in the body. User/assistant turns are deliberately excluded. */
+function instructionCarriers(body: Record<string, unknown>): string[] {
+  const carriers: string[] = [];
+  const pushBlocks = (value: unknown): void => {
+    if (typeof value === "string") {
+      carriers.push(value);
+      return;
+    }
+    if (!Array.isArray(value)) return;
+    for (const block of value) {
+      const text = (block as Record<string, unknown> | null)?.text;
+      if (typeof text === "string") carriers.push(text);
+    }
+  };
+  // Anthropic top-level `system` (string or block array) and the Responses API `instructions`.
+  pushBlocks(body.system);
+  if (typeof body.instructions === "string") carriers.push(body.instructions);
+  // `system`/`developer` role messages: instruction-level by role, wherever they sit in the array.
+  const messages = body.messages;
+  if (Array.isArray(messages)) {
+    for (const message of messages) {
+      const role = (message as Record<string, unknown> | null)?.role;
+      if (role !== "system" && role !== "developer") continue;
+      pushBlocks((message as Record<string, unknown>).content);
+    }
+  }
+  return carriers;
+}
+
+/**
  * Attach the default deterministic output-shaping block idempotently, behind the shared public
  * request-shape validator (same fail-closed boundary as input compaction, no private dependency).
  *
@@ -197,6 +278,7 @@ export function planGatewayOutputShaping(
   // planning / no-oracle / extended-thinking regime, where prose is plausibly load-bearing. The PUBLIC
   // basic path passes no gate → blanket/always-on shaping. Any gate throw degrades to blanket (fail-open
   // to the public method).
+  let taskSignal: OutputShapingTaskSignal | undefined;
   if (options.taskGate) {
     let held: { decision: "shape" | "hold"; signal?: OutputShapingTaskSignal } | undefined;
     try {
@@ -209,6 +291,7 @@ export function planGatewayOutputShaping(
       // typed signal reaches the persisted content-free receipt. `taskSignal` disambiguates the case.
       return unchanged("task-aware: held shaping on a planning/reasoning or extended-thinking turn", true, held.signal);
     }
+    taskSignal = held?.signal;
   }
 
   if (family === "responses") {
@@ -228,6 +311,8 @@ export function planGatewayOutputShaping(
       mutatedBody: JSON.stringify({ ...body, instructions }),
       addedInputCharacters: policy.instructions.length + (typeof existing === "string" && existing.length > 0 ? 2 : 0),
       applied: policy.applied,
+      policyVersion: policy.policyVersion,
+      ...(taskSignal !== undefined ? { taskSignal } : {}),
       reason: "attached deterministic pre-generation output shaping to responses.instructions"
     };
   }
@@ -254,6 +339,8 @@ export function planGatewayOutputShaping(
         mutatedBody: JSON.stringify({ ...body, system }),
         addedInputCharacters: policy.instructions.length,
         applied: policy.applied,
+        policyVersion: policy.policyVersion,
+        ...(taskSignal !== undefined ? { taskSignal } : {}),
         reason: "attached deterministic pre-generation output shaping to anthropic system instructions"
       };
     }
@@ -271,6 +358,8 @@ export function planGatewayOutputShaping(
       mutatedBody: JSON.stringify({ ...body, system }),
       addedInputCharacters: policy.instructions.length + (typeof existing === "string" && existing.length > 0 ? 2 : 0),
       applied: policy.applied,
+      policyVersion: policy.policyVersion,
+      ...(taskSignal !== undefined ? { taskSignal } : {}),
       reason: "attached deterministic pre-generation output shaping to anthropic system instructions"
     };
   }
@@ -300,6 +389,8 @@ export function planGatewayOutputShaping(
       mutatedBody: JSON.stringify({ ...body, messages: next }),
       addedInputCharacters: policy.instructions.length,
       applied: policy.applied,
+      policyVersion: policy.policyVersion,
+      ...(taskSignal !== undefined ? { taskSignal } : {}),
       reason: "attached deterministic pre-generation output shaping as a chat system instruction"
     };
   }

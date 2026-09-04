@@ -141,6 +141,7 @@ import { openBrowser } from "./login.js";
 import { proUrl } from "./pro.js";
 import {
   AUTO_APPLY_ELIGIBILITY_GATES,
+  authorizationStoreDirectory,
   disablePolicyPreference,
   readPolicyPreferences,
   savePolicyPreference
@@ -303,7 +304,7 @@ const SHIM_TOOL_LABELS: Record<CaptureShimTool, { title: string; connectNum: str
     title: "Cursor",
     connectNum: "3",
     measurableForm: "cursor-agent … --output-format json",
-    tokenNote: "LOCAL-ESTIMATE tokens only (Cursor emits no provider usage) - never provider-reported; output unavailable when the result is not separable"
+    tokenNote: "LOCAL-ESTIMATE tokens only because Compaction does not ingest Cursor's conditional result.usage - never provider-reported; output unavailable when the result is not separable"
   }
 };
 
@@ -1240,15 +1241,20 @@ export async function computeOnboardingReadyStatus(
  *
  * The FIRST unmet gate is reported, and the optimization mode is checked first on purpose: it is the
  * user's own visible choice from two screens earlier, so it is the reason that will make sense to them.
+ *
+ * There is no `cwd` here on purpose: both gates are DEVICE facts. The authorization used to be read
+ * from the working directory, which made this screen answer differently in different folders.
  */
 export async function pendingFullApplyGate(
   workflows: readonly ReadyToolKey[],
-  cwd: string = process.cwd(),
   env: NodeJS.ProcessEnv = process.env
 ): Promise<string | undefined> {
   if (readOptimizationMode(env) !== "cache-plus-context") return FULL_APPLY_PENDING_REASONS.optimizationMode;
   for (const workflow of workflows) {
-    const authorization = await findStoredAuthorization({ scope: { tool: workflow }, cwd });
+    // ONE env for both gates. The mode and the authorization are two facts about the same device, and
+    // this screen must answer the question the gateway will answer - reading them from two different
+    // environments (or the authorization from a working directory) is how the two answers diverge.
+    const authorization = await findStoredAuthorization({ scope: { tool: workflow }, env });
     if (authorization) return undefined;
   }
   // Also the "nothing was enabled" case: no enabled workflow can carry an authorization, so no turn
@@ -2100,10 +2106,13 @@ async function runAuthorizeAutoApply(rawWorkflow: string): Promise<void> {
 async function disableAutoApplyAuthorizationsFor(tool: string): Promise<string[]> {
   const disabled: string[] = [];
   try {
-    const { preferences } = await readPolicyPreferences();
+    // The device store - the one place an authorization can live, so disconnecting cannot leave a live
+    // one behind somewhere the disconnect did not look.
+    const store = authorizationStoreDirectory();
+    const { preferences } = await readPolicyPreferences(store);
     for (const preference of preferences) {
       if (preference.scope.tool === tool && preference.enabled) {
-        const result = await disablePolicyPreference(preference.id);
+        const result = await disablePolicyPreference(preference.id, store);
         if (result.disabled) disabled.push(preference.id);
       }
     }

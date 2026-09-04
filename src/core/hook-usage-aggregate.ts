@@ -20,6 +20,14 @@ import {
   CLAUDE_CODE_HOOK_RECORD_SCHEMA,
   type ClaudeCodeHookRecord
 } from "./claude-code-hook-record.js";
+import {
+  coalesceClaudeLogicalRuns,
+  validateActivityEventForStore
+} from "./activity-store.js";
+import {
+  validClaudeLogicalRunId,
+  validClaudeLogicalSessionId
+} from "./claude-logical-run-id.js";
 
 export const HOOK_USAGE_AGGREGATE_SCHEMA = "compaction.hook-usage-aggregate.v1" as const;
 
@@ -115,9 +123,220 @@ export interface AggregateOptions {
   since?: string;
 }
 
+const HOOK_USAGE_COUNT_FIELDS = [
+  "inputTokens",
+  "outputTokens",
+  "cacheReadInputTokens",
+  "cacheCreationInputTokens",
+  "totalTokens"
+] as const;
+
+function validHookUsageCounts(record: ClaudeCodeHookRecord): boolean {
+  return HOOK_USAGE_COUNT_FIELDS.every((field) => {
+    const value = record[field];
+    return value === null || (typeof value === "number" && Number.isFinite(value) && value >= 0);
+  });
+}
+
+/**
+ * Resolve one exact prior cumulative baseline for a known completed Claude run. Identity comes from
+ * the run store; this helper merely selects that run's latest monotonic content-free hook snapshot.
+ * Missing, tied, malformed, source-conflicting, or regressing records yield no baseline.
+ */
+export function exactPriorClaudeHookRecord(
+  records: ClaudeCodeHookRecord[],
+  expected: { sessionId: string; logicalRunId: string; before: string }
+): ClaudeCodeHookRecord | undefined {
+  const sessionRecords = records.filter((record) =>
+    record.tool === "claude-code" &&
+    record.sessionId === expected.sessionId
+  );
+  if (sessionRecords.some((record) => !canonicalRecordedAt(record.recordedAt))) return undefined;
+  const candidates = sessionRecords.filter((record) => record.recordedAt <= expected.before);
+  if (candidates.length === 0 || candidates.some((record) =>
+    !validClaudeLogicalRunId(record.logicalRunId) ||
+    record.recordedAt >= expected.before ||
+    !validHookUsageCounts(record) ||
+    (record.tokenSource !== "provider-reported" && record.tokenSource !== "local-estimate")
+  )) return undefined;
+  candidates.sort((left, right) => left.recordedAt.localeCompare(right.recordedAt));
+  for (let index = 1; index < candidates.length; index += 1) {
+    const older = candidates[index - 1];
+    const newer = candidates[index];
+    if (newer.recordedAt <= older.recordedAt || newer.tokenSource !== older.tokenSource) return undefined;
+    if (HOOK_USAGE_COUNT_FIELDS.some((field) => {
+      const before = older[field];
+      const after = newer[field];
+      return typeof before === "number" && (typeof after !== "number" || after < before);
+    })) return undefined;
+  }
+  const latest = candidates[candidates.length - 1];
+  return latest.logicalRunId === expected.logicalRunId ? latest : undefined;
+}
+
 function addToken(acc: number | null, value: number | null): number | null {
   if (value === null) return acc; // missing contributes nothing and never coerces to 0
   return (acc ?? 0) + value;
+}
+
+const CUMULATIVE_FIELDS = [
+  "inputTokens",
+  "outputTokens",
+  "cacheReadInputTokens",
+  "cacheCreationInputTokens",
+  "totalTokens"
+] as const;
+
+function canonicalRecordedAt(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function compatibleLogicalRecords(records: ClaudeCodeHookRecord[]): boolean {
+  if (records.length < 2) return true;
+  const first = records[0];
+  if (!canonicalRecordedAt(first.recordedAt)) return false;
+  for (let index = 1; index < records.length; index += 1) {
+    const older = records[index - 1];
+    const newer = records[index];
+    if (!canonicalRecordedAt(newer.recordedAt) || newer.recordedAt <= older.recordedAt) return false;
+    if (
+      newer.tool !== first.tool ||
+      newer.tool !== "claude-code" ||
+      newer.sessionId !== first.sessionId ||
+      newer.logicalRunId !== first.logicalRunId
+    ) return false;
+    if (newer.messageCount < older.messageCount) return false;
+    for (const field of CUMULATIVE_FIELDS) {
+      const before = older[field];
+      const after = newer[field];
+      if (typeof before === "number" && (typeof after !== "number" || after < before)) return false;
+    }
+  }
+  const final = records[records.length - 1];
+  if (!exactLogicalRecordPair(final)) return false;
+  const snapshots = records.flatMap((record) =>
+    record.settledActivityEvent ? [record.settledActivityEvent] : []
+  );
+  const coalesced = coalesceClaudeLogicalRuns(snapshots);
+  return coalesced.length === 1 && coalesced[0] === final.settledActivityEvent;
+}
+
+function exactLogicalRecordPair(record: ClaudeCodeHookRecord): string | undefined {
+  const event = record.settledActivityEvent;
+  return record.tool === "claude-code" &&
+    typeof record.sessionId === "string" &&
+    record.sessionId.length > 0 &&
+    validClaudeLogicalRunId(record.logicalRunId) &&
+    event !== undefined &&
+    validateActivityEventForStore(event).problems.length === 0 &&
+    event.surface === "claude_code" &&
+    event.activity_kind === "claude-stop" &&
+    event.workflow_id === "claude-stop" &&
+    validClaudeLogicalSessionId(event.session_id) &&
+    event.run_id === record.logicalRunId
+    ? `${record.sessionId}\0${event.session_id}\0${record.logicalRunId}`
+    : undefined;
+}
+
+function logicalRecordIdentity(record: ClaudeCodeHookRecord): string | undefined {
+  return record.tool === "claude-code" &&
+    typeof record.sessionId === "string" &&
+    record.sessionId.length > 0 &&
+    validClaudeLogicalRunId(record.logicalRunId)
+    ? `${record.sessionId}\0${record.logicalRunId}`
+    : undefined;
+}
+
+function coalesceLogicalHookRecords(records: ClaudeCodeHookRecord[]): ClaudeCodeHookRecord[] {
+  const logical = new Map<string, ClaudeCodeHookRecord[]>();
+  for (const record of records) {
+    const pair = logicalRecordIdentity(record);
+    if (!pair) continue;
+    const group = logical.get(pair) ?? [];
+    group.push(record);
+    logical.set(pair, group);
+  }
+  const suppressed = new Set<ClaudeCodeHookRecord>();
+  for (const group of logical.values()) {
+    if (group.length < 2) continue;
+    const ordered = [...group].sort((left, right) => left.recordedAt.localeCompare(right.recordedAt));
+    if (!compatibleLogicalRecords(ordered)) continue;
+    for (const record of ordered.slice(0, -1)) suppressed.add(record);
+  }
+  return records.filter((record) => !suppressed.has(record));
+}
+
+function taskScopedClaudeHookCounts(records: ClaudeCodeHookRecord[]): ClaudeCodeHookRecord[] {
+  const result = records.map((record) => ({ ...record }));
+  const sessions = new Map<string, number[]>();
+  result.forEach((record, index) => {
+    if (
+      record.tool !== "claude-code" ||
+      typeof record.sessionId !== "string" ||
+      !validClaudeLogicalRunId(record.logicalRunId)
+    ) return;
+    const group = sessions.get(record.sessionId) ?? [];
+    group.push(index);
+    sessions.set(record.sessionId, group);
+  });
+  for (const indices of sessions.values()) {
+    if (indices.length < 2) continue;
+    const ordered = [...indices].sort((left, right) =>
+      result[left].recordedAt.localeCompare(result[right].recordedAt)
+    );
+    const unambiguous = ordered.every((index) =>
+      canonicalRecordedAt(result[index].recordedAt) && validHookUsageCounts(result[index])
+    ) && ordered.every((index, position) =>
+      position === 0 || result[index].recordedAt > result[ordered[position - 1]].recordedAt
+    );
+    if (!unambiguous) {
+      for (const index of ordered) {
+        for (const field of HOOK_USAGE_COUNT_FIELDS) result[index][field] = null;
+      }
+      continue;
+    }
+    let tainted = false;
+    for (let position = 1; position < ordered.length; position += 1) {
+      const current = result[ordered[position]];
+      const previous = records[ordered[position - 1]];
+      if (tainted) {
+        for (const field of HOOK_USAGE_COUNT_FIELDS) current[field] = null;
+        continue;
+      }
+      const exactTaskDelta = exactLogicalRecordPair(current) !== undefined &&
+        current.settledActivityEvent?.measurement_source === "claude-transcript" &&
+        current.settledActivityEvent.claim_scope === "run-scoped";
+      const compatible = current.tokenSource === previous.tokenSource &&
+        HOOK_USAGE_COUNT_FIELDS.every((field) => {
+          const after = current[field];
+          const before = previous[field];
+          return typeof before !== "number" || (typeof after === "number" && after >= before);
+        });
+      if (!compatible) {
+        for (const field of HOOK_USAGE_COUNT_FIELDS) current[field] = null;
+        tainted = true;
+        continue;
+      }
+      if (!exactTaskDelta) {
+        // This is another cumulative session snapshot, not a proven task delta. The newer snapshot
+        // supersedes all earlier contributions for this session so overlapping totals are never summed.
+        for (const earlier of ordered.slice(0, position)) {
+          for (const field of HOOK_USAGE_COUNT_FIELDS) result[earlier][field] = null;
+        }
+        continue;
+      }
+      for (const field of HOOK_USAGE_COUNT_FIELDS) {
+        const after = current[field];
+        const before = previous[field];
+        current[field] = typeof after === "number" && typeof before === "number"
+          ? after - before
+          : null;
+      }
+    }
+  }
+  return result;
 }
 
 /**
@@ -127,22 +346,27 @@ function addToken(acc: number | null, value: number | null): number | null {
 export function aggregateHookUsageRecords(records: ClaudeCodeHookRecord[], options: AggregateOptions = {}): HookUsageAggregate {
   const since = options.since ?? null;
 
-  // Apply the time-window filter first, then dedup by dedupKey (records are already deduped at write time;
-  // this is defensive). `totalRecords` counts records IN the window so "deduped from N" reads accurately
-  // under --since. When `since` is set, a record with a missing/non-string recordedAt is EXCLUDED (a record
-  // with no timestamp cannot be proven to fall inside the window).
+  // Dedup + derive exact-session cumulative deltas over the complete bounded record set BEFORE the
+  // display window is applied. Otherwise the first record inside `--since` would lose its immediately
+  // preceding baseline and its cumulative session total would be mislabeled as new usage. `totalRecords`
+  // still counts physical records IN the requested window so "deduped from N" remains accurate.
   let totalRecords = 0;
-  const deduped = new Map<string, ClaudeCodeHookRecord>();
+  const physical = new Map<string, ClaudeCodeHookRecord>();
   for (const r of records) {
-    if (since !== null && (typeof r.recordedAt !== "string" || r.recordedAt < since)) continue;
-    totalRecords += 1;
-    if (!deduped.has(r.dedupKey)) deduped.set(r.dedupKey, r);
+    if (since === null || (typeof r.recordedAt === "string" && r.recordedAt >= since)) totalRecords += 1;
+    if (!physical.has(r.dedupKey)) physical.set(r.dedupKey, r);
   }
+  const normalized = taskScopedClaudeHookCounts(coalesceLogicalHookRecords([...physical.values()]));
+  const deduped = since === null
+    ? normalized
+    : normalized.filter((record) =>
+        typeof record.recordedAt === "string" && record.recordedAt >= since
+      );
 
   const byTool = new Map<string, HookUsageToolAggregate>();
   const sessionsByTool = new Map<string, Set<string>>();
 
-  for (const r of deduped.values()) {
+  for (const r of deduped) {
     let agg = byTool.get(r.tool);
     if (!agg) {
       agg = {
@@ -191,7 +415,7 @@ export function aggregateHookUsageRecords(records: ClaudeCodeHookRecord[], optio
   return {
     schema: HOOK_USAGE_AGGREGATE_SCHEMA,
     totalRecords,
-    dedupedRecords: deduped.size,
+    dedupedRecords: deduped.length,
     since,
     tools: Array.from(byTool.values()).sort((a, b) => a.tool.localeCompare(b.tool))
   };

@@ -1,10 +1,10 @@
 {
   "name": "@compaction/cli",
-  "version": "0.6.5",
+  "version": "0.6.8",
   "publishConfig": {
     "access": "public"
   },
-  "description": "Install once and route Claude Code, Codex, or Cursor through a local, byte-safe Gateway \u2014 measure token & cache usage with content-free receipts and shape responses before generation for shorter output. Local-first, no account required, no prompt or code telemetry. Adaptive input compaction needs a free account and the separately delivered engine.",
+  "description": "Install once and route Claude Code, Codex, or Cursor through a local, byte-safe Gateway — measure token & cache usage with content-free receipts and shape responses before generation for shorter output. Local-first, no account required, no prompt or code telemetry. Adaptive input compaction needs a free account and the separately delivered engine.",
   "homepage": "https://compaction.dev",
   "repository": {
     "type": "git",

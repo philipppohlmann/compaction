@@ -1,301 +1,505 @@
 /**
- * LEARNING output-shaping calibration store (PUBLIC CLI/SDK core, engine-free, content-free, local-first).
+ * Shared output-shaping calibration store (PUBLIC, engine-free, content-free, local-first).
  *
- * The per-turn receipt line's output before→after arrow (`output 652→512 (−21%, est)`) needs a reduction
- * RATE to reconstruct the before from this turn's real output. That rate must be MEASURED, and it should get
- * TIGHTER as more real A/B experiments are run. This store is that learning loop:
- *
- *  - It ACCUMULATES real, provider-reported output-shaping A/B measurements (each a mean-control vs
- *    mean-treatment output-token pair with its per-arm sample counts) into a single running aggregate —
- *    INCLUDING experiments where shaping did not help, since excluding those is what made v1 optimistic.
- *  - It maintains a running SAMPLE-WEIGHTED reduction rate: the rate is computed from accumulated
- *    control/treatment output-token TOTALS, so an experiment with more turns pulls the estimate more, and
- *    the estimate converges as samples accumulate. It also carries the cumulative sample count so a reader
- *    can refuse to over-trust a 1-sample rate.
- *  - It is CONTENT-FREE: only aggregate token totals, sample counts, an experiment-id set (opaque labels),
- *    and timestamps — never a prompt, response, or trace byte.
- *
- * A rate is produced ONLY from real measurements fed in via `updateCalibrationFromAbSummary` (the
- * `compaction savings` A/B path). Nothing here fabricates a counterfactual: a turn that was merely shaped
- * (with no control arm) can never update the rate — only a real A/B does.
+ * The store accepts only confirmation artifacts produced after the private engine's statistical and
+ * full-content quality gates pass. Records are keyed by the exact model-visible policy bytes plus the
+ * provider/model cohort and, only when observed, a fixed regime. Resolution is exact on every key:
+ * unknown metadata never borrows a nearby cohort and there is no policy-wide or generic-prior fallback.
  */
+import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { OutputShapingAbSummary } from "./output-shaping-ab.js";
 import { compactionConfigDir } from "./config-dir.js";
 
-/**
- * SCHEMA v2 (2026-08-04). v1 aggregates are treated as ABSENT (`loadCalibration` already returns an empty
- * aggregate on a schema mismatch), because v1 totals were accumulated with two defects that make them
- * incomparable with v2 contributions:
- *
- *  1. SURVIVORSHIP — v1 discarded every experiment where shaping did NOT reduce output (`before <= after`),
- *     so the rate was a mean over wins only and structurally optimistic.
- *  2. MISMATCHED ARM WEIGHTS — v1 weighted control by `nControl` and treatment by `nTreatment`, then divided
- *     the two sums. With unbalanced arms that is not a reduction fraction at all: a measured 40% reduction
- *     (before=1000×3 turns, after=600×6 turns) folded in as totals 3000/3600, i.e. a 20% INCREASE.
- *
- * Discarding is safe and cheap here: the file is a local, content-free, regenerable cache, and the only
- * consequence is that the rate returns to uncalibrated until the next `compaction savings` run folds in an
- * A/B under the corrected arithmetic. Blending v1 and v2 totals would silently carry the old error forward.
- */
-export const OUTPUT_SHAPING_CALIBRATION_SCHEMA = "output-shaping.calibration.v2" as const;
+export const OUTPUT_SHAPING_CALIBRATION_SCHEMA = "output-shaping.calibration.v3" as const;
+export const OUTPUT_SHAPING_CALIBRATION_CONFIRMATION_SCHEMA =
+  "output-shaping.calibration-confirmation.v1" as const;
+
+/** The only regime v1 can identify without retaining task content. */
+export type OutputShapingCalibrationRegime = "default-shapeable";
+
+export interface OutputShapingCalibrationQuery {
+  policyVersion: string;
+  provider: string;
+  model: string;
+  regime?: OutputShapingCalibrationRegime;
+}
 
 /**
- * The accumulated, content-free calibration aggregate. Every field is a count, a total, an opaque id, or a
- * timestamp. `sampleCount` is the number of DISTINCT A/B experiments folded in (an experiment re-added by id
- * replaces its prior contribution — see `foldAbSummary` — so re-running the same experiment does not
- * double-count). The reduction rate is derived from the totals, never stored as an independent number that
- * could drift from them.
+ * Content-free handoff emitted by the private engine after all confirmation gates pass. The public
+ * core validates this closed shape but never attempts to reproduce the private full-content eval.
  */
-export interface OutputShapingCalibration {
-  schema: typeof OUTPUT_SHAPING_CALIBRATION_SCHEMA;
-  /** Number of distinct A/B experiments folded into the aggregate. */
-  sampleCount: number;
-  /** Cumulative CONTROL (unshaped) mean-output tokens summed across folded experiments (weighted by turns). */
+export interface OutputShapingCalibrationConfirmation extends OutputShapingCalibrationQuery {
+  schema: typeof OUTPUT_SHAPING_CALIBRATION_CONFIRMATION_SCHEMA;
+  confirmation: "engine-confirmed";
+  confirmationId: string;
+  providerReported: true;
+  nControl: number;
+  nTreatment: number;
   totalControlOutputTokens: number;
-  /** Cumulative TREATMENT (shaped) mean-output tokens summed across folded experiments (weighted by turns). */
   totalTreatmentOutputTokens: number;
-  /** Cumulative provider-reported turns (control + treatment) behind the totals — the confidence denominator. */
-  totalTurns: number;
-  /** The opaque experiment ids folded in (content-free labels), so a re-add replaces not double-counts. */
-  experimentIds: string[];
+  intervalLow: number;
+  intervalHigh: number;
+  evalOrder: "control-first";
+  controlFullContentSufficiency: "pass";
+  treatmentFullContentSufficiency: "pass";
+  truncated: false;
+  refused: false;
+  confirmedAt: string;
+}
+
+export interface OutputShapingCalibrationRecord extends OutputShapingCalibrationQuery {
+  evidenceCount: number;
+  /** Σ(mean control tokens × total turns in that confirmation). */
+  weightedControlOutputTokens: number;
+  /** Σ(mean treatment tokens × total turns in that confirmation). */
+  weightedTreatmentOutputTokens: number;
+  /** Σ(nControl+nTreatment), the shared weight applied to both arm means. */
+  totalWeight: number;
+  nControl: number;
+  nTreatment: number;
+  confirmationIds: string[];
   updatedAt: string;
 }
 
-/** A fresh, empty aggregate (rate is `unavailable` until the first real A/B is folded in). */
-export function emptyCalibration(now: () => string = () => new Date().toISOString()): OutputShapingCalibration {
-  return {
-    schema: OUTPUT_SHAPING_CALIBRATION_SCHEMA,
-    sampleCount: 0,
-    totalControlOutputTokens: 0,
-    totalTreatmentOutputTokens: 0,
-    totalTurns: 0,
-    experimentIds: [],
-    updatedAt: now()
-  };
+export interface OutputShapingCalibration {
+  schema: typeof OUTPUT_SHAPING_CALIBRATION_SCHEMA;
+  records: OutputShapingCalibrationRecord[];
+  updatedAt: string;
 }
 
-/**
- * The current calibrated reduction rate derived from the aggregate, with the confidence the reader needs.
- *  - `calibrated: false` (⇒ the per-turn line degrades to a plain `output N` — no arrow, no fabricated
- *    before) whenever there is no folded sample yet, the totals are non-positive, or the derived rate is not
- *    a usable fraction in (0,1). Since v2 folds in non-favourable experiments too, this is also the state
- *    reached when the accumulated evidence says shaping does NOT reduce output — which is the point.
- *  - `calibrated: true` carries a `rate` in (0,1) AND the `sampleCount` behind it, so a downstream reader
- *    can still treat a 1-sample rate cautiously.
- */
-export interface CalibratedRate {
-  calibrated: boolean;
-  /** The sample-weighted reduction fraction (control − treatment)/control, in (0,1), when calibrated. */
-  rate?: number;
-  /**
-   * Whether the rate is this device's OWN measurement or the shipped default prior. Present whenever
-   * `calibrated` is true. `sampleCount` alone would imply it (0 ⇒ prior), but a surface explaining
-   * itself should not have to infer provenance from a count.
-   */
-  basis?: CalibrationBasis;
-  /** How many distinct A/B experiments back the rate. ZERO when the rate is the default prior. */
-  sampleCount: number;
-  /** Cumulative provider-reported turns behind the rate (the confidence denominator). */
-  totalTurns: number;
-}
-
-/**
- * The STARTING rate, used until this device has measured its own.
- *
- * WHY A PRIOR AT ALL. The per-turn line reconstructs the unshaped `before` from a rate — the unshaped
- * turn was never generated, so there is nothing to measure directly. With no rate the output clause
- * degrades to a bare `output 286`, which is what EVERY install showed, because the only producer of a
- * rate was a manual `compaction savings` A/B that approximately nobody runs before seeing the product.
- * The designed line was therefore unreachable on a fresh machine.
- *
- * WHERE THE NUMBER COMES FROM. Two recorded CODING-TASK A/Bs — the family
- * that matches how these tools are actually used — both provider-reported and both gated by the
- * codified sufficiency eval:
- *   · `exp-cc-output-004` (Claude Code, coding): 107.7 → 50.3 output tokens, ≈53.3%, ±2·SE [19.5, 95.2]
- *   · `exp-cc-output-006` (Codex, coding):       ≈47.5%, sufficient 3/3 both arms
- * They agree closely across two providers. This takes the LOWER of the two and rounds down, so the
- * shipped default sits at or below both measurements rather than between them.
- *
- * WHAT IT IS NOT. Not a claim that any given turn saved 47%. The clause it feeds is labelled `est` and
- * renders a reconstruction, never a measurement. The matrix's binding position — "magnitude is
- * strongly model- AND prompt-dependent", "no single Claude Code output number" — is exactly why this is
- * a conservative floor from the nearest task family rather than the headline 88.6%, and exactly why a
- * device's own measurement REPLACES it outright on the first fold rather than being averaged with it.
- */
+/** Kept only for internal heuristics. It is never persisted, resolved, or rendered as calibration. */
 export const DEFAULT_OUTPUT_SHAPING_RATE = 0.47;
 
-/**
- * Where a rate came from. Surfaces that explain themselves need to distinguish "our measurement, not
- * yours" from "yours" — the two deserve different words even though the clause renders identically.
- */
 export type CalibrationBasis = "default-prior" | "measured";
+export type CalibrationState = "unseeded" | "calibrating" | "calibrated" | "measured-no-effect";
 
-/**
- * Derive the current rate from an aggregate. Pure.
- *
- * With NO folded experiment this returns the shipped default prior (`basis: "default-prior"`), so the
- * per-turn line shows a reduction from the first turn on a fresh install. With at least one folded
- * experiment the device's OWN measurement is used and the prior is discarded entirely — not blended,
- * not averaged. One real A/B on your traffic beats a general figure from ours, and every further
- * experiment tightens it through the turn-weighted accumulation in `foldAbSummary`.
- *
- * The honesty guard is unchanged and still applies to measured data: totals that imply a rate outside
- * (0,1) yield `calibrated: false`, and the line falls back to a bare count. That case does NOT fall
- * back to the prior — a device that measured "shaping does not help here" must not have that answer
- * overwritten by our default.
- */
-export function calibratedRate(cal: OutputShapingCalibration): CalibratedRate {
-  const base = { sampleCount: cal.sampleCount, totalTurns: cal.totalTurns };
-  if (cal.sampleCount < 1) {
-    return { calibrated: true, rate: DEFAULT_OUTPUT_SHAPING_RATE, basis: "default-prior", ...base };
-  }
-  if (cal.totalControlOutputTokens <= 0) return { calibrated: false, ...base };
-  const rate = (cal.totalControlOutputTokens - cal.totalTreatmentOutputTokens) / cal.totalControlOutputTokens;
-  if (!Number.isFinite(rate) || rate <= 0 || rate >= 1) return { calibrated: false, ...base };
-  return { calibrated: true, rate, basis: "measured", ...base };
+export interface ApplicableOutputCalibration extends OutputShapingCalibrationQuery {
+  rate: number;
+  evidenceCount: number;
+  nControl: number;
+  nTreatment: number;
+  meanControlOutputTokens: number;
+  meanTreatmentOutputTokens: number;
 }
 
-/**
- * Fold a MEASURED A/B summary into the aggregate, returning the NEW aggregate (pure; does no IO).
- *
- * WHAT QUALIFIES: a complete, provider-reported before/after pair with at least one turn in each arm. The
- * DIRECTION of the result is NOT a condition — a null or negative experiment is evidence too, and
- * excluding it is the survivorship bias described on `OUTPUT_SHAPING_CALIBRATION_SCHEMA`. The honesty
- * guard sits DOWNSTREAM in `calibratedRate`, which refuses any derived rate outside (0,1): if the
- * accumulated evidence says shaping does not reduce output, the store reports UNCALIBRATED rather than
- * quietly dropping the evidence that would have said so.
- *
- * WEIGHTING: both arms of one experiment carry the SAME weight (its total provider-reported turns), so a
- * larger experiment pulls the estimate more. Weighting each arm by its own N does not yield a reduction
- * fraction at all when the arms differ in size — the v1 defect described on the schema constant.
- *
- * What the aggregate IS, precisely (an earlier draft of this comment got it wrong): a POOLED TOKEN RATIO,
- * not a mean of per-experiment reduction fractions. With shared weight `wᵢ = nCᵢ + nTᵢ`,
- * `rate = Σwᵢcᵢ(1 − tᵢ/cᵢ) / Σwᵢcᵢ` — a weighted mean of the fractions `rᵢ` whose effective weights are
- * `wᵢ·cᵢ`, i.e. turns TIMES control magnitude. That is the right estimator for what the rate is used for,
- * reconstructing a plausible `before` from a real `after`: a turn that produced more tokens should count
- * for more when estimating tokens. It is a ratio of sums, not a mean of ratios, and the two differ — for
- * r₁=0.40 (1000→600) and r₂=0.10 (100→90) at one turn per arm it yields 0.373, where a turn-weighted mean
- * of the fractions would yield 0.250.
- *
- * The shared weight cancels within a single experiment; `wᵢ` only sets relative weight ACROSS experiments.
- * The aggregate can never exceed the best per-experiment reduction (`rate ≤ maxᵢ rᵢ`) — a convex
- * combination with non-negative weights, pinned by a fuzzed test.
- *
- * Re-adding an experiment whose id is already folded in is a NO-OP (idempotent by id; the first fold wins),
- * so re-running `compaction savings` on the same artifact does not double-count it.
- */
-export function foldAbSummary(
-  cal: OutputShapingCalibration,
-  summary: OutputShapingAbSummary,
-  now: () => string = () => new Date().toISOString()
-): OutputShapingCalibration {
-  const before = summary.outputTokensBefore;
-  const after = summary.outputTokensAfter;
-  const nControl = summary.nControl;
-  const nTreatment = summary.nTreatment;
-  // A complete, provider-reported pair with both arms populated. NOT conditioned on the sign of the result:
-  // a non-favourable A/B is real evidence and must be able to move (or fail to move) the rate.
+export function emptyCalibration(now: () => string = () => new Date().toISOString()): OutputShapingCalibration {
+  return { schema: OUTPUT_SHAPING_CALIBRATION_SCHEMA, records: [], updatedAt: now() };
+}
+
+function safeMetadata(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 160 &&
+    !value.startsWith("/") &&
+    !value.includes("\\") &&
+    !value.includes("..") &&
+    !value.startsWith("file:") &&
+    /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(value)
+  );
+}
+
+function safePolicyVersion(value: unknown): value is string {
+  return typeof value === "string" && /^output-shaping\.v1\.sha256\.[a-f0-9]{64}$/.test(value);
+}
+
+function knownModel(value: unknown): value is string {
+  return safeMetadata(value) && !/(^unknown$|-unknown-model$)/i.test(value);
+}
+
+function positiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function nonNegativeFinite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+function validRegime(value: unknown): value is OutputShapingCalibrationRegime | undefined {
+  return value === undefined || value === "default-shapeable";
+}
+
+/** Normalize fixed receipt/adapter metadata into an exact query; unknowns fail closed. */
+export function outputCalibrationQuery(input: {
+  policyVersion?: unknown;
+  provider?: unknown;
+  model?: unknown;
+  regime?: unknown;
+}): OutputShapingCalibrationQuery | undefined {
   if (
-    before === null ||
-    after === null ||
-    !Number.isFinite(before) ||
-    !Number.isFinite(after) ||
-    before < 0 ||
-    after < 0 ||
-    nControl < 1 ||
-    nTreatment < 1
+    !safePolicyVersion(input.policyVersion) ||
+    !safeMetadata(input.provider) ||
+    !knownModel(input.model) ||
+    !validRegime(input.regime)
   ) {
-    return cal;
+    return undefined;
   }
-
-  // If this experiment id was already folded in, its prior contribution must be removed before re-adding, so
-  // the aggregate is idempotent by id. Prior per-experiment contributions are not retained individually, so
-  // the honest, simple idempotency is: a re-add of an already-present id is a NO-OP (the first fold wins).
-  // This keeps the store append-only-safe without retaining per-experiment content.
-  if (cal.experimentIds.includes(summary.experimentId)) return cal;
-
-  // ONE weight for BOTH arms: `before` and `after` are per-arm MEANS, already normalised for their own arm
-  // sizes, so the only thing left to express is how much this experiment counts relative to others —
-  // its total turns. Per-arm weights here would make the ratio something other than a reduction fraction.
-  const experimentWeight = nControl + nTreatment;
-  const controlContribution = before * experimentWeight;
-  const treatmentContribution = after * experimentWeight;
-
   return {
-    schema: OUTPUT_SHAPING_CALIBRATION_SCHEMA,
-    sampleCount: cal.sampleCount + 1,
-    totalControlOutputTokens: cal.totalControlOutputTokens + controlContribution,
-    totalTreatmentOutputTokens: cal.totalTreatmentOutputTokens + treatmentContribution,
-    totalTurns: cal.totalTurns + nControl + nTreatment,
-    experimentIds: [...cal.experimentIds, summary.experimentId],
-    updatedAt: now()
+    policyVersion: input.policyVersion,
+    provider: input.provider,
+    model: input.model,
+    ...(input.regime !== undefined ? { regime: input.regime } : {})
   };
 }
 
+/** Dedupe identity over fixed applicability metadata and aggregate numeric evidence only. */
+export function outputCalibrationConfirmationId(input: Omit<
+  OutputShapingCalibrationConfirmation,
+  "schema" | "confirmation" | "confirmationId" | "providerReported" | "evalOrder" |
+  "controlFullContentSufficiency" | "treatmentFullContentSufficiency" | "truncated" | "refused" | "confirmedAt"
+>): string {
+  const fixed = [
+    input.policyVersion,
+    input.provider,
+    input.model,
+    input.regime ?? null,
+    input.nControl,
+    input.nTreatment,
+    input.totalControlOutputTokens,
+    input.totalTreatmentOutputTokens,
+    input.intervalLow,
+    input.intervalHigh
+  ];
+  return createHash("sha256").update(JSON.stringify(fixed), "utf8").digest("hex");
+}
+
+/** Validate the engine-to-public handoff. Invalid/weak artifacts are absent, never partially trusted. */
+export function validateOutputCalibrationConfirmation(
+  value: unknown
+): OutputShapingCalibrationConfirmation | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const v = value as Partial<OutputShapingCalibrationConfirmation>;
+  if (
+    v.schema !== OUTPUT_SHAPING_CALIBRATION_CONFIRMATION_SCHEMA ||
+    v.confirmation !== "engine-confirmed" ||
+    v.providerReported !== true ||
+    !safePolicyVersion(v.policyVersion) ||
+    !safeMetadata(v.provider) ||
+    !knownModel(v.model) ||
+    !validRegime(v.regime) ||
+    !positiveInteger(v.nControl) ||
+    !positiveInteger(v.nTreatment) ||
+    v.nControl < 3 ||
+    v.nTreatment < 3 ||
+    !nonNegativeFinite(v.totalControlOutputTokens) ||
+    !nonNegativeFinite(v.totalTreatmentOutputTokens) ||
+    v.totalControlOutputTokens / v.nControl <= v.totalTreatmentOutputTokens / v.nTreatment ||
+    typeof v.intervalLow !== "number" ||
+    !Number.isFinite(v.intervalLow) ||
+    v.intervalLow <= 0 ||
+    typeof v.intervalHigh !== "number" ||
+    !Number.isFinite(v.intervalHigh) ||
+    v.intervalHigh < v.intervalLow ||
+    v.evalOrder !== "control-first" ||
+    v.controlFullContentSufficiency !== "pass" ||
+    v.treatmentFullContentSufficiency !== "pass" ||
+    v.truncated !== false ||
+    v.refused !== false ||
+    typeof v.confirmedAt !== "string" ||
+    Number.isNaN(Date.parse(v.confirmedAt)) ||
+    typeof v.confirmationId !== "string" ||
+    !/^[a-f0-9]{64}$/.test(v.confirmationId)
+  ) {
+    return undefined;
+  }
+  const expectedId = outputCalibrationConfirmationId({
+    policyVersion: v.policyVersion,
+    provider: v.provider,
+    model: v.model,
+    ...(v.regime !== undefined ? { regime: v.regime } : {}),
+    nControl: v.nControl,
+    nTreatment: v.nTreatment,
+    totalControlOutputTokens: v.totalControlOutputTokens,
+    totalTreatmentOutputTokens: v.totalTreatmentOutputTokens,
+    intervalLow: v.intervalLow,
+    intervalHigh: v.intervalHigh
+  });
+  if (v.confirmationId !== expectedId) return undefined;
+  // This validator is also a privacy boundary. Returning `v` would retain every unchecked property
+  // supplied by the operator handoff and let raw prompt/output/path fields ride into the generated
+  // package registry. Project a fresh closed artifact so validation and serialization share one shape.
+  return {
+    schema: OUTPUT_SHAPING_CALIBRATION_CONFIRMATION_SCHEMA,
+    confirmation: "engine-confirmed",
+    confirmationId: v.confirmationId,
+    providerReported: true,
+    policyVersion: v.policyVersion,
+    provider: v.provider,
+    model: v.model,
+    ...(v.regime !== undefined ? { regime: v.regime } : {}),
+    nControl: v.nControl,
+    nTreatment: v.nTreatment,
+    totalControlOutputTokens: v.totalControlOutputTokens,
+    totalTreatmentOutputTokens: v.totalTreatmentOutputTokens,
+    intervalLow: v.intervalLow,
+    intervalHigh: v.intervalHigh,
+    evalOrder: "control-first",
+    controlFullContentSufficiency: "pass",
+    treatmentFullContentSufficiency: "pass",
+    truncated: false,
+    refused: false,
+    confirmedAt: v.confirmedAt
+  };
+}
+
+function sameKey(a: OutputShapingCalibrationQuery, b: OutputShapingCalibrationQuery): boolean {
+  return (
+    a.policyVersion === b.policyVersion &&
+    a.provider === b.provider &&
+    a.model === b.model &&
+    a.regime === b.regime
+  );
+}
+
+/** Fold one confirmed artifact into its exact cohort. Invalid or duplicate evidence is a no-op. */
+export function foldCalibrationConfirmation(
+  calibration: OutputShapingCalibration,
+  value: unknown,
+  now: () => string = () => new Date().toISOString()
+): OutputShapingCalibration {
+  const safeRecords = calibration.records
+    .map(projectCalibrationRecord)
+    .filter((record): record is OutputShapingCalibrationRecord => record !== undefined);
+  const safeCalibration: OutputShapingCalibration = {
+    schema: OUTPUT_SHAPING_CALIBRATION_SCHEMA,
+    records: safeRecords,
+    updatedAt:
+      typeof calibration.updatedAt === "string" && !Number.isNaN(Date.parse(calibration.updatedAt))
+        ? calibration.updatedAt
+        : now()
+  };
+  const confirmation = validateOutputCalibrationConfirmation(value);
+  if (!confirmation) return safeCalibration;
+  if (safeRecords.some((record) => record.confirmationIds.includes(confirmation.confirmationId))) {
+    return safeCalibration;
+  }
+  const index = safeRecords.findIndex((record) => sameKey(record, confirmation));
+  const updatedAt = now();
+  const sharedWeight = confirmation.nControl + confirmation.nTreatment;
+  const contribution: OutputShapingCalibrationRecord = {
+    policyVersion: confirmation.policyVersion,
+    provider: confirmation.provider,
+    model: confirmation.model,
+    ...(confirmation.regime !== undefined ? { regime: confirmation.regime } : {}),
+    evidenceCount: 1,
+    weightedControlOutputTokens:
+      (confirmation.totalControlOutputTokens / confirmation.nControl) * sharedWeight,
+    weightedTreatmentOutputTokens:
+      (confirmation.totalTreatmentOutputTokens / confirmation.nTreatment) * sharedWeight,
+    totalWeight: sharedWeight,
+    nControl: confirmation.nControl,
+    nTreatment: confirmation.nTreatment,
+    confirmationIds: [confirmation.confirmationId],
+    updatedAt
+  };
+  const records = [...safeRecords];
+  if (index < 0) {
+    records.push(contribution);
+  } else {
+    const current = records[index];
+    records[index] = {
+      ...current,
+      evidenceCount: current.evidenceCount + 1,
+      weightedControlOutputTokens:
+        current.weightedControlOutputTokens + contribution.weightedControlOutputTokens,
+      weightedTreatmentOutputTokens:
+        current.weightedTreatmentOutputTokens + contribution.weightedTreatmentOutputTokens,
+      totalWeight: current.totalWeight + contribution.totalWeight,
+      nControl: current.nControl + contribution.nControl,
+      nTreatment: current.nTreatment + contribution.nTreatment,
+      confirmationIds: [...current.confirmationIds, confirmation.confirmationId],
+      updatedAt
+    };
+  }
+  return { schema: OUTPUT_SHAPING_CALIBRATION_SCHEMA, records, updatedAt };
+}
+
 /**
- * The conventional local calibration artifact path (`<config-dir>/shaping-calibration.json`), with
- * `COMPACTION_CONFIG_DIR` overriding `~/.compaction` so tests and sandboxes point elsewhere. This function
- * is the SINGLE definition of that path — every reader and writer goes through it.
+ * Add exact-key local records to package-shipped evidence without changing applicability semantics.
+ * Confirmation ids deduplicate the same evidence; shared weights preserve the per-confirmation arm
+ * normalization used by `foldCalibrationConfirmation`.
  */
+export function mergeOutputCalibrations(
+  base: OutputShapingCalibration,
+  addition: OutputShapingCalibration,
+  now: () => string = () => new Date().toISOString()
+): OutputShapingCalibration {
+  let changed = false;
+  const records = base.records
+    .map(projectCalibrationRecord)
+    .filter((record): record is OutputShapingCalibrationRecord => record !== undefined);
+  for (const rawIncoming of addition.records) {
+    const incoming = projectCalibrationRecord(rawIncoming);
+    if (!incoming) continue;
+    const unseenIds = incoming.confirmationIds.filter(
+      (id) => !records.some((record) => record.confirmationIds.includes(id))
+    );
+    if (unseenIds.length === 0) continue;
+    // A persisted record is an aggregate, so partial overlap cannot be separated safely. Fail closed
+    // rather than double-counting some unknown fraction of it.
+    if (unseenIds.length !== incoming.confirmationIds.length) continue;
+    const index = records.findIndex((record) => sameKey(record, incoming));
+    if (index < 0) {
+      records.push(incoming);
+    } else {
+      const current = records[index];
+      records[index] = {
+        ...current,
+        evidenceCount: current.evidenceCount + incoming.evidenceCount,
+        weightedControlOutputTokens:
+          current.weightedControlOutputTokens + incoming.weightedControlOutputTokens,
+        weightedTreatmentOutputTokens:
+          current.weightedTreatmentOutputTokens + incoming.weightedTreatmentOutputTokens,
+        totalWeight: current.totalWeight + incoming.totalWeight,
+        nControl: current.nControl + incoming.nControl,
+        nTreatment: current.nTreatment + incoming.nTreatment,
+        confirmationIds: [...current.confirmationIds, ...incoming.confirmationIds],
+        updatedAt: incoming.updatedAt
+      };
+    }
+    changed = true;
+  }
+  // Return the closed projection even when no evidence was added. Both operands may originate in
+  // parsed or injected data, and a no-op merge must not preserve arbitrary top-level/record fields.
+  return {
+    schema: OUTPUT_SHAPING_CALIBRATION_SCHEMA,
+    records,
+    updatedAt: changed
+      ? now()
+      : typeof base.updatedAt === "string" && !Number.isNaN(Date.parse(base.updatedAt))
+        ? base.updatedAt
+        : now()
+  };
+}
+
+/** Resolve only an exact policy/provider/model/regime key. There is deliberately no fallback ladder. */
+export function bestApplicableOutputCalibration(
+  calibration: OutputShapingCalibration,
+  query: OutputShapingCalibrationQuery
+): ApplicableOutputCalibration | undefined {
+  if (!outputCalibrationQuery(query)) return undefined;
+  const record = calibration.records.find((candidate) => sameKey(candidate, query));
+  if (!record || record.weightedControlOutputTokens <= 0 || record.totalWeight <= 0) return undefined;
+  const rate = (record.weightedControlOutputTokens - record.weightedTreatmentOutputTokens) /
+    record.weightedControlOutputTokens;
+  if (!Number.isFinite(rate) || rate <= 0 || rate >= 1) return undefined;
+  return {
+    policyVersion: record.policyVersion,
+    provider: record.provider,
+    model: record.model,
+    ...(record.regime !== undefined ? { regime: record.regime } : {}),
+    rate,
+    evidenceCount: record.evidenceCount,
+    nControl: record.nControl,
+    nTreatment: record.nTreatment,
+    meanControlOutputTokens: record.weightedControlOutputTokens / record.totalWeight,
+    meanTreatmentOutputTokens: record.weightedTreatmentOutputTokens / record.totalWeight
+  };
+}
+
 export function calibrationStorePath(env: NodeJS.ProcessEnv = process.env): string {
   return join(compactionConfigDir(env), "shaping-calibration.json");
 }
 
-/**
- * Load the calibration aggregate from disk, or a fresh empty aggregate when the file is absent/unreadable/
- * malformed or is not the calibration schema. Total and fail-open: never throws.
- */
+function projectCalibrationRecord(value: unknown): OutputShapingCalibrationRecord | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const v = value as Partial<OutputShapingCalibrationRecord>;
+  if (!(
+    safePolicyVersion(v.policyVersion) &&
+    safeMetadata(v.provider) &&
+    knownModel(v.model) &&
+    validRegime(v.regime) &&
+    positiveInteger(v.evidenceCount) &&
+    positiveInteger(v.nControl) &&
+    positiveInteger(v.nTreatment) &&
+    nonNegativeFinite(v.weightedControlOutputTokens) &&
+    nonNegativeFinite(v.weightedTreatmentOutputTokens) &&
+    v.weightedControlOutputTokens > v.weightedTreatmentOutputTokens &&
+    positiveInteger(v.totalWeight) &&
+    Array.isArray(v.confirmationIds) &&
+    v.confirmationIds.length === v.evidenceCount &&
+    v.confirmationIds.every((id) => typeof id === "string" && /^[a-f0-9]{64}$/.test(id)) &&
+    typeof v.updatedAt === "string" &&
+    !Number.isNaN(Date.parse(v.updatedAt))
+  )) return undefined;
+  // Local JSON is another untrusted persistence boundary. Keep the same closed-record guarantee as
+  // confirmations so unknown fields cannot be retained by load → merge → save structural spreads.
+  return {
+    policyVersion: v.policyVersion,
+    provider: v.provider,
+    model: v.model,
+    ...(v.regime !== undefined ? { regime: v.regime } : {}),
+    evidenceCount: v.evidenceCount,
+    weightedControlOutputTokens: v.weightedControlOutputTokens,
+    weightedTreatmentOutputTokens: v.weightedTreatmentOutputTokens,
+    totalWeight: v.totalWeight,
+    nControl: v.nControl,
+    nTreatment: v.nTreatment,
+    confirmationIds: [...v.confirmationIds],
+    updatedAt: v.updatedAt
+  };
+}
+
+/** v2 and malformed files are treated as absent; calibration is regenerable and never migrated/blended. */
 export async function loadCalibration(
   env: NodeJS.ProcessEnv = process.env,
-  readFileImpl: (p: string) => Promise<string> = (p) => readFile(p, "utf8")
+  readFileImpl: (path: string) => Promise<string> = (path) => readFile(path, "utf8")
 ): Promise<OutputShapingCalibration> {
   try {
-    const raw = await readFileImpl(calibrationStorePath(env));
-    const parsed = JSON.parse(raw) as Partial<OutputShapingCalibration>;
-    if (parsed?.schema !== OUTPUT_SHAPING_CALIBRATION_SCHEMA) return emptyCalibration();
+    const parsed = JSON.parse(await readFileImpl(calibrationStorePath(env))) as Partial<OutputShapingCalibration>;
+    if (parsed.schema !== OUTPUT_SHAPING_CALIBRATION_SCHEMA || !Array.isArray(parsed.records)) {
+      return emptyCalibration();
+    }
+    const records = parsed.records.map(projectCalibrationRecord);
+    if (records.some((record) => record === undefined)) return emptyCalibration();
     return {
       schema: OUTPUT_SHAPING_CALIBRATION_SCHEMA,
-      sampleCount: numberOr(parsed.sampleCount, 0),
-      totalControlOutputTokens: numberOr(parsed.totalControlOutputTokens, 0),
-      totalTreatmentOutputTokens: numberOr(parsed.totalTreatmentOutputTokens, 0),
-      totalTurns: numberOr(parsed.totalTurns, 0),
-      experimentIds: Array.isArray(parsed.experimentIds) ? parsed.experimentIds.filter((s): s is string => typeof s === "string") : [],
-      updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date().toISOString()
+      records: records as OutputShapingCalibrationRecord[],
+      updatedAt:
+        typeof parsed.updatedAt === "string" && !Number.isNaN(Date.parse(parsed.updatedAt))
+          ? parsed.updatedAt
+          : new Date().toISOString()
     };
   } catch {
     return emptyCalibration();
   }
 }
 
-function numberOr(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-/** Persist the calibration aggregate to the conventional path (creating the dir). Content-free by shape. */
-export async function saveCalibration(cal: OutputShapingCalibration, env: NodeJS.ProcessEnv = process.env): Promise<string> {
+export async function saveCalibration(
+  calibration: OutputShapingCalibration,
+  env: NodeJS.ProcessEnv = process.env
+): Promise<string> {
   const path = calibrationStorePath(env);
+  const records = calibration.records
+    .map(projectCalibrationRecord)
+    .filter((record): record is OutputShapingCalibrationRecord => record !== undefined);
+  const closed: OutputShapingCalibration = {
+    schema: OUTPUT_SHAPING_CALIBRATION_SCHEMA,
+    records,
+    updatedAt:
+      typeof calibration.updatedAt === "string" && !Number.isNaN(Date.parse(calibration.updatedAt))
+        ? calibration.updatedAt
+        : new Date().toISOString()
+  };
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, `${JSON.stringify(cal, null, 2)}\n`, "utf8");
+  await writeFile(path, `${JSON.stringify(closed, null, 2)}\n`, "utf8");
   return path;
 }
 
-/**
- * The `compaction savings` learning hook: load the aggregate, fold in a completed A/B summary, and persist
- * the updated aggregate — so running more experiments TIGHTENS the calibrated rate. Returns the new
- * aggregate and whether this fold actually changed it (a non-measured or already-folded A/B is a no-op).
- * Fail-open on IO is the caller's concern; this resolves normally.
- */
-export async function updateCalibrationFromAbSummary(
-  summary: OutputShapingAbSummary,
+export async function updateCalibrationFromConfirmation(
+  confirmation: unknown,
   env: NodeJS.ProcessEnv = process.env,
   now: () => string = () => new Date().toISOString()
 ): Promise<{ calibration: OutputShapingCalibration; updated: boolean }> {
   const current = await loadCalibration(env);
-  const next = foldAbSummary(current, summary, now);
-  const updated = next !== current;
+  const validated = validateOutputCalibrationConfirmation(confirmation);
+  if (!validated) return { calibration: current, updated: false };
+  if (current.records.some((record) => record.confirmationIds.includes(validated.confirmationId))) {
+    return { calibration: current, updated: false };
+  }
+  const next = foldCalibrationConfirmation(current, validated, now);
+  const updated = true;
   if (updated) await saveCalibration(next, env);
   return { calibration: next, updated };
 }
