@@ -111,6 +111,7 @@ const FORBIDDEN_MODULE_PATTERNS = [
   /context-store-sufficiency\./,
   /(^|\/)apply-policy\./,
   /(^|\/)apply-composition\./,
+  /(^|\/)lcm-qualified-classes\./,
   // Operator-only measurement tooling: never registered on the public CLI, never shipped.
   /billing-delta/,
   /eval-harness\./,
@@ -151,6 +152,10 @@ const FORBIDDEN_MODULE_PATTERNS = [
 // Paths that MUST appear in the published tarball.
 const REQUIRE_FILES = [
   "dist/cli/index.js",
+  "dist/cli/commands/update.js",
+  "dist/core/update/bootstrap.js",
+  "dist/core/update/scheduler.js",
+  "dist/core/update/worker.js",
   "README.md",
   "LICENSE",
   "package.json"
@@ -267,6 +272,11 @@ log("3/4 run", "compaction --help (outside repo cwd)");
 const help = run(binPath, ["--help"], { cwd: outsideCwd });
 if (!/usage|compaction|command/i.test(help)) {
   fail(`--help output did not look like usage text:\n${help}`);
+}
+if (!/\bupdate\b/.test(help)) fail("Installed top-level help did not list update.");
+const updateHelp = run(binPath, ["update", "--help"], { cwd: outsideCwd });
+if (!["--check", "--channel", "--rollback", "--auto"].every(flag => updateHelp.includes(flag))) {
+  fail("Installed update help is missing required delivery options.");
 }
 process.stdout.write(`[smoke] compaction --help exit code: 0\n`);
 

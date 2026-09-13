@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0.0",
-  "updated": "2026-07-01",
-  "description": "Navigation registry for Compaction evals. Implementation remains under src/ and tests/.",
+  "updated": "2026-09-05",
+  "description": "Public registry for synthetic eval fixtures and content-free A/B harnesses. Engine-backed validation is delivered separately.",
   "eval_gates": {
     "context_preservation": {
       "question": "Was compacted input context recoverable and task-safe per deterministic checks?",
@@ -14,87 +14,31 @@
   },
   "evals": [
     {
-      "id": "deterministic-recoverability",
-      "name": "Deterministic recoverability eval",
+      "id": "recoverability-fixtures",
+      "name": "Synthetic recoverability fixtures",
       "proves": [
-        "byte_hash_source_pointer_recoverability"
+        "public_fixture_cases_and_expected_labels"
       ],
       "does_not_prove": [
+        "engine_evaluator_execution",
         "semantic_preservation",
-        "commitment_meaning_preservation",
         "billing_confirmed_savings",
-        "output_token_reduction"
-      ],
-      "implementation": [
-        "hybrid-engine (delivered separately)"
-      ],
-      "cli_commands": [
-        "compact --eval",
-        "eval"
-      ],
-      "tests": [
-        "tests/core/eval-harness.test.ts",
-        "tests/core/eval-cli.test.ts",
-        "tests/cli/compact-eval-one-command-cli.test.ts",
-        "tests/core/strong-eval-integration.test.ts"
+        "token_reduction"
       ],
       "fixtures": [
         "tests/fixtures/eval/"
       ],
-      "status": "shipped"
+      "status": "fixtures_shipped_evaluator_delivered_separately"
     },
     {
-      "id": "commitment-recoverability-check",
-      "name": "Commitment recoverability check (strong eval)",
-      "proves": [
-        "extracted_commitments_retained_or_recoverable"
-      ],
-      "does_not_prove": [
-        "semantic_commitment_preservation"
-      ],
-      "implementation": [
-        "hybrid-engine (delivered separately)"
-      ],
-      "cli_commands": [
-        "compact --eval"
-      ],
-      "tests": [
-        "tests/core/commitment-preservation.test.ts",
-        "tests/core/strong-eval-integration.test.ts"
-      ],
-      "status": "shipped"
-    },
-    {
-      "id": "fixture-task-check",
-      "name": "Fixture-based task-check (strong eval)",
-      "proves": [
-        "task_anchors_recoverable_supported_workflows"
-      ],
-      "does_not_prove": [
-        "model_replay",
-        "real_agent_reexecution"
-      ],
-      "implementation": [
-        "hybrid-engine (delivered separately)"
-      ],
-      "cli_commands": [
-        "compact --eval"
-      ],
-      "tests": [
-        "tests/core/strong-eval-integration.test.ts"
-      ],
-      "status": "shipped_fixture_scoped"
-    },
-    {
-      "id": "input-compaction-gate",
-      "name": "Input compaction A/B + context-preservation gate",
+      "id": "input-compaction-ab-harness",
+      "name": "Input-compaction A/B harness",
       "eval_gate": "context_preservation",
       "proves": [
-        "provider_reported_input_ab_n3_se",
-        "context_preservation_eval_pass"
+        "provider_reported_input_ab_n3_se"
       ],
       "does_not_prove": [
-        "output_sufficiency",
+        "context_preservation_without_separate_validation",
         "cross_provider_generalization",
         "billing_confirmed_savings"
       ],
@@ -107,22 +51,19 @@
         "input-compaction-ab status"
       ],
       "tests": [
-        "tests/core/input-compaction-ab.test.ts",
-        "tests/core/input-compaction-verification.test.ts",
-        "tests/core/superseded-same-source-read.test.ts"
+        "tests/core/input-compaction-ab.test.ts"
       ],
-      "status": "shipped"
+      "status": "public_harness_shipped_engine_validation_separate"
     },
     {
-      "id": "output-sufficiency-gate",
-      "name": "Output shaping A/B + short-but-sufficient gate",
+      "id": "output-shaping-ab-harness",
+      "name": "Output-shaping A/B harness",
       "eval_gate": "short_but_sufficient",
       "proves": [
-        "provider_reported_output_ab_n3_se",
-        "output_sufficiency_eval_pass"
+        "provider_reported_output_ab_n3_se"
       ],
       "does_not_prove": [
-        "input_context_preservation",
+        "output_sufficiency_without_separate_validation",
         "single_headline_percent_all_models"
       ],
       "implementation": [
@@ -139,52 +80,21 @@
         "capture cursor --output-shaping"
       ],
       "tests": [
-        "tests/engine/output-sufficiency-eval.test.ts",
-        "tests/core/output-shaping-verification.test.ts",
         "tests/core/output-shaping-ab.test.ts",
         "tests/core/output-shaping.test.ts",
         "tests/core/output-shaping-attach.test.ts"
       ],
-      "status": "shipped"
+      "status": "public_harness_shipped_sufficiency_validation_separate"
     },
     {
-      "id": "context-store-eval",
-      "name": "Context store retrieval eval (V0.4 internal)",
+      "id": "claims-guards",
+      "name": "Public evidence-label guards",
       "proves": [
-        "recall_source_coverage_continuation_fixtures"
-      ],
-      "does_not_prove": [
-        "public_sufficiency_verdict",
-        "large_memory_corpus_claim"
-      ],
-      "implementation": [
-        "src/core/context-store-eval.ts",
-        "src/core/context-store-eval-cases.ts",
-        "src/core/context-store-sufficiency.ts"
-      ],
-      "cli_commands": [
-        "context add",
-        "context get"
+        "public_copy_within_available_evidence"
       ],
       "tests": [
-        "tests/core/context-store-eval.test.ts",
-        "tests/core/context-store-eval-edge.test.ts",
-        "tests/core/context-store-eval-richer.test.ts",
-        "tests/core/context-store-sufficiency.test.ts"
-      ],
-      "status": "shipped_internal"
-    },
-    {
-      "id": "overclaim-guard",
-      "name": "First-value overclaim regression guard",
-      "proves": [
-        "cli_copy_within_evidence_ladder"
-      ],
-      "implementation": [
-        "hybrid-engine (delivered separately)"
-      ],
-      "tests": [
-        "tests/security/no-overclaim-first-value.test.ts"
+        "tests/security/open-basic-engine-free.test.ts",
+        "tests/cli/watch-tier-label-provenance.test.ts"
       ],
       "docs": [
         "README.md"
@@ -194,28 +104,27 @@
   ],
   "gaps": [
     {
-      "id": "cc-input-real-session-n3",
-      "description": "Claude Code provider-reported input A/B on >=3 independent non-sensitive real sessions",
-      "blocked_by": "non_sensitive_real_session_data"
+      "id": "input-evidence-breadth",
+      "description": "Broader provider, model, and task coverage for input A/B evidence"
     },
     {
-      "id": "output-distribution-breadth",
-      "description": "More prompt families and second model for generalizable output reduction distribution"
+      "id": "output-evidence-breadth",
+      "description": "Broader provider, model, and prompt coverage for output A/B evidence"
     },
     {
-      "id": "cursor-provider-usage",
-      "description": "Provider-reported token fields from Cursor",
-      "blocked_by": "vendor_usage_api"
+      "id": "cursor-provider-usage-read-path",
+      "description": "Provider-reported per-turn token fields through Compaction's Cursor parser/read path",
+      "blocked_by": "compaction_parser_read_path"
     },
     {
       "id": "semantic-preservation",
-      "description": "Semantic/meaning preservation eval",
+      "description": "Semantic and meaning preservation evaluation",
       "status": "future_not_evaluated"
     },
     {
       "id": "billing-confirmed",
-      "description": "Billing-confirmed savings figure meeting N>=3/arm and delta-of-means criterion",
-      "status": "future_no_repo_figure"
+      "description": "Billing-confirmed savings evidence",
+      "status": "future_no_public_figure"
     }
   ]
 }

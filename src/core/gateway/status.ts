@@ -6,16 +6,18 @@
  * request/response content; the receipts it reads are already content-free. Local-only under
  * `<cwd>/.compaction/gateway/` (gitignored).
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { DEFAULT_GATEWAY_RECEIPTS_DIR, GATEWAY_RECEIPTS_FILE, type GatewayReceipt } from "./receipt.js";
 import { summarizeCacheProof, type CacheProofSummary } from "./cache-proof.js";
+import { isGatewayReleaseIdentity, queryGatewayIdentity, type GatewayReleaseIdentity, type GatewayIdentityStatus } from "./update-identity.js";
 
 export const GATEWAY_PID_FILE = "gateway.json";
 
 /** Content-free record of a running gateway (no request/response content). */
 export interface GatewayPidRecord {
+  release?: GatewayReleaseIdentity;
   pid: number;
   host: string;
   port: number;
@@ -33,7 +35,8 @@ function pidPath(cwd: string): string {
 
 export function writeGatewayPid(rec: GatewayPidRecord, cwd: string = process.cwd()): void {
   mkdirSync(path.join(cwd, DEFAULT_GATEWAY_RECEIPTS_DIR), { recursive: true });
-  writeFileSync(pidPath(cwd), `${JSON.stringify(rec, null, 2)}\n`, "utf8");
+  writeFileSync(pidPath(cwd), `${JSON.stringify(rec, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  chmodSync(pidPath(cwd), 0o600);
 }
 
 export function readGatewayPid(cwd: string = process.cwd()): GatewayPidRecord | null {
@@ -42,6 +45,7 @@ export function readGatewayPid(cwd: string = process.cwd()): GatewayPidRecord | 
     if (!r || typeof r.pid !== "number") return null;
     const workflow = r.workflow === "codex" || r.workflow === "claude-code" ? r.workflow : undefined;
     return {
+      ...(isGatewayReleaseIdentity(r.release) ? { release: r.release } : {}),
       pid: r.pid,
       host: r.host as string,
       port: r.port as number,
@@ -56,8 +60,9 @@ export function readGatewayPid(cwd: string = process.cwd()): GatewayPidRecord | 
   }
 }
 
-export function removeGatewayPid(cwd: string = process.cwd()): void {
+export function removeGatewayPid(cwd: string = process.cwd(), expectedInstanceId?: string): void {
   try {
+    if (expectedInstanceId && readGatewayPid(cwd)?.release?.instanceId !== expectedInstanceId) return;
     rmSync(pidPath(cwd), { force: true });
   } catch {
     /* best-effort */
@@ -104,6 +109,14 @@ export function readReceipts(cwd: string = process.cwd()): GatewayReceipt[] {
 }
 
 export interface GatewayStatus {
+  releaseIdentity?: GatewayIdentityStatus;
+  identityVerified?: boolean;
+  /**
+   * The PROJECT/dev gateway only: the cwd pidfile is present, its process is alive, and its port is
+   * listening. It is NOT the transparent-routing endpoint, which owns a user-global slot and
+   * deliberately writes no pidfile - so `false` here says nothing about whether routing is live.
+   * `gateway status` reports the two separately for exactly this reason.
+   */
   running: boolean;
   pid?: number;
   base?: string;
@@ -139,12 +152,15 @@ export async function getGatewayStatus(cwd: string = process.cwd(), since?: stri
     base = `http://${rec.host}:${rec.port}`;
   }
   const receipts = readReceipts(cwd);
+  const releaseIdentity = running && rec ? await queryGatewayIdentity(rec) : undefined;
   const times = receipts.map((r) => r.captured_at).filter((t): t is string => typeof t === "string").sort();
   const lastRequestAt = times.length > 0 ? times[times.length - 1] : undefined;
   const cachedObserved = receipts.some((r) => typeof r.tokens?.cached_input === "number" && r.tokens.cached_input > 0);
   const observedSince = since ? receipts.some((r) => typeof r.captured_at === "string" && r.captured_at >= since) : undefined;
   return {
     running,
+    ...(rec ? { identityVerified: !!releaseIdentity } : {}),
+    ...(releaseIdentity ? { releaseIdentity } : {}),
     ...(rec
       ? {
           pid: rec.pid,

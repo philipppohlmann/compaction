@@ -19,10 +19,10 @@
  * than the window, is under-counted there — never mis-attributed.)
  *
  * WHY THE REQUEST INSTANT AND NOT `captured_at`. The receipt is appended only after the response has
- * fully streamed and the usage window has been assembled — on a compressed response, after an
- * asynchronous decompressor flush — while the client already holds the response and its `Stop` hook
- * may already have closed the run. Judged by `captured_at`, the run's FINAL call landed after
- * `ended_at` and was permanently excluded from the completed aggregate. The request instant is
+ * reached EOF or authoritative Codex terminal evidence and the usage window has been assembled — on a
+ * compressed response, after an asynchronous decompressor flush — while the client already holds the
+ * response and its `Stop` hook may already have closed the run. Judged by `captured_at`, the run's FINAL
+ * call landed after `ended_at` and was permanently excluded from the completed aggregate. The request instant is
  * provably before the response and so before any `Stop` the response triggers. It is equally the
  * right instant at the START of a run: a call the previous prompt issued cannot cross into this one
  * merely by finishing late. No grace window is involved, so a later run's call can never bleed in.
@@ -42,6 +42,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   writeFileSync
 } from "node:fs";
 import { dirname, resolve } from "node:path";
@@ -51,6 +52,7 @@ import { validateActivityEventForStore } from "../activity-store.js";
 import { claudeLogicalRunIdentity } from "../claude-logical-run-id.js";
 import { invalidateCodexShapingTurnRecordByCorrelation } from "../output-shaping-turn-state.js";
 import { validCorrelationId } from "./session-correlation.js";
+import { atomicWrite } from "../update/state.js";
 
 /** Schema tag: a store written by an older/newer shape is ignored rather than misread. */
 export const RUN_BOUNDARY_SCHEMA = "compaction.run-boundary.v1";
@@ -150,6 +152,44 @@ interface RunStore {
   schema: string;
   runs: UserRun[];
   claude_provisional_pending?: ClaudeProvisionalPending;
+}
+
+/** Read-only update barrier. Unknown/corrupt state is busy, never silently settled or repaired. */
+export function readGatewaySettlementState(env: ConfigDirEnv = process.env): {
+  unsettledRuns: number; unsettledCodex: number; unsettledClaude: number; settlementUnknown: boolean;
+} {
+  const result = { unsettledRuns: 0, unsettledCodex: 0, unsettledClaude: 0, settlementUnknown: false };
+  const directory = resolve(compactionConfigDir(env), "runs");
+  let names: string[];
+  try { names = readdirSync(directory); }
+  catch (error) {
+    result.settlementUnknown = (error as NodeJS.ErrnoException).code !== "ENOENT";
+    return result;
+  }
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const correlation = name.slice(0, -5);
+    if (!validCorrelationId(correlation)) { result.settlementUnknown = true; continue; }
+    let fd: number | undefined;
+    try {
+      const target = resolve(directory, name);
+      const before = lstatSync(target);
+      if (!before.isFile() || before.isSymbolicLink()) throw new Error("Unsafe run store");
+      fd = openSync(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const opened = fstatSync(fd);
+      if (opened.ino !== before.ino || opened.dev !== before.dev) throw new Error("Run store changed");
+      const store = JSON.parse(readFileSync(fd, "utf8")) as RunStore;
+      if (store.schema !== RUN_BOUNDARY_SCHEMA || !Array.isArray(store.runs)) throw new Error("Unknown run store");
+      for (const run of store.runs) {
+        if (!validRunCore(run, correlation)) throw new Error("Invalid run");
+        if (!run.ended_at) result.unsettledRuns += 1;
+        if (run.codex_settlement_pending !== undefined) result.unsettledCodex += 1;
+      }
+      if (store.claude_provisional_pending !== undefined) result.unsettledClaude += 1;
+    } catch { result.settlementUnknown = true; }
+    finally { if (fd !== undefined) closeSync(fd); }
+  }
+  return result;
 }
 
 function canonicalTimestamp(value: unknown): value is string {
@@ -372,23 +412,26 @@ function writeStore(correlationId: string, store: RunStore, env: ConfigDirEnv): 
       const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "unknown";
       if (code !== "ENOENT") return false;
     }
-    const noFollow = "O_NOFOLLOW" in fsConstants ? fsConstants.O_NOFOLLOW : 0;
-    descriptor = openSync(
-      path,
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | noFollow,
-      0o600
-    );
-    const opened = fstatSync(descriptor);
-    if (!opened.isFile()) return false;
+    // ATOMIC, and SERIALIZED AFTER validation. This file used to be opened `O_TRUNC` and only then
+    // filled — so it sat at ZERO BYTES while `validClaudePending` did real work (schema validation
+    // plus a SHA-256 event-id derivation). Any concurrent `compaction statusline` that read it in
+    // that window got `JSON.parse("")`, which `readStore` reports as "this session has no runs" —
+    // and a session with no run boundary hands the visible line to the LAST PROVIDER CALL. That is
+    // exactly the micro-call flicker the run-level surface exists to prevent. Worse, an interruption
+    // between truncate and write (Ctrl-C in the hook, OOM, disk full) left the store PERMANENTLY
+    // unparseable, so the session lost its run boundary for good and `run_seq` restarted at 1.
+    // Serialize the payload FIRST, then swap it in with the repo's existing tmp+fsync+rename helper:
+    // a reader now sees either the whole previous store or the whole next one, never nothing.
     const retained = store.runs.slice(-RETAINED_RUNS);
     const pending = validClaudePending(store.claude_provisional_pending, retained, correlationId)
       ? store.claude_provisional_pending
       : undefined;
-    writeFileSync(descriptor, JSON.stringify({
+    const payload = JSON.stringify({
       schema: RUN_BOUNDARY_SCHEMA,
       runs: retained,
       ...(pending ? { claude_provisional_pending: pending } : {})
-    }), "utf8");
+    });
+    atomicWrite(path, payload, 0o600);
     const retainedSet = new Set(retained);
     for (const evicted of store.runs) {
       if (!retainedSet.has(evicted) && evicted.codex_settlement_pending?.turn_correlation_id) {

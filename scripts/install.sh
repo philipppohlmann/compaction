@@ -1,7 +1,7 @@
 #!/bin/sh
 # compaction.dev installer
 # ---------------------------------------------------------------------------
-# Target (FUTURE live) form:  curl -fsSL https://cli.compaction.dev/install | sh
+# Install:  curl -fsSL https://cli.compaction.dev/install | sh
 # (Hosted path is /install with no extension; this file is scripts/install.sh.)
 #
 # This script is intentionally SHORT, READABLE, and TRANSPARENT. Read it before
@@ -10,8 +10,9 @@
 #   * POSIX sh — portable; does not require bash.
 #   * NO sudo by default — installs into a user-writable prefix. A system prefix
 #     is only ever used if you explicitly request one (and you run sudo, not us).
-#   * NO telemetry / NO phone-home — the ONLY network call is the actual
-#     `npm install` of the package. No analytics, no version ping, no upload.
+#   * NO telemetry — public npm metadata, package, and signature verification.
+#     Managed installs check about daily; no work content or provider credentials.
+#     Entitled accounts may also acquire the signed engine after EULA acceptance.
 #   * Fail-safe — set -e/-u, a trap on error, required-tool checks up front,
 #     and clear messages.
 #   * Honest about publish state — the package (`@compaction/cli`) is published
@@ -53,7 +54,7 @@ compaction.dev installer
 
 Usage:
   install.sh [--dry-run]
-  curl -fsSL https://cli.compaction.dev/install | sh              # at launch
+  curl -fsSL https://cli.compaction.dev/install | sh
   curl -fsSL https://cli.compaction.dev/install | sh -s -- --dry-run
 
 Options:
@@ -66,10 +67,16 @@ Environment overrides:
   COMPACTION_VERSION   version/dist-tag  (default: latest)
   COMPACTION_PREFIX    npm prefix        (default: $HOME/.local)
   COMPACTION_DRY_RUN   1 = dry-run       (default: 0)
+  COMPACTION_AUTO_UPDATE  0 = persist automatic-update opt-out
+  COMPACTION_LOCAL_ARTIFACT + COMPACTION_LOCAL_SHA256 + exact COMPACTION_VERSION
+                      explicitly reviewed local release (automatic updates off)
 
-This installer makes NO network calls except the npm install itself, uses NO
-sudo by default, and collects NO telemetry. The package is published to npm; a
-real run installs it. If npm cannot find it, the run fails with a clear message.
+Managed installation requires Node.js >= 18 and npm >= 8.15.
+This installer uses NO sudo by default and collects NO telemetry. Official
+managed installs verify public npm releases and check about daily for updates.
+An entitled account may acquire a signed engine after exact EULA acceptance.
+Use compaction update --auto off to opt out. Exact-version installs are pinned.
+Direct npm and custom-package installs remain package-manager-owned.
 See https://compaction.dev.
 EOF
 }
@@ -77,13 +84,16 @@ EOF
 # --- failure trap (clear partial-failure message) --------------------------
 # Set a flag once we reach a clean, intended exit so the trap stays quiet then.
 COMPACTION_DONE=0
+bootstrap_scratch=""
 on_exit() {
   status=$?
+  if [ -n "$bootstrap_scratch" ]; then rm -rf "$bootstrap_scratch"; fi
   if [ "$COMPACTION_DONE" -eq 0 ] && [ "$status" -ne 0 ]; then
     err "installation did not complete (exit ${status})."
-    err "Nothing was installed if the npm step never started. If npm had begun,"
-    err "remove any partial global install with:"
-    err "  npm --prefix \"${COMPACTION_PREFIX}\" uninstall -g \"${COMPACTION_PACKAGE}\""
+    err "A failed managed stage does not replace the active release. Re-run to resume."
+    if [ "$COMPACTION_PACKAGE" != "@compaction/cli" ]; then
+      err "For a partial custom global install: npm --prefix \"${COMPACTION_PREFIX}\" uninstall -g \"${COMPACTION_PACKAGE}\""
+    fi
     err "Then re-run, or see https://compaction.dev."
   fi
 }
@@ -119,8 +129,8 @@ esac
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
     err "required tool not found on PATH: $1"
-    err "compaction.dev installs as an npm package and needs Node.js (which"
-    err "provides node + npm). Install Node.js >= 18 from https://nodejs.org/"
+    err "compaction.dev managed installation requires Node.js >= 18 and npm >= 8.15."
+    err "Install Node.js and npm from https://nodejs.org/"
     err "or your platform package manager, then re-run this installer."
     exit 1
   fi
@@ -137,7 +147,7 @@ need npm
 #
 # POSIX sh only: parse `node -v` (format vMAJOR.MINOR.PATCH) with sed, not [[ ]].
 NODE_MIN_MAJOR=18
-node_version="$(node -v 2>/dev/null || echo '')"
+node_version="$(env -i PATH="$PATH" node -v 2>/dev/null || echo '')"
 # Strip leading 'v' and everything from the first '.' or '-', leaving the major.
 node_major="$(printf '%s' "$node_version" | sed -e 's/^v//' -e 's/[.-].*$//')"
 case "$node_major" in
@@ -173,7 +183,12 @@ if [ "$COMPACTION_DRY_RUN" = "1" ]; then
   info "  version:     ${COMPACTION_VERSION}"
   info "  prefix:      ${COMPACTION_PREFIX}  (user-writable; no sudo)"
   info "  bin dir:     ${bin_dir}"
-  info "  would run:   npm install -g --prefix \"${COMPACTION_PREFIX}\" \"${pkg_spec}\""
+  if [ "$COMPACTION_PACKAGE" = "@compaction/cli" ]; then
+    info "  would run:   npm install --ignore-scripts \"${pkg_spec}\" in isolated temporary storage"
+    info "  then verify and bootstrap the stable managed launcher in ${bin_dir}"
+  else
+    info "  would run:   npm install -g --prefix \"${COMPACTION_PREFIX}\" \"${pkg_spec}\""
+  fi
   info ""
   info "No network call was made. No telemetry. To actually install, re-run"
   info "without --dry-run."
@@ -186,20 +201,62 @@ info "compaction.dev installer"
 info "  installing ${pkg_spec} into ${COMPACTION_PREFIX} (no sudo)"
 info ""
 
-# Attempt the REAL install. If npm fails (network, registry config, or a transient
-# outage), we turn that into a clear, honest message instead of a raw npm error or a
-# fake success. We deliberately do NOT pre-check the registry (that would be an extra
-# network call); we let the single npm install be the only network operation.
-if npm install -g --prefix "${COMPACTION_PREFIX}" "${pkg_spec}"; then
-  :
+# Custom package overrides retain their existing package-manager-owned installation.
+if [ "$COMPACTION_PACKAGE" != "@compaction/cli" ]; then
+  npm install -g --prefix "${COMPACTION_PREFIX}" "${pkg_spec}"
 else
-  err ""
-  err "${COMPACTION_PACKAGE} could not be installed from npm."
-  err "${COMPACTION_PACKAGE} is published to npm; a 404 / 'not found' here usually means"
-  err "a misconfigured npm registry, a network/proxy issue, or a transient npm outage."
-  err "Try: npm config get registry (expect https://registry.npmjs.org/), then re-run."
-  err "See https://compaction.dev for status and support."
-  exit 1
+  # The bootstrap package lives only in a fresh temporary prefix: npm never owns
+  # the stable launcher's destination. Inherited npm configuration is excluded.
+  bootstrap_scratch="$(mktemp -d "${TMPDIR:-/tmp}/compaction-bootstrap.XXXXXXXX")"
+  mkdir -p "$bootstrap_scratch/home" "$bootstrap_scratch/tmp"
+  : > "$bootstrap_scratch/npmrc"
+  : > "$bootstrap_scratch/global-npmrc"
+  isolated_npm() (
+    cd "$bootstrap_scratch"
+    env -i PATH="$PATH" HOME="$bootstrap_scratch/home" TMPDIR="$bootstrap_scratch/tmp" CI=1 \
+      NPM_CONFIG_USERCONFIG="$bootstrap_scratch/npmrc" NPM_CONFIG_GLOBALCONFIG="$bootstrap_scratch/global-npmrc" \
+      NPM_CONFIG_REGISTRY=https://registry.npmjs.org NPM_CONFIG_CACHE="$bootstrap_scratch/cache" \
+      NPM_CONFIG_IGNORE_SCRIPTS=true NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false \
+      NPM_CONFIG_UPDATE_NOTIFIER=false NPM_CONFIG_FETCH_RETRIES=0 NPM_CONFIG_FETCH_TIMEOUT=20000 \
+      npm "$@"
+  )
+  local_artifact="${COMPACTION_LOCAL_ARTIFACT:-}"
+  if [ -n "$local_artifact" ]; then
+    local_artifact="$(env -i PATH="$PATH" node -e 'process.stdout.write(require("node:path").resolve(process.argv[1]))' "$local_artifact")"
+    env -i PATH="$PATH" node -e '
+      const fs=require("node:fs"),crypto=require("node:crypto");
+      const hash=crypto.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex");
+      if(!/^[a-f0-9]{64}$/.test(process.argv[2]) || hash!==process.argv[2] ||
+         !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(process.argv[3])) process.exit(1);
+    ' "$local_artifact" "${COMPACTION_LOCAL_SHA256:-}" "$COMPACTION_VERSION" || {
+      err 'Local artifact requires an exact matching SHA-256 and version.'; exit 1;
+    }
+    pkg_spec="$local_artifact"
+  fi
+  isolated_npm install --ignore-scripts --no-audit --no-fund --save-exact --workspaces=false "$pkg_spec"
+  # Local artifact identity is explicitly supplied; every registry dependency still
+  # needs integrity and signature verification before executing the bootstrap.
+  env -i PATH="$PATH" node -e '
+    const lock=require(process.argv[1]); let count=0;
+    for(const [name,p] of Object.entries(lock.packages||{})) {
+      if(name==="" || name==="node_modules/@compaction/cli") continue;
+      if(!p.resolved || new URL(p.resolved).origin!=="https://registry.npmjs.org" || !p.integrity) process.exit(1);
+      count++;
+    }
+    require("node:fs").writeFileSync(process.argv[2],String(count));
+  ' "$bootstrap_scratch/package-lock.json" "$bootstrap_scratch/dependency-count"
+  if [ -z "$local_artifact" ] || [ "$(cat "$bootstrap_scratch/dependency-count")" -gt 0 ]; then
+    isolated_npm audit signatures --json --workspaces=false
+  fi
+  bootstrap="$bootstrap_scratch/node_modules/@compaction/cli/dist/core/update/bootstrap.js"
+  [ -f "$bootstrap" ] || { err 'This release predates managed updating; rerun after upgrading to an Update-capable release.'; exit 1; }
+  env -i PATH="$PATH" HOME="$HOME" \
+    COMPACTION_CONFIG_DIR="${COMPACTION_CONFIG_DIR:-}" COMPACTION_HOME="${COMPACTION_HOME:-}" \
+    COMPACTION_PREFIX="$COMPACTION_PREFIX" COMPACTION_VERSION="$COMPACTION_VERSION" \
+    COMPACTION_LOCAL_ARTIFACT="$local_artifact" COMPACTION_LOCAL_SHA256="${COMPACTION_LOCAL_SHA256:-}" \
+    COMPACTION_AUTO_UPDATE="${COMPACTION_AUTO_UPDATE:-1}" node "$bootstrap"
+  rm -rf "$bootstrap_scratch"
+  bootstrap_scratch=""
 fi
 
 # --- post-install verification ---------------------------------------------
@@ -210,10 +267,14 @@ fi
 # sudo. We try `--version` first and fall back to `--help`; if neither runs, the
 # install did not yield a working command and we say so clearly (non-zero exit).
 installed_bin="${bin_dir}/${BIN_NAME}"
+verify_installed() {
+  env -i PATH="$PATH" HOME="$HOME" COMPACTION_CONFIG_DIR="${COMPACTION_CONFIG_DIR:-}" \
+    COMPACTION_HOME="${COMPACTION_HOME:-}" COMPACTION_AUTO_UPDATE=0 "${installed_bin}" "$@"
+}
 if [ -x "${installed_bin}" ]; then
-  if "${installed_bin}" --version >/dev/null 2>&1; then
+  if verify_installed --version >/dev/null 2>&1; then
     info "Verified: ${BIN_NAME} --version runs."
-  elif "${installed_bin}" --help >/dev/null 2>&1; then
+  elif verify_installed --help >/dev/null 2>&1; then
     info "Verified: ${BIN_NAME} --help runs."
   else
     err ""
@@ -238,7 +299,7 @@ fi
 # plain text. This is local-only formatting: no network, no telemetry, no sudo.
 
 # Resolve the installed version for display (best-effort, local exec only).
-installed_version="$(${installed_bin} --version 2>/dev/null | head -n 1 || true)"
+installed_version="$(verify_installed --version 2>/dev/null | head -n 1 || true)"
 [ -n "$installed_version" ] || installed_version="${COMPACTION_VERSION}"
 
 # Color helpers, only when stdout is a TTY. Brand accent = bold blue (#3231cd).

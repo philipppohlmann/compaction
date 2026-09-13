@@ -58,25 +58,21 @@ function applyModeText(enabled: ReadyToolKey[], verifications: ProviderLiveVerif
 }
 
 describe("Enable screen - concise, tool-scoped per-workflow lines", () => {
-  /**
-   * THE RECORD-ONLY LINE IS FALSE FOR CODEX ON THIS PATH, in both of its clauses: there is no gateway
-   * route (the connect installs a capture shim + the tool's native hooks), and the hooks exist to
-   * attach an instruction to what the model sees. A user who read the plan consent copy ("Adds that
-   * instruction to what the model sees"), pressed Enable, and landed two screens later on a line
-   * denying it would be reading one flow contradict itself. The pin is REWRITTEN, not loosened.
-   */
+  /** Codex installs both its normal-invocation Gateway shim and its native shaping hook. */
   it("Codex: concise enabled line + run command + the honest per-tool boundary (never the Record-only line)", () => {
     const text = readyText(["codex"]);
     // Concise header carries the keyless plan-auth default once.
     expect(text).toContain("Per workflow - enabled on the plan-auth default (no API key):");
     // The one concise enabled line + run command.
     expect(text).toContain("Codex → ✓ Enabled (plan-auth, default):  codex");
-    // The honest boundary: what is captured, what is attached, and what is absent.
+    // The honest boundary: normal routing plus what the shaping hook attaches.
     expect(text).toContain("a concise-response instruction is attached before generation, every prompt");
-    expect(text).toContain("No Gateway route from this setup.");
+    expect(text).toContain("Routed automatically through the local Gateway");
+    expect(text).not.toContain("No Gateway route from this setup.");
     expect(text).not.toContain("Record-only - your input is not compacted or edited.");
     expect(text).not.toContain("Routed automatically through the local gateway");
-    expect(text).toContain("content-free receipts");
+    expect(text).toContain("content-free receipt evidence when settled");
+    expect(text).not.toContain("Routed automatically through the local Gateway; content-free receipts");
     // A single pointer moves the advanced detail to `compaction status`.
     expect(text).toContain("Advanced routing, cache proof, and per-workflow detail:  compaction status");
     // The advanced detail is NOT inlined on the enable screen (it moved to status).
@@ -202,8 +198,8 @@ describe("Enable screen - concise, tool-scoped per-workflow lines", () => {
   /**
    * THE READY LINE MAY NOT CLAIM A SHAPING EFFECT THAT IS NOT WIRED. Reproduced by the trust review in
    * ONE uninterrupted run: the connect block printed the honest hook-install failure, and the ready
-   * summary twenty-five lines later said the instruction is attached before generation. The capture
-   * half still stands (a hook failure never un-connects the shim), so the line says exactly that.
+   * summary twenty-five lines later said the instruction is attached before generation. The shim
+   * half still stands (a hook failure never un-connects routing/capture), so the line says exactly that.
    */
   it("hooks NOT confirmed on disk ⇒ the line says shaping is NOT active, and never claims an attached instruction", () => {
     for (const key of ["codex", "cursor"] as const) {
@@ -218,8 +214,8 @@ describe("Enable screen - concise, tool-scoped per-workflow lines", () => {
       expect(text).toContain(`compaction hooks install --tool ${key}`);
       expect(text).not.toContain("is attached before generation");
       expect(text).not.toContain("ONE session-level instruction per session");
-      // The CAPTURE half is unaffected - the shim really did connect.
-      expect(text).toContain("Captured locally");
+      // The shim half is unaffected - Codex remains Gateway-routed; Cursor remains captured locally.
+      expect(text).toContain(key === "codex" ? "Routed automatically through the local Gateway" : "Captured locally");
       expect(text).toContain(`✓ Enabled (plan-auth, default)`);
     }
   });

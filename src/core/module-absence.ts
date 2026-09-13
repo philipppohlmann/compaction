@@ -118,7 +118,8 @@ export const PRIVATE_CORE_MODULES: ExpectedModuleSet = {
     "core/context-store-eval-cases",
     "core/context-store-sufficiency",
     "core/gateway/apply-policy",
-    "core/gateway/apply-composition"
+    "core/gateway/apply-composition",
+    "core/gateway/lcm-qualified-classes"
   ]
 };
 

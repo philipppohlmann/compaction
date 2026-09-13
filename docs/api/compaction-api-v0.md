@@ -1,18 +1,16 @@
 # Compaction Hosted API — v0 contract (LOCAL-ENGINE DEV; not hosted)
 
-**Status:** `v0` — LOCAL-ENGINE DEV (open-core Phase 2). The endpoints below
-describe the *shape* of a future hosted API. The local server in `apps/api/`
-validates request bodies against these schemas and now runs the compaction/eval
-**engine server-side, locally** for `/v0/optimize` and `/v0/evaluate`, and the
-PUBLIC aggregator for `/v0/reports`. This document remains the typed boundary a
-future backend would satisfy — it is **not** evidence that a hosted service
-exists. The engine runs server-side ONLY inside `apps/api` (a separate package);
-the public `@compaction/cli` package still ships ZERO engine.
+**Status:** `v0` — LOCAL-ENGINE DEV (open-core Phase 2). This public tree contains
+the API contract and CLI client boundary. The service implementation, including
+the local engine-backed `/v0/optimize` and `/v0/evaluate` handlers and the
+`/v0/reports` aggregator, is maintained separately and is not included here.
+This document is **not** evidence that a hosted service exists. The public
+`@compaction/cli` package ships ZERO engine code.
 
 **What this is NOT (read first):**
 
 - NOT a running hosted service. There is no deployment, no public endpoint, no
-  hosting from this repo. The default server is local-only (`127.0.0.1`), makes
+  hosting from this public tree. The maintained server defaults to local-only (`127.0.0.1`), makes
   no outbound network call, and logs no request content. Hosted MODE exists in
   the code (fail-closed API-key auth, Cloud Run-shaped) but deploying it is a
   separate, deliberate step that this repository does not take.
@@ -25,10 +23,9 @@ the public `@compaction/cli` package still ships ZERO engine.
 - NOT a semantic guarantee / model replay. `/v0/evaluate` returns DETERMINISTIC
   recoverability verdicts only; semantic preservation stays `not_evaluated` and
   TRUE model replay stays `future`.
-- NOT a change to the CLI. The local-first CLI (`@compaction/cli`) is unchanged
-  and remains the product's first-value surface. This API is a separate
-  **local-dev** package for a *future* hosted track, and production/hosted use is
-  out of scope for this repository.
+- NOT a change to the CLI. The local-first CLI (`@compaction/cli`) remains the
+  product's first-value surface. The service implementation is maintained
+  separately; production or hosted use is not established by this contract.
 
 Evidence labels are governed by the ladder in "Evidence labels used in this
 contract" below, which matches the README's Methodology section. That precedence
@@ -296,9 +293,8 @@ All endpoints return a consistent error body:
 
 - The CLI (`@compaction/cli`) is the product's local-first first-value surface and
   is unchanged by this work. It still ships ZERO engine code.
-- `apps/api/` is a **separate, local-dev** package (open-core Phase 2) that runs
-  the engine server-side LOCALLY behind this contract. It is excluded from the CLI
-  package and from the root `npm run verify`.
+- The service implementation is maintained separately and runs the engine behind
+  this contract. It is not part of the public CLI package or this public tree.
 - **Hosting / deploy / production backend** (real database, auth, public endpoint,
   real-trace retention, billing) is **out of scope for this contract**: nothing in
-  this repository deploys or configures one.
+  this public tree deploys or configures one.

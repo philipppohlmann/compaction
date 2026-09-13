@@ -2,10 +2,9 @@
  * HYBRID APPLY ACTIVATION (PUBLIC CLI/SDK core, engine-free, content-free).
  *
  * The explicit, versioned activation switch that makes the on-device HYBRID
- * compaction apply path REACHABLE. It is the simplified activation chosen over the research-grade
- * promotion fortress (`lcm-qualified-classes.ts`): instead of requiring per-class, live-verified,
- * two-run promotion evidence before a class may be considered, the apply boundary now considers any
- * non-global class when this activation is on, while the per-request SAFETY NET (apply-boundary
+ * compaction apply path REACHABLE. It is independent of the private pre-registered evidence bar.
+ * The apply boundary considers any non-global class when this activation is on, while the per-request
+ * SAFETY NET (apply-boundary
  * GATES 2-7: active stored authorization → narrow non-global scope → source-validated candidate →
  * content-free evidence → a real body change → the original retained for byte-exact recovery) is
  * UNCHANGED. Turning apply on does NOT bypass any of those gates; it only replaces GATE 1's
@@ -15,8 +14,8 @@
  * ONLY when a deployment EXPLICITLY opts in via `COMPACTION_HYBRID_APPLY=1` (or `true`). It is NEVER
  * enabled-by-default and NEVER an opt-out, a gateway with an existing stored authorization does not
  * silently start mutating requests just because this code shipped. The version label records WHICH
- * activation an operator is opting into; the fortress path (`lcm-qualified-classes.ts`) remains
- * available and dormant-by-construction alongside this.
+ * activation an operator is opting into; the independent private pre-registered evidence bar remains
+ * available alongside this.
  */
 
 /** The activation version label, records which activation an explicit opt-in enables. */

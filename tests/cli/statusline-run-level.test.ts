@@ -63,6 +63,7 @@ function ledger(correlationId: string): GatewayReceipt[] {
       applied_components: ["lcm-compaction"], output_shaping_state: "already-active",
       output_shaping_policy_version: TEST_OUTPUT_POLICY_VERSION,
       approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
       tokens: { prompt_input: before, output: out }, session_correlation_id: correlationId
     });
   const aux = (id: string, at: string, input: number) =>
@@ -134,6 +135,134 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     expect(line).toContain("full apply");
   });
 
+  it("fails closed on malformed persisted run counts while preserving independent Full input evidence", async () => {
+    for (const output of [-3, 1.8]) {
+      const env = fullDevice();
+      const c = sessionCorrelationId(SESSION, env)!;
+      startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+      const malformedOutput = receipt({
+        receipt_id: `badout${String(output).replace(/\D/g, "")}`,
+        captured_at: "2026-09-01T10:56:00.000Z",
+        mode: "apply",
+        request_mutated: true,
+        model_visible_bytes_changed: true,
+        estimated_input_tokens_before: 100,
+        estimated_input_tokens_after: 80,
+        applied_components: ["lcm-compaction"],
+        approval_status: "auto-applied-by-policy",
+        authorization_id: "pref-1234567890abcdef12345678",
+        tokens: { prompt_input: 80, output } as GatewayReceipt["tokens"],
+        session_correlation_id: c
+      });
+      const line = await computeStatusLine(STDIN, { env, readReceipts: async () => [malformedOutput] });
+      expect(line).toContain("input 100→80");
+      expect(line).toContain("full apply");
+      expect(line).not.toContain("output");
+    }
+
+    for (const [before, after] of [
+      [-1, -2],
+      [100.8, 80.2]
+    ]) {
+      const env = fullDevice();
+      const c = sessionCorrelationId(SESSION, env)!;
+      startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+      const malformedInput = receipt({
+        receipt_id: "badinput",
+        captured_at: "2026-09-01T10:56:00.000Z",
+        mode: "apply",
+        request_mutated: true,
+        model_visible_bytes_changed: true,
+        estimated_input_tokens_before: before,
+        estimated_input_tokens_after: after,
+        applied_components: ["lcm-compaction"],
+        approval_status: "auto-applied-by-policy",
+        authorization_id: "pref-1234567890abcdef12345678",
+        tokens: { prompt_input: -8, output: 10 } as GatewayReceipt["tokens"],
+        session_correlation_id: c
+      });
+      const line = await computeStatusLine(STDIN, { env, readReceipts: async () => [malformedInput] });
+      expect(line).not.toMatch(/input [-\d,]+→[-\d,]+/);
+      expect(line).not.toContain("input -8");
+      expect(line).not.toContain("full apply");
+      expect(line).toContain("output 10");
+    }
+  });
+
+  it("fails closed on malformed persisted run components without throwing", async () => {
+    const env = fullDevice();
+    const c = sessionCorrelationId(SESSION, env)!;
+    startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    const malformedComponents = receipt({
+      receipt_id: "badcomps",
+      captured_at: "2026-09-01T10:56:00.000Z",
+      mode: "apply",
+      request_mutated: true,
+      model_visible_bytes_changed: true,
+      estimated_input_tokens_before: 100,
+      estimated_input_tokens_after: 80,
+      applied_components: { 0: "lcm-compaction" } as unknown as GatewayReceipt["applied_components"],
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      tokens: { prompt_input: 80, output: 10 },
+      session_correlation_id: c
+    });
+
+    const rendered = computeStatusLine(STDIN, { env, readReceipts: async () => [malformedComponents] });
+    await expect(rendered).resolves.toBeDefined();
+    const line = await rendered;
+    expect(line).toContain("input 80");
+    expect(line).not.toContain("→");
+    expect(line).not.toContain("full apply");
+    expect(line).toContain("output 10");
+  });
+
+  it("aggregates a reduction pair only from a real input-compaction apply", async () => {
+    for (const fields of [
+      { mode: "apply", request_mutated: false, applied_components: ["lcm-compaction"] },
+      { mode: "record", request_mutated: false, applied_components: ["lcm-compaction"] },
+      { mode: "apply", request_mutated: true, applied_components: ["output-shaping"] }
+    ] as const) {
+      const env = fullDevice();
+      const c = sessionCorrelationId(SESSION, env)!;
+      startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+      const nonInputApply = receipt({
+        receipt_id: "notapply",
+        captured_at: "2026-09-01T10:56:00.000Z",
+        model_visible_bytes_changed: fields.request_mutated,
+        estimated_input_tokens_before: 100,
+        estimated_input_tokens_after: 80,
+        approval_status: "auto-applied-by-policy",
+        authorization_id: "pref-1234567890abcdef12345678",
+        tokens: { prompt_input: 80, output: 10 },
+        session_correlation_id: c,
+        ...fields
+      } as Partial<GatewayReceipt> & { captured_at: string; receipt_id: string });
+      const line = await computeStatusLine(STDIN, { env, readReceipts: async () => [nonInputApply] });
+      expect(line).toContain("input 80");
+      expect(line).not.toContain("→");
+      expect(line).not.toContain("full apply");
+    }
+
+    const env = fullDevice();
+    const c = sessionCorrelationId(SESSION, env)!;
+    startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    const legacyApply = receipt({
+      receipt_id: "legacy01",
+      captured_at: "2026-09-01T10:56:00.000Z",
+      mode: "apply",
+      request_mutated: true,
+      model_visible_bytes_changed: true,
+      estimated_input_tokens_before: 100,
+      estimated_input_tokens_after: 80,
+      tokens: { prompt_input: 80, output: 10 },
+      session_correlation_id: c
+    });
+    const legacyLine = await computeStatusLine(STDIN, { env, readReceipts: async () => [legacyApply] });
+    expect(legacyLine).toContain("input 100→80");
+    expect(legacyLine).not.toContain("full apply");
+  });
+
   it("a NEW UserPromptSubmit resets the aggregate for the new run", async () => {
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
@@ -169,17 +298,17 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     expect(line).not.toContain("900,000");
   });
 
-  it("falls back to the per-receipt line when this session has no run boundary", async () => {
+  it("falls back to a same-session per-receipt line when this session has no run boundary", async () => {
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
-    // No startUserRun: no hook installed, or the marker was never written.
+    // No startUserRun: the receipt's keyed correlation still attributes it to this session.
     const line = await computeStatusLine(STDIN, {
       env,
       readReceipts: async () => ledger(c),
       readReceipt: async () => ledger(c)[4]
     });
-    // The old per-call rendering, unchanged — the run path never guesses a run.
     expect(line).toContain("1,200→900");
+    expect(line).toContain("apply003");
   });
 
   /**
@@ -388,6 +517,7 @@ describe("the line holds across the gap between runs", () => {
       model_visible_bytes_changed: true, estimated_input_tokens_before: 1000, estimated_input_tokens_after: 900,
       applied_components: ["lcm-compaction"], tokens: { prompt_input: 1000, output: 10 },
       approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
       session_correlation_id: c
     });
 

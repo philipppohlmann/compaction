@@ -38,7 +38,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { compactionConfigDir, type ConfigDirEnv } from "../config-dir.js";
 import { publicKeyHash } from "../crypto/key-hash.js";
-import { canonicalLeaseBytes, currentPeriodId, parseSignedLease, periodEndUtc } from "./lease.js";
+import { canonicalLeaseBytes, currentPeriodId, parseSignedLease, periodEndUtc, type SignedLease } from "./lease.js";
 import { validResetsOn } from "../upgrade-cta.js";
 import { verifyLeaseSignatureBytes, type LeaseTrustSource } from "./lease-roots.js";
 
@@ -171,6 +171,40 @@ function readDevicePublicKey(env: ConfigDirEnv): string | undefined {
 }
 
 /**
+ * Verify a signed lease that is not necessarily on disk yet. Same fail-closed chain as
+ * `readLeaseVerdict` (signature → device → period → expiry), so a renew candidate can be checked
+ * BEFORE it replaces a still-valid stored lease.
+ */
+export function verifySignedLease(
+  signed: SignedLease,
+  env: ConfigDirEnv = process.env,
+  now: Date = new Date()
+): LeaseVerdict {
+  const { lease, signature } = signed;
+
+  const sig = verifyLeaseSignatureBytes(canonicalLeaseBytes(lease), signature, env);
+  if (!sig.verified) return { label: "lease-invalid" };
+
+  const devicePublicKey = readDevicePublicKey(env);
+  if (!devicePublicKey) return { label: "lease-invalid" };
+  if (publicKeyHash(devicePublicKey) !== lease.device_public_key_hash) return { label: "lease-wrong-device" };
+
+  if (lease.period_id !== currentPeriodId(now)) return { label: "lease-wrong-period" };
+  if (Number.isNaN(Date.parse(lease.expires_at)) || now.getTime() > Date.parse(lease.expires_at)) {
+    return { label: "lease-expired" };
+  }
+
+  return {
+    label: "lease-valid",
+    trust: sig.trust,
+    allowanceTokens: lease.allowance_tokens,
+    periodId: lease.period_id,
+    ...(lease.period_allowance_tokens !== undefined ? { periodAllowanceTokens: lease.period_allowance_tokens } : {}),
+    ...(lease.allowance_tokens <= 0 ? { meteredBalanceExhausted: true } : {})
+  };
+}
+
+/**
  * Verify the stored lease and return a content-free verdict. Fail-closed on every anomaly; never
  * throws. `now` is injectable for tests. Check order (most-specific reason wins): presence → parse →
  * signature → device binding → period → expiry. The ENTITLEMENT chain ends there; the metered
@@ -187,48 +221,7 @@ export function readLeaseVerdict(env: ConfigDirEnv = process.env, now: Date = ne
     return { label: "lease-invalid" };
   }
   if (!parsed) return { label: "lease-invalid" };
-  const { lease, signature } = parsed;
-
-  // Cryptographic gate FIRST: a lease whose signature does not verify against an allowed root is
-  // invalid regardless of its contents (pinned-root-not-minted and bad-signature both → invalid).
-  const sig = verifyLeaseSignatureBytes(canonicalLeaseBytes(lease), signature, env);
-  if (!sig.verified) return { label: "lease-invalid" };
-
-  // Device binding: recompute the hash of THIS device's public key and require it to match the
-  // lease's `device_public_key_hash`. No credentials (not logged in) ⇒ cannot bind ⇒ invalid.
-  const devicePublicKey = readDevicePublicKey(env);
-  if (!devicePublicKey) return { label: "lease-invalid" };
-  if (publicKeyHash(devicePublicKey) !== lease.device_public_key_hash) return { label: "lease-wrong-device" };
-
-  // Period + expiry (server-authoritative fields carried IN the signed lease).
-  if (lease.period_id !== currentPeriodId(now)) return { label: "lease-wrong-period" };
-  if (Number.isNaN(Date.parse(lease.expires_at)) || now.getTime() > Date.parse(lease.expires_at)) {
-    return { label: "lease-expired" };
-  }
-
-  // METERED BALANCE — reported, NOT decided. A zero/negative allowance means this period has no
-  // optimized-input headroom left; ceiling behavior is pause/degrade, never auto-purchase. The number is SERVER-AUTHORITATIVE as of issue: the issuer subtracts the
-  // consumption the server has recorded for the period before signing, so a device that deleted its
-  // local journal still receives the reduced figure. Per-turn spend within the lease's life is
-  // tracked separately by the local journal; this is the outer bound the server put in the signature.
-  //
-  // It is NOT a verdict, because it is not the same fact about both capabilities: OUTPUT SHAPING
-  // consumes no allowance on any route, so refusing the ENTITLEMENT here would switch off shaping too
-  // — the base capability that owes the allowance nothing. The apply site decides; this reader states.
-  //
-  // The period rides the verdict so the ceiling is EXPLAINABLE, not just refused: the reset date a
-  // surface names is derived from this (`periodEndUtc`). It is necessarily the current period — the
-  // wrong-period check above already returned for anything else.
-  return {
-    label: "lease-valid",
-    trust: sig.trust,
-    allowanceTokens: lease.allowance_tokens,
-    periodId: lease.period_id,
-    // Only when the issuer actually signed one (v2). Defaulting a missing total to the remainder
-    // would manufacture a denominator the signature does not cover and show a permanently full tank.
-    ...(lease.period_allowance_tokens !== undefined ? { periodAllowanceTokens: lease.period_allowance_tokens } : {}),
-    ...(lease.allowance_tokens <= 0 ? { meteredBalanceExhausted: true } : {})
-  };
+  return verifySignedLease(parsed, env, now);
 }
 
 /**
@@ -240,6 +233,42 @@ export function readLeaseVerdict(env: ConfigDirEnv = process.env, now: Date = ne
  */
 export function hasValidFullApplyLease(env: ConfigDirEnv = process.env, now: Date = new Date()): boolean {
   return readLeaseVerdict(env, now).label === "lease-valid";
+}
+
+/**
+ * How far ahead of `expires_at` a still-valid lease should be renewed.
+ *
+ * The server issues a 24h TTL (`LEASE_TTL_MS`). Renewal is supposed to be invisible: a long-lived
+ * gateway or a device that only runs `status`/`compaction` must refresh BEFORE the verdict flips to
+ * `lease-expired`, otherwise Full apply silently disappears until the user re-runs activation.
+ * Two hours leaves room for transient network failure without waiting until expiry.
+ */
+export const LEASE_REFRESH_BEFORE_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * Whether this device should attempt a silent lease renew NOW.
+ *
+ * True when there is no usable lease, OR when a valid lease is inside the refresh window. Local-disk
+ * only — never a network call. Callers that may touch the network (`ensureCommunityRuntime`, status,
+ * gateway start/request recovery) consult this before deciding whether acquisition is needed.
+ */
+export function leaseNeedsRenewal(env: ConfigDirEnv = process.env, now: Date = new Date()): boolean {
+  const path = leasePath(env);
+  if (!existsSync(path)) return true;
+
+  let expiresAtMs: number | undefined;
+  try {
+    const parsed = parseSignedLease(JSON.parse(readFileSync(path, "utf8")));
+    if (!parsed) return true;
+    expiresAtMs = Date.parse(parsed.lease.expires_at);
+    if (Number.isNaN(expiresAtMs)) return true;
+  } catch {
+    return true;
+  }
+
+  const verdict = readLeaseVerdict(env, now);
+  if (verdict.label !== "lease-valid") return true;
+  return expiresAtMs - now.getTime() <= LEASE_REFRESH_BEFORE_MS;
 }
 
 /**

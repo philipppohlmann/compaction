@@ -12,14 +12,51 @@
  * NOT compute or send any output-savings figure (output savings stay unavailable until the output-shaping
  * policy family produces measured + eval-confirmed evidence).
  */
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
 import { buildOptimizeRequest, sendRequest, type ApiConfig, type TokenSource, type ToolName } from "./api-client/index.js";
 import type { UsageMetadata } from "./usage-metadata.js";
+import { buildCaptureUsageSidecar } from "./output-shaping-ab.js";
 
 /** Map a capture's UsageMetadata to the honest wire token source. */
 export function captureTokenSource(usage: UsageMetadata): TokenSource {
   if (usage.provider_reported_tokens) return "provider-reported";
   if (usage.estimated_tokens) return "local-estimate";
   return "unknown";
+}
+
+/**
+ * Write a content-free `capture-usage.json` sidecar next to a capture artifact (operator-side evidence),
+ * shared by EVERY tool's capture path (codex, cursor, claude-code). It carries provider-reported token
+ * counts + honest source + (treatment) output-shaping policy names so a later
+ * `compaction output-shaping-ab add` can link this run into an A/B arm. NO content is written.
+ *
+ * `policyNames`/`policyVersion` are optional: a caller with no truthful policy-attribution source for
+ * this run (e.g. Claude Code, where shaping is attached by the UserPromptSubmit hook, not by this call
+ * site) omits them, and `buildCaptureUsageSidecar` leaves `outputShaping` off entirely - it is never
+ * invented.
+ */
+export async function writeCaptureUsageSidecar(
+  outDir: string,
+  tool: ToolName,
+  usage: UsageMetadata,
+  policyNames: string[] = [],
+  policyVersion?: string
+): Promise<string> {
+  const sidecar = buildCaptureUsageSidecar({
+    tool,
+    ...(usage.provider ? { provider: usage.provider } : {}),
+    ...(usage.model ? { model: usage.model } : {}),
+    ...(typeof usage.input_tokens === "number" ? { inputTokens: usage.input_tokens } : {}),
+    ...(typeof usage.output_tokens === "number" ? { outputTokens: usage.output_tokens } : {}),
+    providerReported: usage.provider_reported_tokens === true,
+    tokenSource: captureTokenSource(usage),
+    tokenMetadataStatus: usage.provider_reported_tokens === true ? "present" : "missing",
+    ...(policyNames.length > 0 && policyVersion ? { policyNames, policyVersion } : {})
+  });
+  const sidecarPath = path.join(outDir, "capture-usage.json");
+  await writeFile(sidecarPath, JSON.stringify(sidecar, null, 2), "utf8");
+  return sidecarPath;
 }
 
 export interface CaptureRecordOptions {

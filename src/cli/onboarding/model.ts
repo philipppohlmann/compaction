@@ -23,8 +23,8 @@ export const VALUE_PROMISE =
 export const INSTALL_TAGLINE = "context under control";
 export const DETECT_LINE = "Detecting AI tools on this machine…";
 
-/** After a tool is connected, supported runs are measured automatically; the manual tools stay available. */
-export const AFTER_CONNECT_LINE = "After connect: supported runs are measured automatically.";
+/** After connect, routing/capture is automatic; evidence is shown only when an artifact was recorded. */
+export const AFTER_CONNECT_LINE = "After connect: supported runs route or capture automatically; only recorded evidence is reported.";
 export const MANUAL_TOOLS_LINE = "Manual tools: capture · import · analyze · spend · feedback --redact";
 
 /**
@@ -48,7 +48,7 @@ export interface ConnectSurface {
   connectNote: string;
   /** The honest current connect mechanism (capture/wrapper), shown in the per-surface detail. */
   path: string;
-  /** Whether this surface has a working connect option in the [1..] menu (browser/agents are guidance). */
+  /** Whether this surface has a working named connect option (browser/agents are guidance). */
   connectable: boolean;
 }
 
@@ -63,8 +63,8 @@ export const CONNECT_SURFACES: ConnectSurface[] = [
   {
     key: "codex",
     title: "Codex CLI",
-    connectNote: "connect: Compaction wrapper / gateway where verified",
-    path: "Codex: live wrapper around `codex exec --json` where available",
+    connectNote: "connect: transparent Gateway routing (subscription, fail-open)",
+    path: "Codex: transparent routing through the local Gateway for every invocation - interactive included - unless your own model-provider route or an OpenAI API key is already configured",
     connectable: true
   },
   {
@@ -145,7 +145,8 @@ export const CODEX_DISCOVERY_COPY = {
 
 export const CLAUDE_CODE_DISCOVERY_COPY = {
   foundMeaning: "local Claude Code sessions found",
-  readyMeaning: "Compaction hook installed and verified; sessions appear in Compaction activity",
+  readyMeaning:
+    "Compaction Stop + shaping hooks are verified and the transparent-routing shim is active",
   enableAction:
     "Install transparent routing (record-only, fail-open) + local hook; sets up PATH so normal `claude` runs are captured continuously. Reversible."
 } as const;
@@ -433,6 +434,11 @@ export interface EnableResult {
    * screen must not then describe a shaping effect that is not there.
    */
   shapingHooksInstalled?: ReadyToolKey[];
+  /**
+   * Codex's native hook state after this enable. `configured` means the complete hook bundle is on
+   * disk but Codex has not reported its one-time approval active; it is neither absent nor active.
+   */
+  codexShapingState?: "active" | "configured" | "not-installed";
 }
 
 /** Per-tool Ready-summary copy: the Enabled label + the EXACT command the user runs the tool with. */
@@ -455,7 +461,7 @@ export const READY_WILL_HEADER = "Compaction will:";
  * Compaction changes model-visible bytes in the default mode.
  */
 export const READY_WILL_BULLETS = [
-  "✓ record usage (content-free token/cache receipts)",
+  "✓ report only observed usage from content-free token/cache artifacts",
   "✓ show provider-reported proof when the provider caches and fresh input drops (compaction gateway proof)",
   "○ ask before any context compaction - only if you start apply mode (compaction gateway start --mode apply)"
 ] as const;
@@ -505,7 +511,7 @@ export const READY_ENABLE_ADVANCED_POINTER =
  */
 export const PLAN_AUTH_MODE_LABEL = "Plan-auth mode";
 export const PLAN_AUTH_MODE_LINE =
-  "A. Plan-auth mode (default): run your workflows normally with your existing CLI auth / subscription; Compaction records content-free usage. No API key is requested or stored.";
+  "A. Plan-auth mode (default): run your workflows normally with your existing CLI auth / subscription; only recorded content-free evidence is reported. No API key is requested or stored.";
 export const API_KEY_MODE_LABEL = "API-key provider mode";
 export const API_KEY_MODE_LINE =
   "B. API-key provider mode (optional, Advanced): only for provider live cache verification (compaction gateway verify-cache). Never required for basic setup; your provider API key is used for that check and never stored or logged.";
@@ -575,13 +581,17 @@ export interface ReadyRoutingCapability {
   shapingPerTurnHold?: boolean;
   /** Whether this workflow's native shaping hooks are CONFIRMED on disk (checked after the enable). */
   shapingHooksInstalled?: boolean;
+  /** Codex hook bytes are present, but native trust/runnable state is not confirmed active. */
+  shapingHooksConfigured?: boolean;
 }
 
 /** Shared, content-free connection labels rendered by both the headless and TUI Ready surfaces. */
 export const READY_CONNECTION_MANUAL_LABEL =
   "Connection: capture/activity-only; Gateway routing is a manual next step (run the route command explicitly).";
+export const READY_CONNECTION_CODEX_LABEL =
+  "Connection: normal Codex invocations route through the local Gateway when the installed shim is active; user-declared routes and API key auth pass through untouched; evidence is shown only when recorded.";
 export const READY_CONNECTION_CURSOR_LABEL =
-  "Connection: capture/activity-only; Gateway routing unavailable (vendor gap); local-estimate only.";
+  "Connection: capture/activity-only; Compaction has no verified Cursor Gateway route; local-estimate only.";
 
 /**
  * The Claude Code transparent-routing shim's verified state, passed content-free from the caller
@@ -597,7 +607,7 @@ export interface ClaudeRoutingState {
 
 /** The stop/disconnect tail shared by every routed-connection label (fix-the-loop honesty: how to stop). */
 const CLAUDE_ROUTED_STOP_TAIL =
-  "Stop anytime: compaction gateway stop · disconnect: compaction init --disconnect 1.";
+  "Stop anytime: compaction gateway stop · disconnect: compaction init --disconnect claude-code.";
 
 /**
  * The boundary tail shared by every routed-connection label: this route captures, it does not optimize.
@@ -698,6 +708,8 @@ export interface ReadyRoutingInputs {
    * change exists to remove, arriving from the other direction.
    */
   shapingHooksInstalled?: readonly ReadyToolKey[];
+  /** Read-only Codex-native state; configured is not presented as active. */
+  codexShapingState?: "active" | "configured" | "not-installed";
 }
 
 /**
@@ -717,6 +729,7 @@ export function deriveReadyRouting(
     const row = inputs.matrix.find((r) => r.workflow === key);
     const provider = READY_ROUTE_PROVIDER[key];
     const routeCommand = inputs.routeCommands[key];
+    const codexConfigured = key === "codex" && inputs.codexShapingState === "configured";
     if (provider && routeCommand) {
       const pc = inputs.providerCaps.find((p) => p.providerId === provider);
       out.push({
@@ -729,14 +742,15 @@ export function deriveReadyRouting(
         liveVerified: pc?.liveVerified === true,
         activityOnly: false,
         localEstimateOnly: false,
-        // Claude Code carries the VERIFIED routing-shim state (transparent + continuous when
-        // installed); other routable workflows keep the explicit manual-route label.
+        // Claude Code carries its VERIFIED routing-shim state. Codex has its own installed normal-
+        // invocation route; neither label guarantees a receipt that was not observed.
         connectionLabel:
           key === "claude-code"
             ? claudeRoutedConnectionLabel(inputs.claudeRouting, inputs.shapingHooksInstalled?.includes(key) === true)
-            : READY_CONNECTION_MANUAL_LABEL,
+            : READY_CONNECTION_CODEX_LABEL,
         ...(inputs.shapingPerTurnHold === true ? { shapingPerTurnHold: true } : {}),
-        ...(inputs.shapingHooksInstalled?.includes(key) === true ? { shapingHooksInstalled: true } : {})
+        ...(inputs.shapingHooksInstalled?.includes(key) === true ? { shapingHooksInstalled: true } : {}),
+        ...(codexConfigured ? { shapingHooksConfigured: true } : {})
       });
     } else {
       // Not routable (Cursor): activity-only / local-estimate, with the matrix's own reason.
@@ -770,15 +784,20 @@ export function readyRoutingWorkflowLines(cap: ReadyRoutingCapability): string[]
   const runCommand = READY_TOOL_COPY[cap.key].runCommand;
   return [
     `    ${label} → ✓ Enabled (plan-auth, default):  ${runCommand}`,
-    `      ${readyEnableBoundaryLine(cap.key, cap.shapingPerTurnHold === true, cap.shapingHooksInstalled === true)}`
+    `      ${readyEnableBoundaryLine(
+      cap.key,
+      cap.shapingPerTurnHold === true,
+      cap.shapingHooksInstalled === true,
+      cap.shapingHooksConfigured === true
+    )}`
   ];
 }
 
 /**
  * The Codex/Cursor honest per-workflow boundary line. `READY_ENABLE_RECORD_ONLY_LINE` cannot be used
- * for them: BOTH of its clauses are false on the setup this flow produces. There is no gateway route
- * for Codex or Cursor here (the connect installs a capture shim plus the tool's native hooks), and the
- * hooks exist precisely to attach an instruction to what the model sees - so a user who read the plan
+ * for them: its model-visible clause is false on the setup this flow produces. Codex installs a normal-
+ * invocation Gateway shim; Cursor remains capture-only. Their hooks attach an instruction to what the
+ * model sees, so a user who read the plan
  * consent copy ("Adds that instruction to what the model sees") and pressed Enable would land two
  * screens later on a line denying it, inside one uninterrupted flow.
  *
@@ -791,7 +810,7 @@ export function readyRoutingWorkflowLines(cap: ReadyRoutingCapability): string[]
  * printed "Output shaping: on" and then, forty lines later, denied it on the final screen.
  */
 export const READY_ENABLE_CODEX_LINE =
-  "Captured locally (content-free receipts); a concise-response instruction is attached before generation, every prompt. No Gateway route from this setup.";
+  "Routed automatically through the local Gateway unless your own route is detected; content-free receipt evidence when settled; a concise-response instruction is attached before generation, every prompt.";
 /**
  * The same line for a build whose task classifier IS reachable. The hold is a real safety property, so
  * it may be stated only when the classifier that performs it is actually present — a PER-BUILD fact,
@@ -800,7 +819,7 @@ export const READY_ENABLE_CODEX_LINE =
  * very same hook.
  */
 export const READY_ENABLE_CODEX_HOLD_LINE =
-  "Captured locally (content-free receipts); a concise-response instruction is attached before generation on each shapeable turn (planning/reasoning/extended-thinking turns are held). No Gateway route from this setup.";
+  "Routed automatically through the local Gateway unless your own route is detected; content-free receipt evidence when settled; a concise-response instruction is attached before generation on each shapeable turn (planning/reasoning/extended-thinking turns are held).";
 export const READY_ENABLE_CURSOR_LINE =
   "Captured locally (content-free, local-estimate only); ONE session-level instruction per session - not per turn. No Gateway route, no input compaction, no per-turn control. Output effect is not yet measured on Cursor.";
 
@@ -810,7 +829,9 @@ export const READY_ENABLE_CURSOR_LINE =
  * about an instruction that is not attached to anything.
  */
 export const READY_ENABLE_CODEX_NO_SHAPING_LINE =
-  "Captured locally (content-free receipts); output shaping is NOT active for Codex - the hook config was not installed, so nothing is attached to what the model sees. No Gateway route from this setup. Retry:  compaction hooks install --tool codex";
+  "Routed automatically through the local Gateway unless your own route is detected; content-free receipt evidence when settled; output shaping is NOT active for Codex - the hook config was not installed, so nothing is attached to what the model sees. Retry:  compaction hooks install --tool codex";
+export const READY_ENABLE_CODEX_CONFIGURED_LINE =
+  "Routed automatically through the local Gateway unless your own route is detected; content-free receipt evidence when settled; output shaping is configured for Codex, but whether Codex is running it depends on its one-time hook approval. Check:  compaction status";
 export const READY_ENABLE_CURSOR_NO_SHAPING_LINE =
   "Captured locally (content-free, local-estimate only); output shaping is NOT active for Cursor - the hook config was not installed, so nothing is attached to what the model sees. No Gateway route, no input compaction, no per-turn control. Retry:  compaction hooks install --tool cursor";
 
@@ -825,8 +846,14 @@ export const READY_ENABLE_CURSOR_NO_SHAPING_LINE =
  * Defaulting it to false is deliberate: an unknown state understates the effect rather than promising
  * one. The shim/capture claim is unaffected either way — a hook failure never un-connects the shim.
  */
-export function readyEnableBoundaryLine(key: ReadyToolKey, perTurnHold = false, hooksInstalled = false): string {
+export function readyEnableBoundaryLine(
+  key: ReadyToolKey,
+  perTurnHold = false,
+  hooksInstalled = false,
+  hooksConfigured = false
+): string {
   if (key === "codex") {
+    if (hooksConfigured && !hooksInstalled) return READY_ENABLE_CODEX_CONFIGURED_LINE;
     if (!hooksInstalled) return READY_ENABLE_CODEX_NO_SHAPING_LINE;
     return perTurnHold ? READY_ENABLE_CODEX_HOLD_LINE : READY_ENABLE_CODEX_LINE;
   }
@@ -904,13 +931,12 @@ export function buildReadySummaryLines(
   return lines;
 }
 
-/** The connect-once menu shown on the first screen (both surfaces). */
-export const CONNECT_MENU: Array<{ num: string; label: string }> = [
-  { num: "1", label: "Claude Code" },
-  { num: "2", label: "Codex" },
-  { num: "3", label: "Cursor" },
-  { num: "4", label: "All supported" },
-  { num: "5", label: "Skip" }
+/** Named connect-once commands shown on the static first-run screen. */
+export const CONNECT_MENU: Array<{ command: string; label: string }> = [
+  { command: "compaction init --connect claude-code", label: "Claude Code" },
+  { command: "compaction init --connect codex", label: "Codex" },
+  { command: "compaction init --connect cursor", label: "Cursor" },
+  { command: "compaction init --connect all", label: "All detected tools" }
 ];
 
 // The three short status pills shown under the wordmark on both surfaces.
@@ -1156,9 +1182,9 @@ export const FOOTER_LINES = [
 /* ================================================================================================
  * Production onboarding flow model (target → mode/limited → review → ready).
  *
- * The interactive `compaction init` walks the user through: (1) pick a detected workflow to
- * connect; (2) choose how Compaction optimizes it (full / output-only) - Claude Code only, since
- * the other tools are output-shaping-only or session-level; (3) review exactly what enabling does;
+ * The interactive `compaction init` walks the user through: (1) select from the detected workflows,
+ * which are preselected by default; (2) choose how Compaction optimizes the selected set where each
+ * workflow supports it; (3) review exactly what enabling does;
  * (4) run the REAL installers; (5) an honest ready screen with a REAL measured metric (or the
  * "unavailable until measured" state). All copy here is data-only (no React/chalk); the TUI is a
  * thin renderer, and every write routes through the same injected engine callbacks the static and
@@ -1218,7 +1244,8 @@ export const ONBOARDING_TOOLS: OnboardingToolCopy[] = [
     title: "Cursor",
     availabilityTag: "output only · local estimate",
     capability: "Shorter responses via a session-level instruction; Compaction records a content-free local estimate.",
-    fullOptimizationNote: "Input compaction and per-turn control need an API key and are not available for Cursor (no Gateway route; vendor gap). Output effect is not yet measured on Cursor.",
+    fullOptimizationNote:
+      "Input compaction and per-turn control are not available for Cursor because Compaction has no verified Cursor Gateway route. Output effect is not yet measured on Cursor.",
     supportsFullOptimization: false
   }
 ];
@@ -1264,13 +1291,14 @@ export function onboardingUncoveredWorkflowsLine(
     .filter((d) => d.state === "found" && !enabled.includes(d.key as ReadyToolKey))
     .map((d) => findOnboardingTool(d.key as ReadyToolKey)?.title ?? d.title);
   if (others.length === 0) return undefined;
-  return `Also detected, not configured: ${others.join(", ")}. Automatic shaping covers only the workflow you just set up - re-run \`compaction\` to configure another.`;
+  return `Also detected, not configured: ${others.join(", ")}. They remain untouched until you connect them by name.`;
 }
 
 /** The header shown above the target picker. */
-export const ONBOARDING_TARGET_HEADER = "Choose the workflow you want to connect.";
+export const ONBOARDING_TARGET_HEADER = "Choose the workflows you want to connect.";
 /** The read-only, honest sub-line under the target header (the caller injects the real detected list). */
-export const ONBOARDING_TARGET_READONLY = "Discovery is read-only. Enabling a workflow is the first write.";
+export const ONBOARDING_TARGET_READONLY =
+  "All detected tools are selected by default. Discovery is read-only; confirmation is the first write.";
 
 /**
  * The "limited" screen copy for a non-Claude tool: an honest per-tool + per-auth summary before the
@@ -1485,7 +1513,9 @@ export function onboardingReviewContent(
   // so it gets no picker; claiming they chose it would assert a decision that never happened).
   bullets.push(
     tool?.supportsFullOptimization === false
-      ? `  • use "${modeTitle}" as the default for future runs (the only mode available for ${tool?.title ?? key})`
+      ? modeKey === "full"
+        ? `  • effective mode for ${tool?.title ?? key}: "Output only"; the device-wide "${modeTitle}" preference is remembered for future runs and applies only where supported`
+        : `  • effective mode for ${tool?.title ?? key}: "Output only"; remember "${modeTitle}" as the device-wide preference for future runs`
       : `  • remember "${modeTitle}" as your default for future runs`
   );
   if (options.plan) bullets.push(onboardingPlanReviewLine(options.plan));

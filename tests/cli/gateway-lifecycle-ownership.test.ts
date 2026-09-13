@@ -2,13 +2,17 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EventEmitter } from "node:events";
 
 let nextPort = 41000;
 vi.mock("../../src/core/gateway/server.js", () => ({
-  startGatewayServer: vi.fn(async () => ({
+  startGatewayServer: vi.fn(async () => {
+    const server = new EventEmitter();
+    return {
+    server,
     address: { host: "127.0.0.1", port: nextPort++ },
-    close: vi.fn(async () => undefined)
-  }))
+    close: vi.fn(async () => { server.emit("close"); })
+  }; })
 }));
 
 import { runGatewayStart, type RunningGateway } from "../../src/cli/commands/gateway.js";

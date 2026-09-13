@@ -19,11 +19,10 @@
 import { summarizeOutputShapingAb, type OutputShapingAbSummary } from "./output-shaping-ab.js";
 import {
   bestApplicableOutputCalibration,
-  emptyCalibration,
-  foldCalibrationConfirmation,
   loadCalibration,
-  mergeOutputCalibrations,
-  type OutputShapingCalibrationConfirmation,
+  outputCalibrationQuery,
+  updateCalibrationFromConfirmation,
+  validateOutputCalibrationConfirmation,
   type OutputShapingCalibration,
   type OutputShapingCalibrationQuery,
   type CalibrationBasis,
@@ -261,13 +260,14 @@ export function planLifetimeProjection(reduction: PerTurnReduction, planOutputBu
 }
 
 /**
- * Load the current MEASURED per-turn reduction from the shared exact calibration sources, for the receipt line's
+ * Load the current MEASURED per-turn reduction from the activated local calibration store, for the receipt line's
  * estimated-output-saved clause. MEASURED is meant literally: an exact key with no confirmed experiment gets
- * `unavailable`, not the generic starting prior dressed as evidence. The shared registry and additive
- * local store (`output-shaping-calibration-store.ts`) contain only engine-confirmed,
- * provider-reported A/B measurements admitted by the private confirmation gate; their running
- * experiment-weighted rate is
- * what this returns. Total and fail-open: an absent / unreadable / uncalibrated store yields an
+ * `unavailable`, not the generic starting prior dressed as evidence. Package-shipped confirmations stay
+ * inert until a matching positively shaped run crosses its authoritative durable-settlement barrier and
+ * activates them into the content-free local store. The store contains only engine-confirmed,
+ * provider-reported A/B measurements admitted by the private confirmation gate; its running
+ * experiment-weighted rate is what this returns. Total and fail-open: an absent / unreadable /
+ * uncalibrated store yields an
  * `unavailable` reduction (⇒ the line degrades to a plain `output N`), NEVER a thrown error and NEVER a
  * fabricated rate. The `sampleCount` rides on the measured result so a reader never over-trusts a 1-sample
  * rate. Content-free: the store holds only aggregate counts + rates (no request bytes).
@@ -302,15 +302,37 @@ export function outputCalibrationResolver(calibration: OutputShapingCalibration)
 }
 
 export async function loadOutputCalibrationResolver(
-  env: NodeJS.ProcessEnv = process.env,
-  sharedConfirmations: readonly OutputShapingCalibrationConfirmation[] = SHARED_OUTPUT_CALIBRATION_CONFIRMATIONS
+  env: NodeJS.ProcessEnv = process.env
 ): Promise<OutputCalibrationResolver> {
-  let shared = emptyCalibration();
-  for (const confirmation of sharedConfirmations) {
-    shared = foldCalibrationConfirmation(shared, confirmation);
+  return outputCalibrationResolver(await loadCalibration(env));
+}
+
+/**
+ * Activate package-shipped evidence only after a caller has durably settled one positively shaped
+ * run for the same exact cohort. The caller owns that settlement barrier; this helper only performs
+ * exact-key validation and the existing content-free, idempotent local-store fold.
+ */
+export async function activateSharedOutputCalibration(
+  query: OutputShapingCalibrationQuery,
+  env: NodeJS.ProcessEnv = process.env,
+  sharedConfirmations: readonly unknown[] = SHARED_OUTPUT_CALIBRATION_CONFIRMATIONS
+): Promise<{ activated: number }> {
+  const exact = outputCalibrationQuery(query);
+  if (!exact) return { activated: 0 };
+  let activated = 0;
+  for (const value of sharedConfirmations) {
+    const confirmation = validateOutputCalibrationConfirmation(value);
+    if (
+      !confirmation ||
+      confirmation.policyVersion !== exact.policyVersion ||
+      confirmation.provider !== exact.provider ||
+      confirmation.model !== exact.model ||
+      confirmation.regime !== exact.regime
+    ) continue;
+    const result = await updateCalibrationFromConfirmation(confirmation, env);
+    if (result.updated) activated += 1;
   }
-  const effective = mergeOutputCalibrations(shared, await loadCalibration(env));
-  return outputCalibrationResolver(effective);
+  return { activated };
 }
 
 export async function loadCalibrationReduction(

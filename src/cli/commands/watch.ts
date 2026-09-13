@@ -118,8 +118,8 @@ function parseReceiptLine(line: string): GatewayReceipt | undefined {
  */
 export interface WatchRenderContext {
   /**
-   * The device's CURRENT product tier. It selects the BUILDER only — `full` routes a real full-apply
-   * receipt to the community builder — and never the Open tier LABEL, which comes from the receipt or
+   * The device's CURRENT product tier. It selects the BUILDER only — `full` routes a receipt proving a
+   * successful stored-policy private LCM apply to the community builder — and never the Open tier LABEL, which comes from the receipt or
    * from this batch's shaped-evidence. A current setting may decide how much of a receipt we are
    * equipped to render; it may not decide what a past turn is called.
    */
@@ -171,54 +171,10 @@ export function receiptTurnLinesFromJsonl(
     // run, so every other workflow keeps its existing live behavior. If Stop never settles, silence is
     // the fail-closed outcome and the receipt remains durable in its ledger.
     if (codexRunEnv && codexUserRunForReceipt(receipt, codexRunEnv)) continue;
-    // The saving is per TURN (rate × THAT turn's output), so the RATE is injected and the count derived
-    // per receipt — one precomputed count would attribute a single turn's saving to every line.
-    //
-    // THE RECEIPT IS ASKED FIRST, exactly as the LABEL beneath already asks it. This gate used to read
-    // `context.shapedEvidence` ALONE, which is a LIVE session signal (`lastTurnWasShaped`) that the two
-    // replay callers — `watch --once` and `status`'s "Last turns", both of which build their context in
-    // `watchRenderContext` — never set. The arrow was therefore unreachable on those two surfaces for
-    // every turn, at every tier: a real full apply that the gateway's own inline line rendered as
-    // `output 617→327 (−47%, est.)` came back as a bare `output 327` the moment the same receipt was
-    // replayed. One receipt, two descriptions, and the weaker one came from the surface a user is most
-    // likely to check. (The capture that surfaced this carried the shipped default prior, which now
-    // renders no figure on either surface — the DISAGREEMENT is what this gate is about, and it would
-    // read the same way on a device that has measured.)
-    //
-    // THE EVIDENCE IS `output_shaping_state`, NOT `applied_components`. #941 gated on the component set,
-    // which was the right correction to `isRealApply` (that answers "did we mutate") but still the wrong
-    // predicate: `applied_components` records what THIS APPLY PASS MUTATED, and the tool's own
-    // `UserPromptSubmit` hook attaches the same policy upstream. The planner then correctly attaches
-    // nothing, correctly omits `output-shaping` — and the model still reads the policy at instruction
-    // level. Measured: all five 0.6.7 Founder Journey LCM turns and 261/261 replayable captures are in
-    // exactly that state, so the arrow was withheld on the ordinary LCM turn.
-    //
-    // `already-active` and `attached-this-pass` both mean ACTIVE ON THE FINAL MODEL-VISIBLE REQUEST,
-    // which is the only thing that licenses an output saving. `absent` and a MISSING field do not:
-    // the final request is not retained anywhere, so a legacy receipt cannot be classified after the
-    // fact and must fail closed rather than borrow a guess.
-    //
-    // DO NOT REINTRODUCE `isRealApply` HERE. It answers "did we mutate", not "did we shape output" --
-    // its own doc says so -- and the engine composes a real apply from EITHER layer
-    // (`shapedChanged = deterministicPlan.changed || outputShapingPlan?.changed`). An input-only apply
-    // (`applied_components: ["lcm-compaction"]`, no output-shaping) is therefore a real apply on which
-    // output shaping never ran, and gating on `isRealApply` drew a reconstructed
-    // `output 617→327 (−47%, est.)` over it -- a counterfactual for a saving that did
-    // not happen. That is not a hypothetical shape: every `lcm-compaction` turn in the 0.6.7 founder
-    // journey has exactly that receipt, because the tool's own `UserPromptSubmit` hook attached the
-    // policy upstream: the planner correctly attached nothing, so `applied_components` names only
-    // `lcm-compaction` even though the request reached the model carrying the shaping policy at
-    // instruction level. The component set therefore cannot separate a genuinely unshaped turn from a
-    // hook-shaped one -- only the recorded `output_shaping_state` can.
-    //
-    // `shapedEvidence` remains the fallback for a LIVE turn whose receipt records NO state; it is
-    // still never set for a historical batch, so a replayed receipt cannot borrow today's session
-    // state. AND IT IS ONLY A FALLBACK: a live drain coalesces every receipt appended since the last
-    // poll and hands all of them the latest turn's `lastTurnWasShaped`, so an earlier receipt that
-    // explicitly says `absent` must not inherit `true` from a later shaped turn and draw an arrow
-    // over a saving that did not occur. `outputShapingActiveForTurn` holds that precedence for the
-    // arrow and the label alike. The estimate itself comes only from an exact shared calibration
-    // match; there is no generic-rate fallback.
+    // Recorded `output_shaping_state` proves whether the final model-visible request was shaped;
+    // apply status and `applied_components` never infer shaping. Explicit receipt state outranks the
+    // live fallback, while missing state may use the current live signal. A numeric counterfactual
+    // requires exact applicable calibration; there is no generic prior.
     const shapedTurn = outputShapingActiveForTurn(receipt, context?.shapedEvidence === true);
     const query = outputCalibrationQuery({
       policyVersion: receipt.output_shaping_policy_version,
@@ -249,8 +205,8 @@ export function receiptTurnLinesFromJsonl(
     // `openLineForTurn` holds that rule for every surface, so it cannot drift between them.
     const openLine: OpenLineRendering = openLineForTurn(receipt, context?.shapedEvidence === true);
 
-    // Builder choice is separate from output-estimate eligibility. A REAL apply on a full-tier device
-    // takes the Community builder; a REAL public explicit apply takes the generic apply builder so its
+    // Builder choice is separate from output-estimate eligibility. A proven private Full receipt on a
+    // full-tier device takes the Community builder; a public deterministic or explicit apply takes the generic apply builder so its
     // measured input before→after survives without acquiring a `full apply` label. Non-apply turns use
     // the honest Open line. `isRealApply` decides only this dispatch — `shapedTurn` above remains the
     // sole gate for an output counterfactual.
@@ -264,7 +220,9 @@ export function receiptTurnLinesFromJsonl(
     const rendered =
       context?.productTier === "full"
         ? (communityFullApplyReceiptLine(receipt, estimatedSaved, ceiling) ??
-          receiptLineFromGatewayReceipt(receipt, openLine, undefined, estimatedSaved, ceiling))
+          (isRealApply(receipt)
+            ? receiptLineFromGatewayReceipt(receipt, undefined, undefined, estimatedSaved, ceiling)
+            : receiptLineFromGatewayReceipt(receipt, openLine, undefined, estimatedSaved, ceiling)))
         : isRealApply(receipt)
           ? receiptLineFromGatewayReceipt(receipt, undefined, undefined, estimatedSaved, ceiling)
           : receiptLineFromGatewayReceipt(receipt, openLine, undefined, estimatedSaved, ceiling);
@@ -304,12 +262,16 @@ export const WATCH_TIER_LINE =
   "Counts print at the tier they were recorded at: Cursor is local-estimate only because Compaction's current Cursor parser does not consume the vendor's per-turn usage; watch never upgrades it to provider-reported.";
 /**
  * WHAT THIS FEED CANNOT SHOW, said in the header rather than discovered by watching an empty screen.
- * Only the measurable forms are recorded: a Codex Stop, an exact Gateway-backed Claude Stop, a
- * positively reconciled hook-only Claude task-notification continuation, a Gateway-routed run, or a
- * shim-captured batch invocation (`core/tool-shim.ts`). A Cursor IDE session writes no activity record.
+ * Codex's PATH shim (`core/tool-shim.ts`, `kind: "gateway-route"`) routes EVERY normal invocation -
+ * interactive included - through the local Gateway once connected, so those settle after Stop the same
+ * as any other Gateway-routed run; the ONE exception is a run where Compaction detects the user's own
+ * route already declared (env, argv, `~/.codex/config.toml`, or an OpenAI API key) - that run falls
+ * back to the legacy shim-captured batch form (`codex exec --json`) ONLY and is otherwise unmeasured.
+ * Claude Code settles exact Gateway-backed runs and positively reconciled hook-only task-notification
+ * continuations. A Cursor IDE session writes no activity record at all.
  */
 export const WATCH_SCOPE_LINE =
-  "Codex turns settle after Stop. Claude Code settles exact Gateway-backed runs and positively reconciled hook-only task-notification continuations; other turns appear when routed through the Gateway, or captured as `codex exec --json` / `cursor-agent … --output-format json`. Cursor IDE sessions are not measured.";
+  "Normal Codex invocations route through the local Gateway once connected unless your own model-provider route or an API key is detected; only observed settled Stop/Gateway evidence is shown, and requests without it are not inferred as measured. Claude Code settles exact Gateway-backed runs and positively reconciled hook-only task-notification continuations. Cursor IDE sessions are not measured.";
 
 /** The content-free header printed once at the top of a `watch` session. */
 export async function watchHeaderLines(

@@ -11,7 +11,7 @@
  *
  * ── WHAT THIS GUARD NOW GUARANTEES ──────────────────────────────────────────────────────────────
  *  1. Every URL-shaped literal in tracked `src/` names a host that is loopback, or is one of the
- *     four justified external hosts below, or lives in `src/core/web-origin.ts`. A website host
+ *     justified external hosts below, or lives in `src/core/web-origin.ts`. A website host
  *     hardcoded into any other file — the original defect, and any repeat of it — fails here.
  *  2. `src/core/web-origin.ts` names exactly ONE URL-shaped host, and it is the value of
  *     `DEFAULT_WEB_ORIGIN`. So the default cannot be duplicated, branched, or shadowed inside the
@@ -102,6 +102,10 @@ const LOOPBACK = new Set(["127.0.0.1", "localhost", "0.0.0.0", "::1"]);
 const ALLOWED_HOSTS = new Map<string, string>([
   ["api.anthropic.com", "provider API base (gateway upstream) — not a browser handoff"],
   ["api.openai.com", "provider API base (OpenAI-compatible upstream) — not a browser handoff"],
+  [
+    "chatgpt.com",
+    "pinned Codex ChatGPT-subscription inference upstream — not a browser handoff"
+  ],
   ["api.example.com", "RFC 2606 documentation host inside an example — resolves nowhere by design"],
   [
     "pub-cf9336d86d8140a5aaefd7412832adf7.r2.dev",
@@ -118,6 +122,18 @@ const ALLOWED_HOSTS = new Map<string, string>([
   ]
 ]);
 
+/** Updater-specific literals, not blanket host permissions for unrelated browser handoffs. */
+const UPDATE_LITERALS = new Map<string, Map<string, string>>([
+  ["src/core/update/registry.ts", new Map([
+    ["https://registry.npmjs.org", "single public npm acquisition origin; requests omit credentials and reject redirects"],
+    ["https://slsa.dev/provenance/v0.2", "exact supported provenance predicate identifier; never fetched"],
+    ["https://slsa.dev/provenance/v1", "exact supported provenance predicate identifier; never fetched"]
+  ])],
+  ["src/cli/commands/update.ts", new Map([
+    ["https://cli.compaction.dev/install", "printed official-installer instruction for unknown ownership; not opened or fetched"]
+  ])]
+]);
+
 interface Offender {
   file: string;
   line: number;
@@ -125,7 +141,7 @@ interface Offender {
 }
 
 function trackedSourceFiles(): string[] {
-  const stdout = execFileSync("git", ["-C", REPO_ROOT, "ls-files", "-z", "src"], {
+  const stdout = execFileSync("git", ["-C", REPO_ROOT, "ls-files", "--cached", "--others", "--exclude-standard", "-z", "src"], {
     encoding: "utf8",
     maxBuffer: 32 * 1024 * 1024
   });
@@ -157,8 +173,8 @@ function hostOf(candidate: string): string | null {
 }
 
 /** Every URL host in one file's text, with the line it sits on. */
-function urlHostsIn(contents: string): { line: number; host: string }[] {
-  const found: { line: number; host: string }[] = [];
+function urlHostsIn(contents: string): { line: number; host: string; literal: string }[] {
+  const found: { line: number; host: string; literal: string }[] = [];
   contents.split("\n").forEach((text, index) => {
     const candidates = [
       ...[...text.matchAll(ABSOLUTE_URL)].map((m) => m[0] as string),
@@ -166,7 +182,7 @@ function urlHostsIn(contents: string): { line: number; host: string }[] {
     ];
     for (const candidate of candidates) {
       const host = hostOf(candidate);
-      if (host !== null) found.push({ line: index + 1, host });
+      if (host !== null) found.push({ line: index + 1, host, literal: candidate });
     }
   });
   return found;
@@ -176,11 +192,21 @@ function urlHostsIn(contents: string): { line: number; host: string }[] {
 function offendersIn(file: string, contents: string): Offender[] {
   if (file === WEB_ORIGIN_SOURCE) return [];
   return urlHostsIn(contents)
-    .filter(({ host }) => !LOOPBACK.has(host) && !ALLOWED_HOSTS.has(host))
+    .filter(({ host, literal }) => !LOOPBACK.has(host) && !ALLOWED_HOSTS.has(host) && !UPDATE_LITERALS.get(file)?.has(literal))
     .map(({ line, host }) => ({ file, line, host }));
 }
 
 describe("the classifier itself (falsified in both directions before it is trusted)", () => {
+  it("allows only the exact updater file/purpose literals, not their hosts elsewhere or arbitrary paths", () => {
+    for (const [file, literals] of UPDATE_LITERALS) {
+      for (const literal of literals.keys()) {
+        expect(offendersIn(file, JSON.stringify(literal))).toEqual([]);
+        expect(offendersIn("src/cli/commands/unrelated.ts", JSON.stringify(literal))).toHaveLength(1);
+        expect(offendersIn(file, JSON.stringify(`${literal}/arbitrary`))).toHaveLength(1);
+      }
+    }
+    expect(offendersIn("src/core/update/registry.ts", 'fetch("https://registry.npmjs.org@evil.example")')[0]?.host).toBe("evil.example");
+  });
   it("flags the original defect: a surface naming the website host in a URL", () => {
     const found = offendersIn("src/cli/commands/upgrade.ts", 'const u = "https://compaction.dev/pricing";');
     expect(found.map((o) => o.host)).toEqual(["compaction.dev"]);

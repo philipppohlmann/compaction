@@ -362,7 +362,7 @@ describe("a REAL issuer-exhausted lease pauses input optimization on every route
     const leaseEnv = exhausted();
     const line = await computeStatusLine('{"cwd":"/x","usage":{"output_tokens":286}}', { env: leaseEnv, readReceipt: async () => undefined });
     // THE DATE'S PROVENANCE, END TO END, THROUGH A REAL LEASE. This is the strongest form of the
-    // rule the founder set: the date on the primary line must come from the CURRENT allowance period
+    // period-label rule: the date on the primary line must come from the CURRENT allowance period
     // and from nowhere else. Nothing here types a date — it is derived from the same `periodEndUtc`
     // the entitlement chain derives it from, so a renderer that hard-coded one, defaulted to one, or
     // reached for the lease's own expiry fails here.

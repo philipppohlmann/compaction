@@ -58,7 +58,8 @@ const plan: DedupePlan = {
  */
 function realApplyReceipt(outputTokens = 512, route: "api-key" | "subscription" = "api-key") {
   const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens, model: "gpt-4o" };
-  return buildApplyReceipt({
+  return {
+    ...buildApplyReceipt({
     provider: "openai",
     endpoint: "/v1/chat/completions",
     upstreamStatus: 200,
@@ -66,14 +67,18 @@ function realApplyReceipt(outputTokens = 512, route: "api-key" | "subscription" 
     activation: applyActivation,
     plan,
     applied: true,
-    appliedComponents: ["deterministic-compaction"],
+    authorizationId: "pref-1234567890abcdef12345678",
+    appliedComponents: ["lcm-compaction"],
+    composedInputEstimate: { before: 12_000, after: 9_000 },
     outputShapingState: "already-active",
     outputShapingPolicyVersion: TEST_OUTPUT_POLICY_VERSION,
     outputShapingRegime: "default-shapeable",
     upstreamRouteType: route,
     id: fixedId,
     now: fixedNow
-  });
+    }),
+    approval_status: "auto-applied-by-policy" as const
+  };
 }
 
 let configDir: string;
@@ -246,10 +251,14 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
       activation: applyActivation,
       plan,
       applied: true,
+      authorizationId: "pref-1234567890abcdef12345678",
+      appliedComponents: ["lcm-compaction"],
+      composedInputEstimate: { before: 12_000, after: 9_000 },
       upstreamRouteType: "api-key",
       id: fixedId,
       now: fixedNow
     });
+    receipt.approval_status = "auto-applied-by-policy";
     const line = await perTurnLineFromReceipt(receipt, { entitlementEnv: env() });
     expect(line).not.toMatch(/output [\d,]+→/);
     expect(line).toContain("input 12,000→9,000 (−25%)");

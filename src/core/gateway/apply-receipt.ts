@@ -12,7 +12,7 @@ import type { OpenAiUsageBreakdown } from "./openai-usage.js";
 import type { DedupePlan } from "./request-shape.js";
 import type { OptimizationPlan } from "./optimization-planner.js";
 import type { ApplyActivation } from "./apply-activation.js";
-import { LCM_APPLY_POLICY } from "./lcm-qualified-classes.js";
+import { LCM_APPLY_POLICY } from "./lcm-apply-policy-name.js";
 
 export const applyLabelMutated = (pct: number): string =>
   `apply (deterministic-dedupe): model-visible input reduced by ${pct}% by a deterministic policy (exact-duplicate large blocks removed); the original request is retained locally. No output-token, cost, provider-billing, or semantic-compaction claim.`;

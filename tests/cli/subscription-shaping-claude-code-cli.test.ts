@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -116,11 +116,21 @@ describe("compaction init --connect claude-code installs the before-call SHAPING
     // Run in a fresh tmp cwd so the project settings land under it, not the repo.
     const projectCwd = await mkdtemp(join(tmpdir(), "cc-shape-proj-"));
     try {
+      const fakeBinDir = join(projectCwd, "bin");
+      const fakeClaude = join(fakeBinDir, "claude");
+      await mkdir(fakeBinDir, { recursive: true });
+      await writeFile(fakeClaude, "#!/bin/sh\nexit 0\n", "utf8");
+      await chmod(fakeClaude, 0o755);
       await execFileAsync("node", [CLI, "init", "--connect", "claude-code", "--static"], {
-        env: { ...process.env, HOME: home, COMPACTION_CONFIG_DIR: configDir },
+        env: {
+          ...process.env,
+          HOME: home,
+          COMPACTION_CONFIG_DIR: configDir,
+          PATH: `${fakeBinDir}${delimiter}${process.env.PATH ?? ""}`
+        },
         cwd: projectCwd
       });
-      const settings = JSON.parse(await readFile(join(projectCwd, ".claude", "settings.json"), "utf8"));
+      const settings = JSON.parse(await readFile(join(home, ".claude", "settings.json"), "utf8"));
       const upsCmds = (settings.hooks.UserPromptSubmit ?? []).flatMap((g: { hooks: { command: string }[] }) =>
         g.hooks.map((h) => h.command)
       );

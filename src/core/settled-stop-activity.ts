@@ -5,27 +5,103 @@ import type { CalibrationState } from "./output-shaping-calibration-store.js";
 import { outputCalibrationQuery } from "./output-shaping-calibration-store.js";
 import type { OutputCalibrationResolver, PerTurnEstimatedSaved } from "./output-shaping-savings.js";
 import type { GatewayReceipt } from "./gateway/receipt.js";
-import { runAggregateLine } from "./gateway/receipt-line.js";
+import { receiptProvesPrivateFullApply, runAggregateLine } from "./gateway/receipt-line.js";
 import type { RunAggregate } from "./gateway/run-aggregate.js";
 
-const INPUT_COMPONENTS = new Set(["lcm-compaction", "deterministic-compaction"]);
+/**
+ * Fields a settled claude-stop event describes THE SAME RUN by. All must agree across every event
+ * in a candidate series, or the series is treated as describing different runs (fail closed).
+ * `apply_posture`, `output_shaping_state` and the calibration fields are deliberately EXCLUDED: they
+ * are per-call-derived and may legitimately evolve as later calls join one run (a later call may
+ * prove shaping the earlier ones did not) - only the selected LATEST event's own values are ever
+ * rendered, so an earlier event disagreeing on them is not a conflict.
+ */
+const CLAUDE_STOP_SERIES_IMMUTABLE_FIELDS = [
+  "surface",
+  "provider",
+  "workflow_id",
+  "claim_scope",
+  "evidence_level",
+  "measurement_source",
+  "run_started_at"
+] as const satisfies readonly (keyof ActivityEvent)[];
 
-function inputComponent(receipt: GatewayReceipt): boolean {
-  return receipt.applied_components?.some((component) => INPUT_COMPONENTS.has(component)) === true;
+/** The cumulative counters a settled claude-stop series must never regress on. */
+const CLAUDE_STOP_SERIES_MONOTONIC_FIELDS = ["input_before", "output_after"] as const satisfies readonly (keyof ActivityEvent)[];
+
+function canonicalTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
 
 /**
- * Resolve posture only from exact receipts. Stored authorized input reduction is full; public
- * explicit input apply remains deliberately unlabelled; otherwise positive shaping is basic.
+ * Select the ONE settled claude-stop event to render out of every event sharing one exact logical
+ * run identity (same hashed session/run pair), or `undefined` when the set cannot be proven to
+ * describe one consistent cumulative series.
+ *
+ * A single long-running Claude Code session settles more than once: the Stop hook writes a fresh
+ * whole-run snapshot on every Stop, and every snapshot after the first carries the SAME logical run
+ * identity with strictly larger cumulative counters (this is the writer's own
+ * `"monotonic delta from exact prior Claude session transcript usage"` evidence level). Failing
+ * closed whenever more than one event shares that identity therefore fails closed on every ordinary
+ * long run - only a session that happened to settle exactly once could ever render a settled line.
+ *
+ * This picks the series' LATEST event - by `recorded_at`, which the monotonic check below also
+ * proves is the maximal event on the cumulative counters - when, and only when, the whole set:
+ *  - agrees on `CLAUDE_STOP_SERIES_IMMUTABLE_FIELDS` (same run, same measurement method);
+ *  - carries a distinct, canonical `recorded_at` on every event (a tie is a conflict, not an order -
+ *    it can never be resolved by "latest" without guessing which one actually happened last); and
+ *  - is non-decreasing on `input_before` and `output_after` in that `recorded_at` order.
+ *
+ * Any violation - a backwards counter, a disagreeing `run_started_at`, a duplicate `recorded_at`, a
+ * missing counter partway through - keeps the original fail-closed behavior: `undefined`, never a
+ * guess at which event is authoritative.
+ */
+export function latestConsistentClaudeStopEvent(
+  events: readonly ActivityEvent[]
+): ActivityEvent | undefined {
+  if (events.length === 0) return undefined;
+  if (events.length === 1) return events[0];
+
+  const first = events[0];
+  const sameRunIdentity = CLAUDE_STOP_SERIES_IMMUTABLE_FIELDS.every((field) =>
+    events.every((event) => event[field] === first[field])
+  );
+  if (!sameRunIdentity) return undefined;
+
+  const sorted = [...events].sort((a, b) => {
+    const at = typeof a.recorded_at === "string" ? a.recorded_at : "";
+    const bt = typeof b.recorded_at === "string" ? b.recorded_at : "";
+    return at < bt ? -1 : at > bt ? 1 : 0;
+  });
+
+  for (let index = 0; index < sorted.length; index += 1) {
+    if (!canonicalTimestamp(sorted[index].recorded_at)) return undefined;
+    if (index === 0) continue;
+    const older = sorted[index - 1];
+    const newer = sorted[index];
+    if (newer.recorded_at === older.recorded_at) return undefined; // a tie is a conflict, not an order
+    for (const field of CLAUDE_STOP_SERIES_MONOTONIC_FIELDS) {
+      const before = older[field];
+      const after = newer[field];
+      if (typeof before !== "number" || typeof after !== "number" || after < before) return undefined;
+    }
+  }
+  return sorted[sorted.length - 1];
+}
+
+/**
+ * Resolve posture only from exact receipts. A successful stored-policy private Hybrid/LCM input
+ * reduction is full; public deterministic or explicit input apply remains deliberately unlabelled;
+ * otherwise positive shaping is basic.
  */
 export function settledRunApplyPosture(
   receipts: readonly GatewayReceipt[],
   aggregate: RunAggregate
 ): "basic" | "full" | undefined {
   const inputReduced = aggregate.input !== undefined && aggregate.input.after < aggregate.input.before;
-  const storedFull = inputReduced && receipts.some(
-    (receipt) => receipt.approval_status === "auto-applied-by-policy" && inputComponent(receipt)
-  );
+  const storedFull = inputReduced && receipts.some(receiptProvesPrivateFullApply);
   if (storedFull) return "full";
   // A measured input apply without stored authorization is either the public explicit deterministic
   // path or an older/ambiguous receipt. Both keep the exact arrow, but neither may borrow a tier label
@@ -106,7 +182,12 @@ export function settledStopLineFromActivityEvent(event: ActivityEvent): string |
       ? { outputState: event.output_estimate_state }
       : shaped
         ? { outputState: "unseeded" as const }
-        : {})
+        : {}),
+    ...(event.activity_kind === "codex-stop" &&
+    typeof event.run_started_at === "string" &&
+    typeof event.recorded_at === "string"
+      ? { activeWindow: { startedAt: event.run_started_at, endedAt: event.recorded_at } }
+      : {})
   });
   return line &&
     event.activity_kind === "claude-stop" &&

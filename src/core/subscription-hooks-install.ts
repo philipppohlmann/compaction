@@ -81,7 +81,7 @@ export function subscriptionHookEntries(tool: SubscriptionHookTool): Subscriptio
       {
         event: "Stop",
         command: codexTurnLineCommand(),
-        effect: "returns the content-free per-turn receipt line as `systemMessage` after each turn"
+        effect: "returns settled content-free receipt evidence as `systemMessage` when recorded"
       }
     ];
   }
@@ -326,7 +326,7 @@ export interface SubscriptionHookUninstallOutcome {
 /**
  * Remove ONLY Compaction's own entries for a tool, preserving every other key, event, and entry.
  *
- * This exists because `compaction init --disconnect 2|3` printed "disconnected" while the shaping hook
+ * This exists because the named Codex/Cursor disconnect path printed "disconnected" while the shaping hook
  * it had installed kept firing on every turn — the PATH shim came out, the model-visible lever stayed
  * in. Claude Code's `--disconnect 1` already removed its own shaping hook; this is the same promise for
  * the other two. Never throws, so a disconnect can report the outcome and still complete.

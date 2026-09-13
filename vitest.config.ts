@@ -1,5 +1,14 @@
 import { configDefaults, defineConfig } from "vitest/config";
 
+// These tests observe the real OS process table. Unrelated legacy Gateway fixtures
+// are correctly treated as live blockers, even when they use different temp homes.
+const processGlobalTests = [
+  "tests/core/gateway-update-identity.test.ts",
+  "tests/core/update-managed-runtime.test.ts",
+  "tests/core/update-process-inventory.test.ts",
+  "tests/core/update-installed-lifecycle.test.ts"
+];
+
 export default defineConfig({
   test: {
     // Keep vitest's default excludes (node_modules, dist, .git, .cache, …) and
@@ -36,6 +45,25 @@ export default defineConfig({
     // developer state that otherwise decide whether the suite is green: a real `~/.compaction`
     // install (whose `product_mode` authorizes gateway output shaping) and an exported `FORCE_COLOR`
     // (which makes chalk emit escapes into asserted CLI output). See the file for the full rationale.
-    setupFiles: ["tests/helpers/hermetic-env.ts"]
+    setupFiles: ["tests/helpers/hermetic-env.ts"],
+
+    // Vitest waits for every file in a lower groupOrder before starting the next
+    // project group. Keep ordinary tests parallel; only real process-global guard
+    // tests need an otherwise quiet test runner and serial execution with each other.
+    projects: [
+      {
+        extends: true,
+        test: { name: "parallel", exclude: processGlobalTests, sequence: { groupOrder: 0 } }
+      },
+      {
+        extends: true,
+        test: {
+          name: "process-global",
+          include: processGlobalTests,
+          fileParallelism: false,
+          sequence: { groupOrder: 1 }
+        }
+      }
+    ]
   }
 });

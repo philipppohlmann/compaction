@@ -27,6 +27,9 @@ import { autoWorkflowNote, resolveWorkflowForGatewayRun } from "../../core/gatew
 import { getGatewayStatus, readGatewayPid, readReceipts } from "../../core/gateway/status.js";
 import { summarizeCacheProof } from "../../core/gateway/cache-proof.js";
 import { formatFreshBilledInputReduction, type GatewayReceipt } from "../../core/gateway/receipt.js";
+import { gatewayQuiescent, gatewayReleaseMatches, queryGatewayIdentity } from "../../core/gateway/update-identity.js";
+import { defaultManagedRoot } from "../../core/update/ownership.js";
+import { resolveSessionPin } from "../../core/update/sessions.js";
 
 export type RoutedWorkflowIdentity = "codex" | "claude-code";
 
@@ -36,10 +39,10 @@ export interface RunThroughGatewayOptions {
   listen?: string;
   workflow?: string;
   /**
-   * EXPLICIT keyless Claude Code subscription route (`--subscription`; Anthropic only, default OFF).
-   * Routes `claude` through an ephemeral local gateway under the user's saved login: credential-free
+   * EXPLICIT saved-login subscription route (`--subscription`; OpenAI/Codex or Anthropic/Claude Code).
+   * Routes the exact supported tool through an ephemeral local gateway under the user's saved login: credential-free
    * (the saved-login credential rides through untouched, never read, stored, or logged), byte-safe,
-   * pinned to api.anthropic.com, fail-open. Not yet live-proven.
+   * pinned to the matching first-party upstream, and fail-open before the child starts.
    */
   subscription?: boolean;
   /** Pre-promotion internal spelling for the SAME transport; kept for compatibility, never a separate behavior. */
@@ -54,8 +57,9 @@ export interface RunThroughGatewayOptions {
   policy?: string;
 }
 
-/** The tool binaries the subscription route accepts (the Claude Code CLI itself, nothing else). */
+/** The exact tool binaries accepted by each saved-login route. */
 const CLAUDE_EXECUTABLES = new Set(["claude", "claude.exe"]);
+const CODEX_EXECUTABLES = new Set(["codex", "codex.exe"]);
 
 /** Flags under which the Claude Code CLI does NOT need an interactive terminal. */
 const CLAUDE_NON_INTERACTIVE_FLAGS = new Set(["-p", "--print", "-h", "--help", "-v", "--version"]);
@@ -125,12 +129,30 @@ export function injectionEnv(base: string, provider = "openai"): Record<string, 
  * Codex does not reliably route from `OPENAI_BASE_URL` alone. Its supported CLI configuration surface
  * is `-c key=value`, where the value is TOML. We retain the env injection for SDK compatibility and add
  * this override only when the explicitly scoped workflow actually launches a `codex` executable. No
- * user config file is read or changed, and `chatgpt_base_url` (subscription auth) is deliberately absent.
+ * user config file is read or changed. The subscription form uses a fresh custom provider whose
+ * `requires_openai_auth` setting asks Codex to attach its existing ChatGPT login to the loopback route.
  */
-export function routedCommand(parts: string[], base: string, workflow?: RoutedWorkflowIdentity): string[] {
+export function routedCommand(
+  parts: string[],
+  base: string,
+  workflow?: RoutedWorkflowIdentity,
+  subscription = false
+): string[] {
   if (workflow !== "codex" || parts.length === 0) return [...parts];
   const executable = path.basename(parts[0]).toLowerCase();
   if (executable !== "codex" && executable !== "codex.exe") return [...parts];
+  if (subscription) {
+    const provider = "compaction_subscription";
+    return [
+      parts[0],
+      "-c", `model_provider=${JSON.stringify(provider)}`,
+      "-c", `model_providers.${provider}.name=${JSON.stringify("Compaction ChatGPT subscription")}`,
+      "-c", `model_providers.${provider}.base_url=${JSON.stringify(base)}`,
+      "-c", `model_providers.${provider}.wire_api=${JSON.stringify("responses")}`,
+      "-c", `model_providers.${provider}.requires_openai_auth=true`,
+      ...parts.slice(1)
+    ];
+  }
   const openaiBaseUrl = `${base}/v1`;
   return [parts[0], "-c", `openai_base_url=${JSON.stringify(openaiBaseUrl)}`, ...parts.slice(1)];
 }
@@ -163,7 +185,7 @@ function hasProviderKey(env: NodeJS.ProcessEnv, provider = "openai"): boolean {
  * no supported local-capture/base-url route (documented vendor gap) - it stays local-estimate/activity-only.
  */
 export const ROUTE_COMMANDS = {
-  codex: 'compaction gateway run --workflow codex -- codex exec --json "<task>"',
+  codex: 'compaction gateway run --provider openai --workflow codex --subscription -- codex exec "<task>"',
   "claude-code": "compaction gateway run --provider anthropic --workflow claude-code -- claude"
 } as const;
 
@@ -213,38 +235,37 @@ export async function runThroughGateway(
   }
   if (mode === "apply" && subscriptionTransport) {
     console.error(
-      "error: --mode apply is not available with --subscription - the keyless --subscription route is " +
-        "record-only by construction (byte-safe credential passthrough); apply mode needs the API-key route. " +
-        "Drop --subscription and set your provider API key (e.g. ANTHROPIC_API_KEY), or drop --mode apply to record."
+      "error: --mode apply is not available with --subscription because the gateway-wide apply flag is not " +
+        "transported by this capability route. Use record mode; stored Community authorization is evaluated " +
+        "independently on eligible turns."
     );
     process.exitCode = 1;
     return;
   }
   if (subscriptionTransport) {
-    // The subscription route is Anthropic/Claude Code ONLY. Reject anything else with the honest reason
-    // BEFORE any gateway starts - never silently fall back to a different route.
-    if (provider !== "anthropic") {
+    if (provider !== "anthropic" && provider !== "openai") {
       console.error(
-        "error: --subscription routes Claude Code under your saved Anthropic login only (use --provider anthropic). " +
-          "A Codex/ChatGPT subscription route is vendor-blocked: Codex offers no supported way to point " +
-          "subscription traffic at a local base URL, and Compaction does not fake one."
+        "error: --subscription supports only OpenAI/Codex and Anthropic/Claude Code."
       );
       process.exitCode = 1;
       return;
     }
     const executable = path.basename(parts[0]).toLowerCase();
-    if (!CLAUDE_EXECUTABLES.has(executable)) {
+    const expected = provider === "openai" ? CODEX_EXECUTABLES : CLAUDE_EXECUTABLES;
+    const workflowForProvider: RoutedWorkflowIdentity = provider === "openai" ? "codex" : "claude-code";
+    if (!expected.has(executable)) {
       console.error(
-        `error: --subscription routes the Claude Code CLI only; '${parts[0]}' is not the claude binary. ` +
-          "Usage: compaction gateway run --provider anthropic --subscription -- claude"
+        `error: --subscription with --provider ${provider} routes the ${workflowForProvider} binary only; ` +
+          `'${parts[0]}' is not that binary.`
       );
       process.exitCode = 1;
       return;
     }
     const explicitWorkflow = options.workflow?.trim().toLowerCase();
-    if (explicitWorkflow !== undefined && explicitWorkflow !== "" && explicitWorkflow !== "auto" && explicitWorkflow !== "claude-code") {
+    if (explicitWorkflow !== undefined && explicitWorkflow !== "" && explicitWorkflow !== "auto" && explicitWorkflow !== workflowForProvider) {
       console.error(
-        `error: --subscription IS the Claude Code route; --workflow '${options.workflow}' is not compatible (only claude-code).`
+        `error: --subscription with --provider ${provider} requires workflow '${workflowForProvider}'; ` +
+          `--workflow '${options.workflow}' is not compatible.`
       );
       process.exitCode = 1;
       return;
@@ -253,15 +274,14 @@ export async function runThroughGateway(
   // Resolve only the SOURCE of the workflow identity (explicit > auto-from-connect > none). Auto applies
   // ONLY when the connected workflow's own tool binary is being launched AND the provider route matches -
   // a generic command never inherits an identity, and every apply gate downstream is unchanged.
-  // `--subscription` is itself an explicit Claude Code declaration (validated above), so it fixes the
-  // identity to claude-code - the same identity the transport requires at the server boundary.
+  // `--subscription` fixes the identity to the exact provider-supported tool validated above.
   let workflow: RoutedWorkflowIdentity | undefined;
   try {
     const resolution = resolveWorkflowForGatewayRun({
       provider,
       command: parts,
       ...(subscriptionTransport
-        ? { explicit: "claude-code" }
+        ? { explicit: provider === "openai" ? "codex" : "claude-code" }
         : options.workflow !== undefined
           ? { explicit: options.workflow }
           : {})
@@ -277,13 +297,14 @@ export async function runThroughGateway(
     return;
   }
   // Backstop rails (unreachable via the validated public path above, kept fail-closed on purpose).
-  if (subscriptionTransport && (workflow !== "claude-code" || provider !== "anthropic")) {
-    console.error("error: the Claude subscription route requires --provider anthropic and the claude-code workflow.");
+  if (subscriptionTransport &&
+      !((workflow === "claude-code" && provider === "anthropic") || (workflow === "codex" && provider === "openai"))) {
+    console.error("error: the subscription route requires a matching OpenAI/Codex or Anthropic/Claude Code workflow.");
     process.exitCode = 1;
     return;
   }
   if (subscriptionTransport && options.upstream !== undefined) {
-    console.error("error: the Claude subscription route pins the Anthropic upstream (api.anthropic.com); --upstream is not accepted.");
+    console.error("error: the subscription route pins its provider upstream; --upstream is not accepted.");
     process.exitCode = 1;
     return;
   }
@@ -309,13 +330,21 @@ export async function runThroughGateway(
     return;
   }
 
-  // Generic/custom commands retain legacy reuse behavior. Explicit workflow routes require an exact,
+  const sessionToken = process.env.COMPACTION_SESSION_PIN;
+  const sessionPair = sessionToken ? resolveSessionPin(defaultManagedRoot(), sessionToken) : undefined;
+  if (sessionToken && !sessionPair) {
+    console.error("error: managed Gateway session pin is invalid or no longer active.");
+    process.exitCode = 1;
+    return;
+  }
+  // Generic/custom commands retain their route checks. Explicit workflow routes require an exact,
   // content-free identity match so stored authorization cannot silently widen across routes.
   const status = await getGatewayStatus(cwd);
   let base: string;
   let ownGateway: { close: () => Promise<void> } | null = null;
   const routeCapability = subscriptionTransport ? randomBytes(32).toString("base64url") : undefined;
-  if (!subscriptionTransport && status.running && status.base) {
+  let reuse = !subscriptionTransport && status.running && !!status.base;
+  if (reuse) {
     if (workflow) {
       // Reuse compatibility needs the private persisted upstream, but public GatewayStatus deliberately
       // omits it because URLs may contain userinfo or query credentials.
@@ -333,7 +362,9 @@ export async function runThroughGateway(
       if (!sameProcess || !sameWorkflow || !sameProvider || !sameUpstream) {
         console.error(
           `error: the gateway already running at ${status.base} does not match the requested workflow/provider/upstream for '${workflow}'. ` +
-            "Run 'compaction gateway stop' and retry; Compaction will start a correctly scoped gateway."
+            "Run 'compaction gateway stop' and retry; Compaction will start a correctly scoped gateway. " +
+              "(That stops this project's gateway only - it never touches the transparent-routing endpoint a " +
+              "connected Claude Code session is using.)"
         );
         process.exitCode = 1;
         return;
@@ -343,12 +374,30 @@ export async function runThroughGateway(
     if (mode === "apply" && status.mode !== "apply") {
       console.error(
         `error: --mode apply was requested, but the gateway already running at ${status.base} is in '${status.mode ?? "unknown"}' mode. ` +
-          "Run 'compaction gateway stop' and retry (Compaction will start an apply-mode gateway), or drop --mode apply to use it as-is."
+          "Run 'compaction gateway stop' and retry (Compaction will start an apply-mode gateway), or drop --mode apply to use it as-is. " +
+            "(That stops this project's gateway only - it never touches the transparent-routing endpoint a connected Claude Code session is using.)"
       );
       process.exitCode = 1;
       return;
     }
-    base = status.base;
+    if (!gatewayReleaseMatches(status.releaseIdentity, sessionPair?.id)) {
+      const persisted = readGatewayPid(cwd);
+      const identity = persisted && persisted.pid === status.pid ? await queryGatewayIdentity(persisted) : undefined;
+      if (!identity || !gatewayQuiescent(identity)) {
+        console.error("error: running Gateway release is unverified or has active/unsettled work; replacement deferred.");
+        process.exitCode = 1;
+        return;
+      }
+      if (!(await queryGatewayIdentity(persisted!, true))?.draining) {
+        console.error("error: running Gateway could not safely drain; replacement deferred.");
+        process.exitCode = 1;
+        return;
+      }
+      reuse = false;
+    }
+  }
+  if (reuse) {
+    base = status.base!;
     console.error(`${label}: reusing the running gateway at ${base}${mode === "apply" ? " (apply mode, as requested)" : ""}`);
     // Honest note: a default (record) run that reuses a gateway the user explicitly started in a mutating
     // mode says so plainly (it does not silently change that mode).
@@ -369,7 +418,8 @@ export async function runThroughGateway(
         cwd,
         installSignals: false,
         persistLifecycle: false,
-        ...(routeCapability ? { claudeSubscription: { capability: routeCapability } } : {}),
+        ...(routeCapability && provider === "anthropic" ? { claudeSubscription: { capability: routeCapability } } : {}),
+        ...(routeCapability && provider === "openai" ? { codexSubscription: { capability: routeCapability } } : {}),
         log: () => {}
       });
       base = g.base;
@@ -378,12 +428,16 @@ export async function runThroughGateway(
         mode === "apply"
           ? `${label}: started a local gateway at ${base} (APPLY mode - EXPERIMENTAL; policy ${options.policy}; deterministic, known-safe shapes only; ` +
               `unknown shapes fail closed; originals retained - 'compaction gateway recover <id>'; content-free receipts${workflow ? `; workflow ${workflow}` : ""})`
+          : subscriptionTransport
+            ? `${label}: started a local gateway at ${base} (subscription transport; credential and response-stream transit is byte-safe; ` +
+              `stored Community authorization may evaluate and apply input optimization; content-free receipts${workflow ? `; workflow ${workflow}` : ""})`
           : `${label}: started a local gateway at ${base} (record mode; byte-safe; content-free receipts${workflow ? `; workflow ${workflow}` : ""})`
       );
     } catch (err) {
       if (subscriptionTransport) {
+        const toolName = provider === "anthropic" ? "Claude Code" : "Codex";
         console.error(
-          `${label}: local subscription route could not start; running the original Claude Code command unchanged - ${(err as Error).message}`
+          `${label}: local subscription route could not start; running the original ${toolName} command unchanged - ${(err as Error).message}`
         );
         const fallbackCode = await runChildCommand(parts, process.env, cwd, label);
         process.exit(fallbackCode);
@@ -395,14 +449,19 @@ export async function runThroughGateway(
     }
   }
 
-  const childBase = routeCapability ? `${base}/__compaction/claude/${routeCapability}` : base;
-  const injected = injectionEnv(childBase, provider);
+  const childBase = routeCapability
+    ? provider === "openai"
+      ? `${base}/__compaction/codex/${routeCapability}/backend-api/codex`
+      : `${base}/__compaction/claude/${routeCapability}`
+    : base;
+  const injected = subscriptionTransport && provider === "openai" ? {} : injectionEnv(childBase, provider);
   const childEnv = { ...process.env, ...injected };
   if (subscriptionTransport) {
     console.error(
-      `${label}: routing Claude Code through an ephemeral local subscription route under your saved login ` +
+      `${label}: routing ${workflow === "codex" ? "Codex" : "Claude Code"} through an ephemeral local subscription route under your saved login ` +
         "(credential-free: your login credential rides through untouched - never read, stored, or logged; " +
-        "byte-safe; pinned to api.anthropic.com; fail-open)"
+        "credential and response-stream transit is byte-safe; stored Community authorization may evaluate and apply input optimization; " +
+        `pinned to ${provider === "openai" ? "chatgpt.com" : "api.anthropic.com"}; fail-open)`
     );
   } else {
     const routeLine = Object.entries(injected)
@@ -417,7 +476,7 @@ export async function runThroughGateway(
   // Snapshot receipts so we can report ONLY the traffic observed during this run (content-free).
   const before = new Set(readReceipts(cwd).map((r) => r.receipt_id));
 
-  const routedParts = routedCommand(parts, base, workflow);
+  const routedParts = routedCommand(parts, childBase, workflow, subscriptionTransport);
   let code = 127;
   try {
     code = await runChildCommand(routedParts, childEnv, cwd, label);
@@ -477,7 +536,7 @@ export function registerDevCommand(program: Command): void {
     .option("--workflow <tool>", "Routed workflow identity: codex | claude-code | auto | none. Omitted (or `auto`): defaults ONLY when the launched command is the connected workflow's own tool binary on its matching provider route; `none` disables; an explicit tool always wins.")
     .option(
       "--subscription",
-      "EXPLICIT keyless Claude Code route under your saved login (Anthropic only) - same flag as 'gateway run --subscription'."
+      "EXPLICIT saved-login route for OpenAI/Codex or Anthropic/Claude Code - same flag as 'gateway run --subscription'."
     )
     .argument("[command...]", "The command to run through the gateway (after --), e.g. -- npm run dev")
     .allowUnknownOption(true)

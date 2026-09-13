@@ -7,6 +7,7 @@ import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import type { OpenAiUsageBreakdown } from "../../src/core/gateway/openai-usage.js";
 import type { ApplyActivation } from "../../src/core/gateway/apply-activation.js";
 import type { DedupePlan } from "../../src/core/gateway/request-shape.js";
+import { LCM_APPLY_POLICY } from "../../src/core/gateway/lcm-apply-policy-name.js";
 
 /**
  * THE README'S PER-TURN EXAMPLES ARE PINNED TO THE RENDERER THAT PRODUCES THEM.
@@ -50,8 +51,8 @@ const MODEL = "claude-sonnet-4-6";
 const activation: ApplyActivation = {
   mode: "apply",
   requested: true,
-  activation: "explicit-mode",
-  policy: "deterministic-dedupe"
+  activation: "stored-authorization",
+  policy: LCM_APPLY_POLICY
 };
 
 const plan: DedupePlan = {
@@ -74,7 +75,7 @@ const plan: DedupePlan = {
  * would advertise an allowance no Community account is granted.
  *
  * The METER the grant is denominated in moved to `optimized-input-v2` (tokens removed, not tokens
- * inspected); the GRANT NUMBER did not, and re-denominating it is a founder pricing decision, not a
+ * inspected); the GRANT NUMBER did not, and re-denominating it is a product pricing decision, not a
  * units edit (`docs/product/commercial-boundary-v1.md` §1.2, amended 2026-09-02). This example stays
  * pinned to what the runtime actually grants today.
  */
@@ -101,8 +102,11 @@ function applyReceipt(route: "api-key" | "subscription"): GatewayReceipt {
     activation,
     plan,
     applied: true,
+    appliedComponents: ["lcm-compaction"],
+    composedInputEstimate: { before: INPUT_BEFORE, after: INPUT_AFTER },
     upstreamRouteType: route,
     allowanceSnapshot,
+    authorizationId: "pref-1234567890abcdef12345678",
     id: () => RECEIPT_ID,
     now: () => "2026-08-31T00:00:00.000Z"
   });

@@ -4,6 +4,8 @@ import {
   receiptLineFromGatewayReceipt,
   receiptLineOutputOnly,
   communityFullApplyReceiptLine,
+  nonApplyReceiptLine,
+  receiptCeiling,
   isReceiptLineEnabled,
   RECEIPT_LINE_ENV,
   CALIBRATED_ESTIMATE_MARKER
@@ -475,7 +477,7 @@ describe("output-arrow PROVENANCE: a default prior renders no per-run figure at 
   });
 
   /**
-   * The founder rule, stated as a comparison: with the SAME magnitude handed in, a measured device
+   * The evidence rule, stated as a comparison: with the SAME magnitude handed in, a measured device
    * shows a figure and an unmeasured one shows none. It is the EVIDENCE that decides, not the number.
    */
   it("same magnitude, different evidence: measured renders a figure, the prior renders none", () => {
@@ -666,7 +668,7 @@ describe("communityFullApplyReceiptLine - DEFINED but emitted ONLY on a real ful
     reductionPercent: 47
   };
 
-  it("a REAL apply receipt → `input B→A (−PP%) · output N · full apply · id`", () => {
+  it("a stored-authorized private LCM reduction → `input B→A (−PP%) · output N · full apply · id`", () => {
     const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens: 286, model: "gpt-4o" };
     const receipt = buildApplyReceipt({
       provider: "openai",
@@ -679,11 +681,207 @@ describe("communityFullApplyReceiptLine - DEFINED but emitted ONLY on a real ful
       id: fixedId,
       now: fixedNow
     });
-    const line = communityFullApplyReceiptLine(receipt);
+    const line = communityFullApplyReceiptLine({
+      ...receipt,
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      applied_components: ["lcm-compaction"]
+    });
     expect(line).toContain("input 41,210→21,876 (−47%)");
     expect(line).toContain("output 286");
     expect(line).toContain("full apply");
     expect(line).toContain("id 8f4c2f6e");
+  });
+
+  it("a deterministic-only input reduction keeps its evidence but never acquires private Full posture", () => {
+    const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens: 286, model: "gpt-4o" };
+    const receipt = buildApplyReceipt({
+      provider: "openai",
+      endpoint: "/v1/chat/completions",
+      upstreamStatus: 200,
+      usage,
+      activation: applyActivation,
+      plan,
+      applied: true,
+      id: fixedId,
+      now: fixedNow
+    });
+    const deterministicOnly = {
+      ...receipt,
+      approval_status: "auto-applied-by-policy",
+      applied_components: ["deterministic-compaction"]
+    } as GatewayReceipt;
+    expect(deterministicOnly.estimated_input_tokens_after).toBeLessThan(deterministicOnly.estimated_input_tokens_before ?? 0);
+    expect(communityFullApplyReceiptLine(deterministicOnly)).toBeUndefined();
+  });
+
+  it("a shaping-only failed request is never private Full evidence", () => {
+    const usage: OpenAiUsageBreakdown = { present: false };
+    const base = buildGatewayReceipt({
+      provider: "anthropic",
+      endpoint: "/v1/messages",
+      mode: "record",
+      upstreamStatus: 429,
+      usage,
+      id: fixedId,
+      now: fixedNow
+    });
+    const receipt = {
+      ...base,
+      mode: "apply",
+      upstream_status: 429,
+      request_mutated: true,
+      estimated_input_tokens_before: 1,
+      estimated_input_tokens_after: 107,
+      approval_status: "auto-applied-by-policy",
+      applied_components: ["output-shaping"]
+    } as GatewayReceipt;
+    expect(communityFullApplyReceiptLine(receipt)).toBeUndefined();
+  });
+
+  it("private LCM provenance without a valid stored authorization id is never Full", () => {
+    const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens: 286, model: "gpt-4o" };
+    const receipt = buildApplyReceipt({
+      provider: "openai",
+      endpoint: "/v1/chat/completions",
+      upstreamStatus: 200,
+      usage,
+      activation: applyActivation,
+      plan,
+      applied: true,
+      id: fixedId,
+      now: fixedNow
+    });
+    for (const authorizationId of [undefined, "", "pref-not-hex"]) {
+      expect(communityFullApplyReceiptLine({
+        ...receipt,
+        approval_status: "auto-applied-by-policy",
+        authorization_id: authorizationId,
+        applied_components: ["lcm-compaction"]
+      })).toBeUndefined();
+    }
+  });
+
+  it("malformed component storage fails closed without throwing", () => {
+    const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens: 286, model: "gpt-4o" };
+    const receipt = buildApplyReceipt({
+      provider: "openai",
+      endpoint: "/v1/chat/completions",
+      upstreamStatus: 200,
+      usage,
+      activation: applyActivation,
+      plan,
+      applied: true,
+      id: fixedId,
+      now: fixedNow
+    });
+    for (const malformedFields of [
+      { applied_components: "lcm-compaction" },
+      { applied_components: { 0: "lcm-compaction" } },
+      { applied_components: ["lcm-compaction"], tokens: "not-a-token-object" }
+    ]) {
+      const malformed = {
+        ...receipt,
+        approval_status: "auto-applied-by-policy",
+        authorization_id: "pref-1234567890abcdef12345678",
+        ...malformedFields
+      } as unknown as Parameters<typeof communityFullApplyReceiptLine>[0];
+      expect(() => communityFullApplyReceiptLine(malformed)).not.toThrow();
+      expect(communityFullApplyReceiptLine(malformed)).toBeUndefined();
+      expect(() => receiptLineFromGatewayReceipt(malformed)).not.toThrow();
+      expect(receiptLineFromGatewayReceipt(malformed)).not.toContain("full apply");
+      expect(() => receiptCeiling({
+        ...malformed,
+        allowance_pause: { reason: "insufficient" }
+      }, {})).not.toThrow();
+    }
+  });
+
+  it("malformed persisted token storage never throws or renders an invalid provider count", () => {
+    const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens: 286, model: "gpt-4o" };
+    const receipt = buildApplyReceipt({
+      provider: "openai",
+      endpoint: "/v1/chat/completions",
+      upstreamStatus: 200,
+      usage,
+      activation: applyActivation,
+      plan,
+      applied: true,
+      id: fixedId,
+      now: fixedNow
+    });
+    const full = {
+      ...receipt,
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      applied_components: ["lcm-compaction"]
+    };
+
+    for (const tokens of [
+      null,
+      "not-a-token-object",
+      { prompt_input: 50, output: "999" },
+      { prompt_input: 50, output: -3 },
+      { prompt_input: 50, output: 1.8 }
+    ]) {
+      const malformed = { ...full, tokens } as unknown as GatewayReceipt;
+      expect(() => receiptLineFromGatewayReceipt(malformed)).not.toThrow();
+      expect(() => nonApplyReceiptLine(malformed)).not.toThrow();
+      expect(() => communityFullApplyReceiptLine(malformed)).not.toThrow();
+      const lines = [
+        receiptLineFromGatewayReceipt(malformed),
+        nonApplyReceiptLine(malformed),
+        communityFullApplyReceiptLine(malformed)
+      ].filter((line): line is string => line !== undefined);
+      expect(lines.join("\n")).not.toMatch(/output (?:999|[-−]3|1(?:\.8)?)(?:\D|$)/);
+    }
+  });
+
+  it("a persisted string status cannot be coerced into successful private Full evidence", () => {
+    const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens: 286, model: "gpt-4o" };
+    const receipt = buildApplyReceipt({
+      provider: "openai",
+      endpoint: "/v1/chat/completions",
+      upstreamStatus: 200,
+      usage,
+      activation: applyActivation,
+      plan,
+      applied: true,
+      id: fixedId,
+      now: fixedNow
+    });
+    const malformed = {
+      ...receipt,
+      upstream_status: "200",
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      applied_components: ["lcm-compaction"]
+    } as unknown as Parameters<typeof communityFullApplyReceiptLine>[0];
+    expect(communityFullApplyReceiptLine(malformed)).toBeUndefined();
+  });
+
+  it("negative input estimates cannot prove a private Full reduction", () => {
+    const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens: 286, model: "gpt-4o" };
+    const receipt = buildApplyReceipt({
+      provider: "openai",
+      endpoint: "/v1/chat/completions",
+      upstreamStatus: 200,
+      usage,
+      activation: applyActivation,
+      plan,
+      applied: true,
+      id: fixedId,
+      now: fixedNow
+    });
+    const malformed = {
+      ...receipt,
+      estimated_input_tokens_before: -1,
+      estimated_input_tokens_after: -2,
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      applied_components: ["lcm-compaction"]
+    } as Parameters<typeof communityFullApplyReceiptLine>[0];
+    expect(communityFullApplyReceiptLine(malformed)).toBeUndefined();
   });
 
   it("a RECORD receipt (no real apply) → undefined (full apply is never synthesized on an Open/record line)", () => {
@@ -766,7 +964,12 @@ describe("communityFullApplyReceiptLine - healthy allowance countdown", () => {
       ...(allowanceSnapshot ? { allowanceSnapshot } : {}),
       ...extra
     });
-    return communityFullApplyReceiptLine(receipt);
+    return communityFullApplyReceiptLine({
+      ...receipt,
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      applied_components: ["lcm-compaction"]
+    });
   }
 
   it("renders `REMAINING/TOTAL left` on a healthy metered turn", () => {
@@ -887,6 +1090,9 @@ describe("input savings axis: only when an input-compaction component actually r
     model: "claude-haiku-4-5-20251001",
     endpoint: "/v1/messages",
     mode: "apply",
+    upstream_status: 200,
+    approval_status: "auto-applied-by-policy",
+    authorization_id: "pref-1234567890abcdef12345678",
     policy: "deterministic-dedupe",
     tokens: { prompt_input: 1001, output: 47 }
   };
@@ -911,7 +1117,8 @@ describe("input savings axis: only when an input-compaction component actually r
       estimated_input_tokens_before: 1_500,
       estimated_input_tokens_after: 1_600
     });
-    for (const line of bothLines(r)) {
+    expect(communityFullApplyReceiptLine(r)).toBeUndefined();
+    for (const line of [receiptLineFromGatewayReceipt(r) ?? ""]) {
       expect(hasInputAxis(line), line).toBe(false);
       expect(line).not.toContain("1,500");
       expect(line).not.toContain("1,600");
@@ -940,7 +1147,8 @@ describe("input savings axis: only when an input-compaction component actually r
       estimated_input_tokens_before: 41_210,
       estimated_input_tokens_after: 21_876
     });
-    for (const line of bothLines(r)) {
+    expect(communityFullApplyReceiptLine(r)).toBeUndefined();
+    for (const line of [receiptLineFromGatewayReceipt(r) ?? ""]) {
       expect(line).toContain("input 41,210→21,876 (−47%)");
     }
   });
@@ -960,18 +1168,34 @@ describe("input savings axis: only when an input-compaction component actually r
     expect(line).not.toContain("21,876");
   });
 
-  it("A REAL INPUT APPLY THAT REDUCED NOTHING KEEPS ITS AXIS — a truthful zero is not the defect", () => {
-    // The rule is component-based rather than arithmetic precisely so this survives: a compaction pass
-    // that ran and legitimately found nothing to remove measured −0%, and that is a real measurement of a
-    // real apply. Suppressing it would hide a capability that ran, which is the opposite failure.
+  it("record mode cannot claim a measured apply axis even if malformed storage says it mutated", () => {
+    const r = receipt({
+      mode: "record",
+      request_mutated: true,
+      applied_components: ["lcm-compaction"],
+      estimated_input_tokens_before: 100,
+      estimated_input_tokens_after: 80
+    });
+    expect(communityFullApplyReceiptLine(r)).toBeUndefined();
+    const line = receiptLineFromGatewayReceipt(r) ?? "";
+    expect(line).toContain("input 1,001");
+    expect(line).not.toContain("→");
+  });
+
+  it("a deterministic pass that reduced nothing keeps its counts but claims no reduction or private Full posture", () => {
+    // A component may run and legitimately find nothing to remove. The receipt remains evidence of
+    // that component outcome, but a visible before→after arrow is reserved for a strict net reduction;
+    // otherwise `−0%` reads as a savings claim while saying no saving occurred.
     const r = receipt({
       request_mutated: true,
       applied_components: ["deterministic-compaction"],
       estimated_input_tokens_before: 41_210,
       estimated_input_tokens_after: 41_210
     });
-    for (const line of bothLines(r)) {
-      expect(line).toContain("input 41,210→41,210 (−0%)");
+    expect(communityFullApplyReceiptLine(r)).toBeUndefined();
+    for (const line of [receiptLineFromGatewayReceipt(r) ?? ""]) {
+      expect(line).toContain("input 1,001");
+      expect(line).not.toContain("→");
     }
   });
 
@@ -985,8 +1209,8 @@ describe("input savings axis: only when an input-compaction component actually r
       estimated_input_tokens_after: 75_883,
       allowance_pause: { reason: "insufficient", resets_on: "2026-09-01", scope: "all-routes" }
     });
+    expect(communityFullApplyReceiptLine(r)).toBeUndefined();
     for (const line of [
-      communityFullApplyReceiptLine(r, undefined, { reason: "insufficient", resetsOn: "2026-09-01", scope: "all-routes" }) ?? "",
       receiptLineFromGatewayReceipt(r, undefined, undefined, undefined, {
         reason: "insufficient",
         resetsOn: "2026-09-01",

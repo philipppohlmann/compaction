@@ -1,6 +1,18 @@
 {
   "name": "@compaction/cli",
   "version": "0.6.8",
+  "compactionRelease": {
+    "cliVersion": "0.6.8",
+    "launcherProtocol": 1,
+    "integrationProtocol": 1,
+    "gatewayProtocol": 1,
+    "controlPlaneProtocol": 1,
+    "engineProtocol": 1,
+    "minEngineVersion": "0.0.0",
+    "maxEngineVersion": "1.0.0",
+    "usageSchemaVersion": 3,
+    "meterVersion": "optimized-input-v2"
+  },
   "publishConfig": {
     "access": "public"
   },
@@ -23,7 +35,6 @@
     "dist",
     "!dist/engine/**",
     "!dist/examples/**",
-    "!dist/cli/onboarding-prototype/**",
     "!dist/**/*.js.map",
     "!dist/core/adapter-audit.*",
     "!dist/core/pilot-audit.*",
@@ -37,6 +48,7 @@
     "!dist/core/context-store-sufficiency.*",
     "!dist/core/gateway/apply-policy.*",
     "!dist/core/gateway/apply-composition.*",
+    "!dist/core/gateway/lcm-qualified-classes.*",
     "!dist/core/billing-delta/**",
     "!dist/cli/commands/billing-delta.*",
     "!dist/cli/commands/dev-lease.*",

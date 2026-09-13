@@ -1,16 +1,8 @@
 # Compaction terminal mark — derived rendering of the brand SVG
 
-Status: shipped (renderer + CLI top-level help banner). README hero block below is a
-DRAFT for the future public README (consumed by a later cycle under its own
-public-claims gate — publishing it is NOT authorized by this doc).
+Status: shipped (renderer + CLI top-level help banner).
 
 ## The rule
-
-**The canonical mark is `apps/web/src/assets/compaction-mark.svg` and its geometry is
-unchanged by anything in this document.** The terminal mark is a *derived rendering*
-of that geometry into character cells — the same relationship a favicon has to the
-master SVG. If the SVG ever changes, the terminal mark is re-derived from it; the
-terminal mark is never edited into a second, diverging logo.
 
 Canonical string source for the terminal rendering:
 `scripts/render-terminal-logo.mjs` (zero-dependency, deterministic). The packaged CLI
@@ -84,9 +76,7 @@ Render with `node scripts/render-terminal-logo.mjs --variant compact|expanded
 ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 ```
 
-Bars 16/10/16 columns, middle inset 3 — the exact SVG widths. The lowercase
-`compaction` wordmark sits on the center-band line (the lockup mirrors
-`apps/web/src/components/site/Wordmark.tsx`: mark + lowercase name).
+Bars 16/10/16 columns, middle inset 3 — the exact SVG widths.
 
 ### Expanded (README hero / docs)
 
@@ -129,29 +119,3 @@ Degradation rules (all implemented in the renderer / CLI helper):
 | --- | --- | --- | --- |
 | CLI top-level help (`compaction --help`, bare `compaction`) | compact | TTY-only | shipped — `program.addHelpText("before", …)` in `src/cli/index.ts`; three lines above `Usage:`; no exit-code or command-output changes; subcommand help and `--version` untouched |
 | `compaction init` TUI hero | (unchanged) | — | the existing figlet COMPACTION wordmark (`src/cli/onboarding/wordmark.ts`) remains the init hero; the compact mark does not replace it |
-| README hero (public) | expanded | none (fenced block) | DRAFT below — publishing is a public-claims human gate for a later cycle |
-| Install-script success output (`scripts/install.sh`) | compact | plain (sh has no renderer) | proposed, not wired — paste the 3 plain lines as a heredoc when install-script UX is next touched |
-| Docs / website terminal mocks | either | per surface | available via the renderer; website keeps using the SVG itself where images are possible |
-
-## README hero draft (for the future public README — DRAFT, not published)
-
-The one-line promise below is the approved line; no other copy is authorized by this
-doc.
-
-````markdown
-```text
-╭──────────────────────────────╮
-│                              │
-│       ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀       │
-│                              │
-│          ▀▀▀▀▀▀▀▀▀▀          │
-│                              │
-│       ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀       │
-│                              │
-╰──────────────────────────────╯
-
-           compaction
-```
-
-Reduce wasted context in AI coding workflows.
-````

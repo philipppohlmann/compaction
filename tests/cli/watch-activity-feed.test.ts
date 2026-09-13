@@ -120,11 +120,12 @@ describe("watch --once surfaces local activity records for the non-gateway surfa
     }
   });
 
-  it("the empty state names the MEASURABLE forms, not 'a Cursor/Codex session'", async () => {
+  it("the empty state names Codex's normal route and Cursor's measurable form without inferring evidence", async () => {
     const lines: string[] = [];
     await runWatchOnce({ once: true }, { cwd: dir, env: cleanEnv as NodeJS.ProcessEnv, print: (l) => lines.push(l) });
     const text = lines.join("\n");
-    expect(text).toContain("codex exec --json");
+    expect(text).toContain("Normal Codex invocations route through the local Gateway once connected");
+    expect(text).toContain("requests without it are not inferred as measured");
     expect(text).toContain("cursor-agent … --output-format json");
     expect(text).toContain("exact Gateway-backed Claude Stop");
     expect(text).toContain("positively reconciled hook-only Claude task-notification continuation");

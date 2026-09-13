@@ -72,7 +72,7 @@ export interface ClaudeSettings {
  * `echo compaction capture claude-code --from-hook >> /tmp/mylog` or
  * `my-wrapper compaction capture claude-code --from-hook`. That breaks the module's promise in both
  * directions: install/connect would SKIP (believing ours is already present, so measurement never
- * starts), and uninstall — the path `compaction hooks uninstall` and `init --disconnect 1` run —
+ * starts), and uninstall — the path `compaction hooks uninstall` and `init --disconnect claude-code` run —
  * would DELETE the user's own entry while claiming to remove only Compaction's.
  *
  * Install writes only the canonical constant below — callers cannot supply a command of their own —

@@ -15,10 +15,11 @@
  *    the report never fails the command (it is a report, not a gate).
  *  - HONEST LABELS: routing/receipts are fixture-tested in CI; live provider cache proof is key-gated
  *    and operator-run; nothing here is billing-confirmed; Cursor is measure-only (vendor gap); LCM is
- *    shadow-only; subscription routing is available ONLY as the explicit `--subscription` opt-in
- *    (keyless; credential-free; not yet live-proven, never auto-enabled).
+ *    shadow-only; a connected Codex shim routes normally under the existing ChatGPT login, while explicit
+ *    `--subscription` routes remain available. Evidence is reported only from observed artifacts.
  */
 import { existsSync, accessSync, constants as fsConstants, readFileSync } from "node:fs";
+import { claudeSettingsReadPaths } from "../../core/claude-code-connect.js";
 import { homedir } from "node:os";
 import path from "node:path";
 import { defaultProjectsDir, discoverClaudeCodeSessions } from "../../core/adapters/claude-code-discovery.js";
@@ -147,7 +148,7 @@ export interface ReadinessReport {
     ANTHROPIC_API_KEY: Presence;
     OPENAI_API_KEY: Presence;
     /** Availability label only, never a credential and never a live-proven claim. */
-    subscriptionRouting: "available-explicit-opt-in";
+    subscriptionRouting: "codex-normal-shim-plus-explicit";
   };
   optimizationMode: OptimizationModePreference;
   connectedWorkflows: string[];
@@ -181,7 +182,9 @@ function reportHome(env: NodeJS.ProcessEnv): string {
  * they answer three questions about the same two files.
  */
 function claudeSettingsPaths(cwd: string, env: NodeJS.ProcessEnv): readonly string[] {
-  return [path.join(cwd, ".claude", "settings.json"), path.join(reportHome(env), ".claude", "settings.json")];
+  // ONE resolver, shared with every write path, so readiness can never look somewhere the installer
+  // does not write. Order is Claude Code's own precedence: project-local, project, then user.
+  return claudeSettingsReadPaths(cwd, env);
 }
 
 /**
@@ -502,7 +505,7 @@ export async function collectReadinessReport(
     credentials: {
       ANTHROPIC_API_KEY: presence(env, "ANTHROPIC_API_KEY"),
       OPENAI_API_KEY: presence(env, "OPENAI_API_KEY"),
-      subscriptionRouting: "available-explicit-opt-in"
+      subscriptionRouting: "codex-normal-shim-plus-explicit"
     },
     optimizationMode,
     connectedWorkflows,
@@ -539,7 +542,7 @@ function deriveNextCommands(r: ReadinessReport): string[] {
   const codexConnected = r.tools.codex.shim === "active" || r.connectedWorkflows.includes("codex");
 
   if (!claudeConnected && !codexConnected) {
-    commands.push("compaction init --connect detected   # connect the tools found on this machine (reversible)");
+    commands.push("compaction init --connect all   # connect the tools found on this machine (reversible)");
   }
   if (claudeConnected) {
     if (r.credentials.ANTHROPIC_API_KEY === "unset") {
@@ -551,12 +554,9 @@ function deriveNextCommands(r: ReadinessReport): string[] {
     );
   }
   if (codexConnected) {
-    if (r.credentials.OPENAI_API_KEY === "unset") {
-      commands.push("export OPENAI_API_KEY=<your key>   # required for the Codex API-key route; Compaction never stores it");
-    }
     commands.push(
       r.tools.codex.shim === "active"
-        ? 'codex exec --json "<task>"   # measured automatically via the connected shim'
+        ? 'codex exec --json "<task>"   # routed automatically via the connected shim; inspect only observed evidence'
         : 'compaction gateway run -- codex exec --json "<task>"   # route a real Codex run (workflow auto-selected)'
     );
   }
@@ -722,7 +722,7 @@ export function renderReadinessReport(r: ReadinessReport): string {
       s.binaryFound ? "found" : "not found"
     }`;
   lines.push(`  Codex         ${shimLabel(r.tools.codex)}`);
-  lines.push(`  Cursor        ${shimLabel(r.tools.cursor)}   (measure-only - no provider route; vendor gap)`);
+  lines.push(`  Cursor        ${shimLabel(r.tools.cursor)}   (measure-only - no verified Compaction provider route)`);
   lines.push("");
   lines.push("Gateway");
   if (r.gateway.running) {
@@ -744,7 +744,7 @@ export function renderReadinessReport(r: ReadinessReport): string {
   lines.push(`  ANTHROPIC_API_KEY: ${r.credentials.ANTHROPIC_API_KEY.toUpperCase()}   (Claude Code API-key route)`);
   lines.push(`  OPENAI_API_KEY:    ${r.credentials.OPENAI_API_KEY.toUpperCase()}   (Codex API-key route)`);
   lines.push(
-    "  subscription routing: available (explicit --subscription; keyless; credential-free; not yet live-proven)"
+    "  subscription routing: Codex normal shim route plus explicit --subscription routes (keyless; credential-free; evidence only when recorded)"
   );
   lines.push("    compaction gateway run --provider anthropic --subscription -- claude   # route Claude Code under your saved login - no API key");
   lines.push("");
@@ -758,12 +758,12 @@ export function renderReadinessReport(r: ReadinessReport): string {
   lines.push("");
   lines.push("What routes vs what only measures");
   lines.push("  claude-code   ROUTABLE - API-key path through the local gateway (provider-reported receipts)");
-  lines.push("  codex         ROUTABLE - API-key path (shim or gateway run; provider-reported receipts)");
-  lines.push("  cursor        measure-only - no provider route (vendor gap); local-estimate tokens only");
+  lines.push("  codex         ROUTABLE - normal connected shim under your existing ChatGPT login; user routes/API key auth pass through untouched; evidence only when recorded");
+  lines.push("  cursor        measure-only - no verified Compaction provider route; local-estimate tokens only");
   lines.push("  LCM           shadow-only - never model-visible");
   lines.push("");
   lines.push("Routing & apply boundary (the honest detail behind the concise enable screen)");
-  lines.push("  plan-auth is the default: run your workflows with your existing subscription; No API key needed. Compaction records content-free usage.");
+  lines.push("  plan-auth is the default: run your workflows with your existing subscription; No API key needed. Only observed content-free evidence is reported.");
   // State-aware, because this section used to assert a flat record-only boundary while the Claude Code
   // shaping hook was installed and attaching an instruction to every shapeable turn (F65). Input axis and
   // output axis are reported separately and never collapsed.
@@ -773,7 +773,7 @@ export function renderReadinessReport(r: ReadinessReport): string {
   const codexApproval = codexApprovalLine(r);
   if (codexApproval !== undefined) lines.push(codexApproval);
   lines.push("  No semantic-preservation claim.");
-  lines.push("  keyless subscription route (explicit opt-in, never automatic; credential-free; not yet live-proven):");
+  lines.push("  keyless subscription routing: Codex routes normally when its connected shim is active; explicit routes remain available; evidence only when recorded:");
   lines.push("    compaction gateway run --provider anthropic --subscription -- claude");
   lines.push("  Optional (Advanced) - provider cache proof: route through the Gateway, then verify-cache (uses your provider API key; never stored):");
   lines.push(
@@ -788,7 +788,7 @@ export function renderReadinessReport(r: ReadinessReport): string {
   for (const c of r.nextCommands) lines.push(`  ${c}`);
   lines.push("");
   lines.push("Evidence labels (honest):");
-  lines.push("  - routing + receipts: fixture-tested in CI; live provider traffic requires YOUR key (key-gated).");
+  lines.push("  - routing is fixture-tested in CI; live cache proof remains key-gated; receipt and usage claims require an observed settled artifact.");
   lines.push(
     `  - live cache proof recorded in this project: ${r.liveVerifiedProviders.length > 0 ? r.liveVerifiedProviders.join(", ") : "none yet (run verify-cache with your key)"}.`
   );

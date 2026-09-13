@@ -29,12 +29,20 @@ const BLOCK = "SHARED CONTEXT BLOCK long enough to clear the duplicate size floo
 const SECRET = "SECRET_PROMPT_marker_zeta";
 const DUP_PROMPT = `${BLOCK}\n\ndo the task with ${SECRET}, concisely.\n\n${BLOCK}`;
 
-function env(pathValue: string, compBin: string): ShimEnv & { COMPACTION_BIN: string; TMPDIR: string; NO_COLOR: string } {
+function env(pathValue: string, compBin: string): ShimEnv & {
+  COMPACTION_BIN: string;
+  TMPDIR: string;
+  NO_COLOR: string;
+  OPENAI_BASE_URL: string;
+} {
   return {
     HOME: home,
     COMPACTION_HOME: path.join(home, ".compaction"),
     PATH: pathValue,
     COMPACTION_BIN: compBin,
+    // This suite pins the legacy local precall/capture behavior under an explicit user route.
+    // Normal no-override Codex subscription routing is covered by the dedicated shim suites.
+    OPENAI_BASE_URL: "http://127.0.0.1:9999/v1",
     TMPDIR: root,
     NO_COLOR: "1"
   };

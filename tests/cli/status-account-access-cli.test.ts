@@ -104,15 +104,18 @@ describe("compaction status - Account & access section (fixed wording)", () => {
     expect(out).not.toContain("product_mode");
   });
 
-  it("(b) signed-in but no valid lease → needs activation + restore remedy", async () => {
+  it("(b) signed-in but no valid lease and renew cannot reach a service → refresh gap, not browser activation", async () => {
+    // Credentials present + lease removed: silent renew runs against the fixture's dead api_url and
+    // fails. That is NOT "needs activation" (browser) — it is authorization that could not refresh.
     provisionValidLease(configDir); // sets credentials (signed in) + product_mode=full
     unlinkSync(leasePath({ COMPACTION_CONFIG_DIR: configDir })); // remove the lease → no valid entitlement
     const out = await runStatusHuman(absentEngine());
 
     expect(out).toContain("Account: connected");
     expect(out).toContain("Plan: Open");
-    expect(out).toContain("Community: needs activation");
-    expect(out).toContain("Run compaction to restore Community access.");
+    expect(out).toContain("Community: authorization needs refresh");
+    expect(out).toContain("Community authorization could not be refreshed automatically");
+    expect(out).not.toContain("Community: needs activation");
     expect(out).not.toContain("Community: active");
     expect(out).not.toContain("Compaction is active.");
     expect(out).not.toContain("Engine: ready"); // engine forced absent

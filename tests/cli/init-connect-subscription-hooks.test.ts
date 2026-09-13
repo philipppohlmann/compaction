@@ -124,9 +124,11 @@ describe("init --connect codex installs the native hooks, not just the PATH shim
     // Pinning it made this test enforce the defect (the F58 class), so the pin now follows the
     // disclosure rather than the overclaim.
     expect(out).toContain("attaches a concise-response instruction to what the model sees, before generation");
-    // The per-turn line is never promised as something the user WILL see (rendering is unproven).
+    // The Stop line is never promised as something the user WILL see, nor without settled evidence.
     expect(out).toContain("if your Codex build displays hook `systemMessage`");
+    expect(out).toContain("settled evidence when recorded");
     expect(out).not.toMatch(/you'll see a line after each turn/i);
+    expect(out).not.toMatch(/one line per turn|after each turn|returns the content-free per-turn receipt/i);
     // No savings/cost claim rides the enable output for this path.
     expect(out).not.toMatch(/\$\d/);
   });
@@ -253,12 +255,13 @@ describe("ready summary follows the hook state that is actually on disk", () => 
     expect(out).toContain("Output shaping: not installed for codex");
   });
 
-  it("a SUCCESSFUL hook install ⇒ the ready line states the shaping effect", async () => {
+  it("a successful hook install without a native trust result stays configured, not active", async () => {
     await runCli(["init", "--connect", "codex", "--static"], installPath());
     const out = await runCli(["init", "--connect", "codex", "--static"], activePath());
     const ready = out.slice(out.indexOf("Compaction is ready."));
-    expect(ready).toContain("a concise-response instruction is attached before generation");
-    expect(ready).not.toContain("output shaping is NOT active");
+    expect(ready).toContain("output shaping is configured for Codex");
+    expect(ready).toContain("depends on its one-time hook approval");
+    expect(ready).not.toContain("a concise-response instruction is attached before generation");
   });
 
   it("the kill switch ⇒ no hook is written AND the ready line does not claim one", async () => {

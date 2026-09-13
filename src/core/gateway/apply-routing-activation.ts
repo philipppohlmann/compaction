@@ -185,7 +185,7 @@ export async function resolveApplyRoutingActivation(
 
     // 4. EXPLICIT INIT - `claude-code` connected via `compaction init --connect` (persisted enum-only).
     if (!readConnectedWorkflows(env).includes(APPLY_ROUTING_WORKFLOW)) {
-      return dormant("claude-code is not a connected workflow (`compaction init --connect 1`) - record-only");
+      return dormant("claude-code is not a connected workflow (`compaction init --connect claude-code`) - record-only");
     }
 
     // 3. STORED AUTH - an enabled, narrow-scoped auto-apply authorization for claude-code must exist.

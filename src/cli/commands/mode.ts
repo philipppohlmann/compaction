@@ -12,7 +12,10 @@
  *  - `full`    — Community private-engine adaptive apply. It is LEASE-GATED: with a valid signed entitlement
  *    lease on this device it is enabled; without one, selecting `full` EXPLAINS what Community adds, points
  *    at the onboarding stepper (`compaction`), makes NO full-apply claim, and PRESERVES the current Open
- *    mode (observe/basic).
+ *    mode (observe/basic). It is ALSO gated on the two LOCAL conditions the gateway's own dormant guard
+ *    enforces (`pendingFullApplyGate`): the `cache-plus-context` optimization mode and a stored per-tool
+ *    apply authorization. An unmet one refuses as a NO-OP with the same three promises — nothing written,
+ *    no full-apply claim, current mode preserved — because a lease permits full apply and does not route it.
  *
  * HARD RAILS (this command):
  *  - Reads and writes ONLY the local content-free preference store (`~/.compaction/preferences.json`).
@@ -30,12 +33,15 @@ import chalk from "chalk";
 import { Command } from "commander";
 import {
   DEFAULT_PRODUCT_MODE,
+  OPTIMIZATION_MODE_PREFERENCE_LABELS,
   PRODUCT_MODES,
   isProductMode,
+  readConnectedWorkflows,
   readProductMode,
   writeProductMode,
   type ProductMode
 } from "../../core/onboarding-preferences.js";
+import { pendingFullApplyGate } from "./full-apply-gate.js";
 import { readLeaseVerdict } from "../../core/entitlement/lease-store.js";
 import { upgradeNoticeLines } from "../../core/upgrade-cta.js";
 import { allowanceNoticeInput } from "./watch.js";
@@ -119,6 +125,25 @@ async function printCurrentMode(env: NodeJS.ProcessEnv = process.env): Promise<v
       )
     );
   }
+  // THE SAME CLAIM, ON THE SAME COMMAND. `MODE_DESCRIPTION.full` states the per-turn line reads `full
+  // apply`, so a device carrying a stored `full` from before the selection-time gate below existed
+  // reads that promise here while the Gateway's dormant guard holds every turn on a local setting.
+  //
+  // QUALIFIED, NOT RE-DECIDED. The engine case above degrades the reported mode because with no engine
+  // nothing on any route can mutate; a local gate is narrower than that (it holds the apply-routing
+  // path, and the user can lift it), so this states the fact and leaves the reported mode alone rather
+  // than inventing a second, differently-derived effective posture for one surface.
+  if (stored === "full" && engineReachable) {
+    const pending = await pendingFullApplyGate(readConnectedWorkflows(env), env);
+    if (pending !== undefined) {
+      console.log(
+        chalk.yellow(
+          `  Full apply is not reaching your turns: ${pending}. The Gateway checks this on every request, ` +
+            `so requests route record-only until it is set. Your saved preference is kept.`
+        )
+      );
+    }
+  }
   console.log(chalk.dim("  Modes:"));
   for (const mode of PRODUCT_MODES) {
     const marker = mode === current ? chalk.green("•") : " ";
@@ -153,6 +178,27 @@ export interface ModeSelectionOutcome {
    * over-promise it.
    */
   meteredBalanceExhausted?: boolean;
+  /**
+   * For a `full` selection the ENTITLEMENT would have unlocked, but which a LOCAL gate the gateway
+   * itself enforces would then have held: the first unmet gate, verbatim from
+   * `FULL_APPLY_PENDING_REASONS`. `persisted` is false whenever this is set.
+   *
+   * Set ONLY from the gate result the caller passes in, never re-derived here, so the rendering and
+   * the persistence decision cannot disagree about which gate was missing.
+   */
+  pendingFullApplyReason?: string;
+}
+
+/** Optional facts the caller has already established, so this seam need not (and must not) re-derive them. */
+export interface ModeSelectionOptions {
+  /**
+   * The first unmet LOCAL full-apply gate on this device (`pendingFullApplyGate`), or `undefined`
+   * when none is unmet. Passed IN because the gate is async and this seam is deliberately sync.
+   *
+   * It is honoured only on the `full` path and only once the lease has already verified, so a device
+   * with no entitlement still gets the entitlement answer rather than a configuration one.
+   */
+  pendingFullApplyReason?: string;
 }
 
 /**
@@ -170,11 +216,37 @@ export interface ModeSelectionOutcome {
  * on a spent period. The spent balance travels out as `meteredBalanceExhausted` so the rendering can
  * bound its promise to what the device actually has this period, rather than refusing a mode the user
  * is entitled to.
+ *
+ * ENTITLEMENT IS NOT THE ONLY GATE. A valid lease says the user is ALLOWED full apply; the gateway
+ * additionally enforces two LOCAL conditions before any request can take the apply path (the
+ * `cache-plus-context` optimization mode and a stored per-tool apply authorization —
+ * `pendingFullApplyGate`, conditions 2 and 3 of `apply-routing-activation.ts`). This seam used to
+ * persist `full` against the lease alone, so a device that kept the recommended Output-only mode was
+ * told full apply was enabled and then routed record-only on every turn, with the honest reason
+ * reaching only the gateway log. An unmet local gate therefore persists NOTHING and travels out as
+ * `pendingFullApplyReason` — a no-op, never a rollback, exactly like the engine refusal upstream.
+ *
+ * The gate itself is not evaluated here: it is async and this seam is sync (and a second copy of the
+ * rule is how two surfaces come to disagree). The caller passes in the one result it already has.
  */
-export function applyModeSelection(mode: ProductMode, env: NodeJS.ProcessEnv = process.env): ModeSelectionOutcome {
+export function applyModeSelection(
+  mode: ProductMode,
+  env: NodeJS.ProcessEnv = process.env,
+  options: ModeSelectionOptions = {}
+): ModeSelectionOutcome {
   if (mode === "full") {
     const verdict = readLeaseVerdict(env);
     if (verdict.label === "lease-valid") {
+      if (options.pendingFullApplyReason !== undefined) {
+        const preserved = readProductMode(env);
+        return {
+          requested: "full",
+          persisted: false,
+          effective: preserved === "basic" ? "basic" : "observe",
+          leaseVerdict: verdict.label,
+          pendingFullApplyReason: options.pendingFullApplyReason
+        };
+      }
       const path = writeProductMode("full", env);
       return {
         requested: "full",
@@ -328,7 +400,54 @@ async function handleFullMode(env: NodeJS.ProcessEnv = process.env): Promise<voi
     return;
   }
 
-  const outcome = applyModeSelection("full", env);
+  // THE GATES THE RUNTIME ACTUALLY ENFORCES, asked BEFORE anything is written. The engine gate above
+  // is not the only precondition this command never checked: the gateway's own dormant guard also
+  // requires the `cache-plus-context` optimization mode and a stored per-tool apply authorization
+  // (`apply-routing-activation.ts`, conditions 2 and 3). Neither is written by this command, and
+  // `optimization_mode` is written in exactly one place in the product — the onboarding mode picker —
+  // so a device that kept the recommended Output-only mode was told `Full apply enabled` and then
+  // routed record-only on every turn, with the honest reason going only to the gateway log.
+  //
+  // The gate is consulted against the DEVICE's connected workflows, which is the same set that can
+  // carry a routable authorization; with none connected no turn on this device can be a full apply,
+  // and the predicate says so.
+  const connectedWorkflows = readConnectedWorkflows(env);
+  const pendingLocalGate = await pendingFullApplyGate(connectedWorkflows, env);
+  const outcome = applyModeSelection("full", env, { pendingFullApplyReason: pendingLocalGate });
+
+  // A LOCAL GATE HELD. The entitlement verified (this field is set only inside the lease-valid branch),
+  // so the honest answer is not the Community explanation below but the one setting that is missing —
+  // and, exactly as in the engine refusal above, nothing was written and no full-apply claim is made.
+  //
+  // MAKE IT TRUE was the alternative, and it is deliberately not taken: the two gates are the user's
+  // own explicit choices (the recommended optimization mode, and a scoped authorization to mutate
+  // their real requests). Writing either of them from here would arm before-call mutation off a
+  // command the user ran to set a preference.
+  if (outcome.pendingFullApplyReason !== undefined) {
+    console.log(
+      chalk.yellow(
+        `  Full apply was NOT enabled: ${outcome.pendingFullApplyReason}. Nothing was written and no ` +
+          `full-apply claim is made.`
+      )
+    );
+    console.log(chalk.dim(`  Your effective mode is unchanged: ${outcome.effective}.`));
+    console.log(
+      chalk.dim(
+        "  This is not about your account or entitlement — your Community lease verified. The Gateway " +
+          "checks this same local setting on every request, so `full` would have routed record-only."
+      )
+    );
+    console.log(
+      connectedWorkflows.length === 0
+        ? `  ${chalk.bold("Next:")} run ${chalk.bold("compaction")} and connect the tool you use — full apply ` +
+            `needs a connected workflow carrying an apply authorization.`
+        : `  ${chalk.bold("Next:")} run ` +
+            `${chalk.bold(`compaction init --authorize-auto-apply ${connectedWorkflows[0]}`)} — it records the ` +
+            `per-tool apply authorization and sets this device's optimization mode to ` +
+            `"${OPTIMIZATION_MODE_PREFERENCE_LABELS["cache-plus-context"]}".`
+    );
+    return;
+  }
 
   if (outcome.persisted && outcome.effective === "full") {
     console.log(
@@ -357,10 +476,14 @@ async function handleFullMode(env: NodeJS.ProcessEnv = process.env): Promise<voi
       console.log(chalk.dim("  Nothing is purchased automatically."));
     }
     console.log(chalk.dim("  On a real apply turn, the per-turn receipt line reads `full apply`."));
+    // NAMES EVERY PRECONDITION THIS COMMAND CHECKED. The optimization mode was missing from this
+    // sentence while being one of the gates that silently sends a turn record-only, so the one line
+    // that lists what full apply needs omitted the setting most likely to be holding it back.
     console.log(
       chalk.dim(
-        "  Full apply still requires the private engine AND your separate per-tool apply authorization AND " +
-          "the safety/recovery gates — the lease alone does not apply anything."
+        `  Full apply still requires the private engine AND the ` +
+          `"${OPTIMIZATION_MODE_PREFERENCE_LABELS["cache-plus-context"]}" optimization mode AND your separate ` +
+          `per-tool apply authorization AND the safety/recovery gates — the lease alone does not apply anything.`
       )
     );
     console.log(chalk.dim(`  Persisted content-free preference: ${outcome.path}`));
@@ -376,7 +499,6 @@ async function handleFullMode(env: NodeJS.ProcessEnv = process.env): Promise<voi
   );
   console.log(chalk.dim("  Community full apply adds (over Open basic shaping):"));
   console.log(chalk.dim("    - the private adaptive engine (input compaction + adaptive output), not just the one basic method"));
-  console.log(chalk.dim("    - turn/request-aware method selection, candidate generation + ranking, commitment preservation"));
   console.log(chalk.dim("    - safety / evidence / recovery gates and byte-exact recovery on full apply"));
   console.log(
     chalk.dim(
@@ -426,7 +548,7 @@ async function repairCommunityRuntimeIfPossible(
 ): Promise<CommunityRuntimeOutcome | undefined> {
   try {
     const { ensureCommunityRuntime } = await import("../../core/entitlement/community-runtime.js");
-    const outcome = await ensureCommunityRuntime(env);
+    const outcome = await ensureCommunityRuntime(env, undefined, { engineIntent: "explicit" });
     return outcome.account === "absent" ? undefined : outcome;
   } catch {
     // A repair is best-effort; failing to attempt one must never turn `mode full` into an error. The
@@ -442,8 +564,9 @@ export function registerModeCommand(program: Command): void {
       "Show or set the product mode (open-core apply posture). `observe` = no model-visible mutation " +
         "(line: `apply off`); `basic` = the one public deterministic output-shaping method (line: " +
         "`basic shaping`), engine-free and account-free; `full` = Community private-engine apply, which " +
-        "requires a valid entitlement lease on this device (without one it explains what Community adds " +
-        "and preserves your current Open mode — run `compaction` to set Community up). " +
+        "requires the private engine, a valid entitlement lease on this device, the \"Full optimization\" " +
+        "mode, and a per-tool apply authorization (with any of them missing it names which one, changes " +
+        "nothing, and preserves your current Open mode — run `compaction` to set Community up). " +
         "With no argument, shows the current mode. `observe`, `basic`, and the no-argument display are " +
         "fully offline and read/write only the local content-free preference store. `full` on a " +
         "signed-in device first tries to re-establish your Community setup, so it may contact the " +

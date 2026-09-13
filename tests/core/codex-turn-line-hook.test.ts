@@ -12,6 +12,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  CODEX_TURN_LINE_HOOK_TIMEOUT_SECONDS,
   codexTurnLineCommand,
   codexTurnLineStdout,
   installCodexTurnLineHook,
@@ -69,6 +70,19 @@ describe("codex per-turn line hook — install/uninstall discipline", () => {
     expect(twice.changed).toBe(false);
     expect(twice.alreadyPresent).toBe(true);
     expect(twice.config).toEqual(once.config);
+  });
+
+  it("migrates the exact owned Stop hook away from the 5s deadline that timed out on a real large run", () => {
+    const stale: CodexHooksConfig = {
+      hooks: {
+        Stop: [{ hooks: [{ type: "command", command: codexTurnLineCommand(), timeout: 5 }] }]
+      }
+    };
+    const migrated = installCodexTurnLineHook(stale);
+    expect(migrated.changed).toBe(true);
+    expect(migrated.alreadyPresent).toBe(true);
+    const stop = migrated.config.hooks?.Stop as Array<{ hooks?: Array<{ timeout?: number }> }>;
+    expect(stop[0].hooks?.[0].timeout).toBe(CODEX_TURN_LINE_HOOK_TIMEOUT_SECONDS);
   });
 
   it("refuses to clobber a malformed hooks.Stop rather than overwriting it", () => {

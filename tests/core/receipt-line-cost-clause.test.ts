@@ -6,6 +6,7 @@ import { MODEL_PRICING, type ModelPricing } from "../../src/core/pricing.js";
 import type { OpenAiUsageBreakdown } from "../../src/core/gateway/openai-usage.js";
 import type { ApplyActivation } from "../../src/core/gateway/apply-activation.js";
 import type { DedupePlan } from "../../src/core/gateway/request-shape.js";
+import { LCM_APPLY_POLICY } from "../../src/core/gateway/lcm-apply-policy-name.js";
 
 /**
  * PROOF that the per-turn line's `−$X (list price)` clause is COMPUTED from the price table, not hardcoded.
@@ -16,8 +17,8 @@ import type { DedupePlan } from "../../src/core/gateway/request-shape.js";
 const activation: ApplyActivation = {
   mode: "apply",
   requested: true,
-  activation: "explicit-mode",
-  policy: "deterministic-dedupe"
+  activation: "stored-authorization",
+  policy: LCM_APPLY_POLICY
 };
 
 /** A plan with a 20,000-token model-visible input reduction (100,000 → 80,000). */
@@ -52,6 +53,9 @@ function applyReceiptFor(model: string, route: "api-key" | "subscription" = "api
     activation,
     plan,
     applied: true,
+    authorizationId: "pref-1234567890abcdef12345678",
+    appliedComponents: ["lcm-compaction"],
+    composedInputEstimate: { before: plan.estTokensBefore, after: plan.estTokensAfter },
     upstreamRouteType: route,
     id: () => "abcd1234-0000-0000-0000-000000000000",
     now: () => "2026-07-31T00:00:00.000Z"
@@ -69,6 +73,9 @@ function legacyRoutelessApplyReceipt(model: string) {
     activation,
     plan,
     applied: true,
+    authorizationId: "pref-1234567890abcdef12345678",
+    appliedComponents: ["lcm-compaction"],
+    composedInputEstimate: { before: plan.estTokensBefore, after: plan.estTokensAfter },
     id: () => "abcd1234-0000-0000-0000-000000000000",
     now: () => "2026-07-31T00:00:00.000Z"
   });

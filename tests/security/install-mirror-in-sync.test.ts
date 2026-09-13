@@ -24,7 +24,7 @@ import { describe, expect, it } from "vitest";
  *   cp scripts/install.sh apps/cli-install/public/install
  *
  * NOTE: this asserts byte-identity only. The installer's *safety* properties
- * (no sudo / no telemetry / no phone-home / Node>=18 gate / honest-not-published)
+ * (no sudo / no telemetry / isolated acquisition / Node>=18 gate / honest failures)
  * are pinned separately in `install-script-safe.test.ts`, which runs against the
  * source of truth, so a passing pair here means the served script inherits those
  * same guarantees.

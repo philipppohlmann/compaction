@@ -30,8 +30,8 @@ export type WorkflowKey = "codex" | "claude-code" | "cursor" | "custom-openai-ap
  * Whether a workflow's provider requests route THROUGH the local Gateway:
  *  - `true`           , routed by default (the custom OpenAI-compatible app path);
  *  - `false`          , not routable (activity-only Stop hook / local-estimate vendor gap);
- *  - `"if-configured"`, routable only when the user configures it (Codex + `OPENAI_BASE_URL` → Gateway); not
- *                        routed by default, so provider-reported proof is unavailable until configured.
+ *  - `"if-configured"`, routable only when the user configures it; not routed by default, so
+ *                        provider-reported proof is unavailable until configured.
  */
 export type GatewayRoutable = boolean | "if-configured";
 
@@ -81,7 +81,7 @@ export interface WorkflowRouting {
   installable: boolean;
   /**
    * Plan-auth ready (the default keyless MVP path): the workflow works via the user's existing CLI auth and
-   * records content-free usage through the installed shim/hook, no API key, no Gateway routing required. A
+   * routes or captures through the installed shim/hook, with evidence reported only from recorded artifacts. A
    * per-workflow constant (not key-derived), independent of cacheProofSupported / gatewayRoutable / liveVerified.
    */
   planAuthReady: boolean;
@@ -121,8 +121,8 @@ export interface WorkflowProviderCapability {
   /** Installable (keyless): Compaction can install its hook/shim for this workflow (no API key). */
   installable: boolean;
   /**
-   * Plan-auth ready (the default keyless MVP path): works via the user's existing CLI auth, measured
-   * content-free with no API key and no Gateway routing. Independent of cacheProofSupported / liveVerified, a
+   * Plan-auth ready (the default keyless MVP path): works via the user's existing CLI auth, with
+   * content-free evidence reported only when recorded and no API key required. Independent of cacheProofSupported / liveVerified, a
    * workflow is NOT unavailable when those are false.
    */
   planAuthReady: boolean;
@@ -234,8 +234,8 @@ export function deriveProviderCapabilities(
 }
 
 /**
- * Workflow routing descriptors, grounded in the current integration: Codex's shim is capture/activity
- * (routable only if `OPENAI_BASE_URL` points at the Gateway); Claude Code is a post-session Stop hook
+ * Workflow routing descriptors, grounded in the current integration: Codex's normal saved-login shim routes
+ * through the Gateway unless a user route/API-key override is detected; Claude Code is a post-session Stop hook
  * (activity-only); Compaction does not ingest Cursor's conditional `result.usage` (local-estimate only);
  * the custom OpenAI-compatible app is the primary gateway-routable path.
  */
@@ -257,18 +257,16 @@ export const WORKFLOW_ROUTING: WorkflowRouting[] = [
   {
     workflow: "codex",
     displayName: "Codex CLI",
-    gatewayRoutable: "if-configured",
+    gatewayRoutable: true,
     defaultProvider: "openai",
     installable: true,
     planAuthReady: true,
     planAuthNote:
-      "plan-auth ready (default, keyless): run `codex` normally with your existing CLI auth / subscription; Compaction records content-free usage through the installed shim - no API key requested or stored.",
-    activityOnly: true,
+      "plan-auth ready (default, keyless): run `codex` normally with your existing ChatGPT login; the installed shim routes through the local Gateway, and evidence is reported only from recorded content-free artifacts - no API key requested or stored.",
+    activityOnly: false,
     localEstimateOnly: false,
     routingNote:
-      "the current Compaction shim wraps `codex exec --json` for capture/activity - it does NOT route provider requests through the Gateway. Codex is gateway-routable ONLY when the user sets an OpenAI-compatible base URL (OPENAI_BASE_URL) to the local Gateway.",
-    unavailableReason:
-      "Codex is detected, installable, and plan-auth-ready; only provider CACHE PROOF is unavailable by default because the shim is capture/activity and does not route provider requests through the Gateway (route via OPENAI_BASE_URL → the local Gateway to enable provider-reported cache proof). The workflow itself is not unavailable."
+      "the installed Compaction shim routes each normal `codex` invocation through the local Gateway under the existing ChatGPT login unless it detects a user-declared route or API key auth; receipt and usage evidence are reported only when settled artifacts exist."
   },
   {
     workflow: "claude-code",

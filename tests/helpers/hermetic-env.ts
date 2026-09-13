@@ -13,7 +13,15 @@
  *     default is `observe` (`DEFAULT_PRODUCT_MODE`), which shapes nothing — so an EMPTY config dir,
  *     not a hand-written one, is the correct default posture to test against.
  *
- *  2. `FORCE_COLOR`. Some terminals and agent harnesses export it (e.g. `FORCE_COLOR=3`), which makes
+ *  2. `HOME`. Compaction is an INSTALL-ONCE product, so the Claude Code integration now installs into
+ *     `~/.claude/settings.json` by DEFAULT (a project-scoped install would not survive a new repo or
+ *     worktree). Any test that runs a real `init --connect` / `hooks install` without overriding HOME
+ *     would therefore mutate the DEVELOPER'S OWN Claude Code settings — installing a status line and
+ *     hooks on their machine as a side effect of running the suite. The project-scoped default used to
+ *     mask this; it never made the tests hermetic. HOME is redirected per test FILE so a connect lands
+ *     in a throwaway home, and `claudeSettingsHome()` reads `env.HOME` first precisely so this works.
+ *
+ *  3. `FORCE_COLOR`. Some terminals and agent harnesses export it (e.g. `FORCE_COLOR=3`), which makes
  *     chalk emit SGR escapes inside CLI output and breaks raw-substring assertions — `run \e[1mcompaction\e[22m`
  *     no longer contains `run compaction`. It is DELETED rather than set to `0`, and deliberately not
  *     replaced with `NO_COLOR`: chalk treats an empty `FORCE_COLOR` as colors-ON (already documented at
@@ -33,8 +41,11 @@ import { afterAll } from "vitest";
 // Per-test-FILE, so parallel workers cannot observe each other's writes.
 const configDir = mkdtempSync(join(tmpdir(), "compaction-hermetic-"));
 process.env.COMPACTION_CONFIG_DIR = configDir;
+const homeDir = mkdtempSync(join(tmpdir(), "compaction-hermetic-home-"));
+process.env.HOME = homeDir;
 delete process.env.FORCE_COLOR;
 
 afterAll(() => {
   rmSync(configDir, { recursive: true, force: true });
+  rmSync(homeDir, { recursive: true, force: true });
 });

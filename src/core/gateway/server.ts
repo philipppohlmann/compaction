@@ -13,13 +13,10 @@
  * pass every fail-closed eligibility gate (`apply-eligibility.ts`), otherwise every request is plain
  * record. The RESPONSE is never mutated on any path.
  *
- * PRIVATE-ENGINE BOUNDARY: for the stored-authorization path this file decides WHETHER apply is
- * allowed (the public auth/scope/endpoint gates), retains the byte-exact original, and forwards the
- * result — but it no longer runs the optimization ALGORITHM in-process. The deterministic-dedupe input
- * compaction, the LCM hybrid candidate, and the adaptive output shaping run inside the supervised
- * private native engine (`engine-ipc/supervisor.ts` → the sidecar's `plan_and_apply`); this file
- * reaches them ONLY over that spawned IPC (never by importing the algorithm modules). Any engine
- * degrade / refusal / no-op / error → forward the ORIGINAL unchanged (fail-open).
+ * PRIVATE-ENGINE BOUNDARY: this process enforces public authorization and request-shape gates,
+ * retains the byte-exact original, and exchanges a bounded request/decision contract with the signed
+ * engine over IPC. It never imports optimization implementation. Any engine refusal, no-op, or error
+ * forwards the original request unchanged.
  *
  * LCM SHADOW evaluation is likewise explicit opt-in and DEFAULT OFF (`lcmShadow` option or
  * `COMPACTION_LCM_SHADOW=1`): when off, this file behaves byte-identically to a build without the hook;
@@ -60,8 +57,8 @@ import {
   findStoredAuthorization,
   type ApplyRequestScope
 } from "./apply-eligibility.js";
-import { LCM_APPLY_POLICY } from "./lcm-qualified-classes.js";
-import { EngineSupervisor } from "./engine-ipc/supervisor.js";
+import { LCM_APPLY_POLICY } from "./lcm-apply-policy-name.js";
+import { EngineSupervisor, type EngineSupervisorOptions } from "./engine-ipc/supervisor.js";
 import { decideEngineApply, type EngineApplyDecision } from "./engine-ipc/engine-apply-seam.js";
 import { appendAutoApplyActivityEvent } from "./auto-apply-activity.js";
 import { saveOriginalForRecovery, discardRecoveryRecord, GATEWAY_RECOVERY_DIR } from "./recovery.js";
@@ -108,8 +105,17 @@ import {
   safeClaudeSubscriptionResponseHeaders,
   type ClaudeSubscriptionEnvelope
 } from "./claude-subscription-route.js";
+import {
+  CODEX_SUBSCRIPTION_UPSTREAM,
+  classifyCodexSubscriptionTarget,
+  forwardedCodexRawRequestHeaders,
+  safeCodexSubscriptionResponseHeaders,
+  type CodexSubscriptionEnvelope
+} from "./codex-subscription-route.js";
 import { assembleHeadTail, createUsageTee } from "./usage-response-tee.js";
 import { attachBookkeepingDrain, PendingBookkeeping } from "./pending-bookkeeping.js";
+import { gatewayControlHandler, type GatewayReleaseIdentity } from "./update-identity.js";
+import { readGatewaySettlementState } from "./run-boundary.js";
 /** The engine decision narrowed to the applied branch (the only branch this path carries forward). */
 type AppliedEngineDecision = Extract<EngineApplyDecision, { decision: "apply" }>;
 
@@ -163,6 +169,8 @@ class RequestBodyLimitError extends Error {
 export type GatewayServerMode = "record" | "apply" | "dry-run";
 
 export interface GatewayServerOptions {
+  releaseIdentity?: GatewayReleaseIdentity;
+  verifiedInstalledArtifact?: EngineSupervisorOptions["verifiedInstalledArtifact"];
   provider: string;
   /** The upstream provider base (only its ORIGIN is used; the client's request path is authoritative). */
   upstream: string;
@@ -214,6 +222,8 @@ export interface GatewayServerOptions {
   lcmShadow?: GatewayLcmShadowOptions;
   /** Internal, default-off Claude Code saved-subscription transport envelope. */
   claudeSubscription?: ClaudeSubscriptionEnvelope;
+  /** Internal, default-off Codex ChatGPT-subscription transport envelope. */
+  codexSubscription?: CodexSubscriptionEnvelope;
   /**
    * Idle auto-shutdown TTL in milliseconds, DEFAULT OFF (absent or 0 = the server never self-stops).
    * When > 0, the started server tracks the time of its last handled request and, once it has been
@@ -271,6 +281,89 @@ function usageWithReason(breakdown: OpenAiUsageBreakdown, decompressionReason?: 
   return { ...breakdown, present: false, unavailableReason: decompressionReason };
 }
 
+/**
+ * Codex's Responses SSE consumer returns as soon as it receives `response.completed`; it does not
+ * wait for the HTTP body to reach EOF. A premature-close receipt is therefore safe only when the
+ * bounded usage window contains that exact terminal event and the SAME event carries both provider
+ * input and output usage. Anything truncated, malformed, nonterminal, or usage-less fails closed.
+ */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isOptionalType(record: Record<string, unknown>, key: string, type: "string" | "boolean"): boolean {
+  return !(key in record) || record[key] === null || typeof record[key] === type;
+}
+
+function isOptionalSafeInteger(record: Record<string, unknown>, key: string): boolean {
+  return !(key in record) || record[key] === null || Number.isSafeInteger(record[key]);
+}
+
+/** Mirror the current Codex Responses terminal wire types that can reject the event before Completed. */
+function isCodexCompletedEventWithUsage(event: Record<string, unknown>): boolean {
+  if (event.type !== "response.completed" || !isRecord(event.response)) return false;
+  for (const key of ["item_id", "call_id", "delta", "text"]) {
+    if (!isOptionalType(event, key, "string")) return false;
+  }
+  for (const key of ["summary_index", "content_index"]) {
+    if (!isOptionalSafeInteger(event, key)) return false;
+  }
+
+  const response = event.response;
+  if (typeof response.id !== "string" || !isOptionalType(response, "end_turn", "boolean")) return false;
+  if (!("usage" in response) || !isRecord(response.usage)) return false;
+  if ("usage_metadata" in response && response.usage_metadata !== null) {
+    if (!isRecord(response.usage_metadata)) return false;
+    if (!isOptionalType(response.usage_metadata, "amount", "string")) return false;
+  }
+
+  const usage = response.usage;
+  for (const key of ["input_tokens", "output_tokens", "total_tokens"]) {
+    if (!Number.isSafeInteger(usage[key]) || (usage[key] as number) < 0) return false;
+  }
+  if ("input_tokens_details" in usage && usage.input_tokens_details !== null) {
+    if (!isRecord(usage.input_tokens_details)) return false;
+    if (!Number.isSafeInteger(usage.input_tokens_details.cached_tokens)) return false;
+    if (
+      "cache_write_tokens" in usage.input_tokens_details &&
+      !Number.isSafeInteger(usage.input_tokens_details.cache_write_tokens)
+    ) return false;
+  }
+  if ("output_tokens_details" in usage && usage.output_tokens_details !== null) {
+    if (!isRecord(usage.output_tokens_details)) return false;
+    if (!Number.isSafeInteger(usage.output_tokens_details.reasoning_tokens)) return false;
+  }
+  if (
+    "codex_rollout_budget_units" in usage && usage.codex_rollout_budget_units !== null &&
+    (typeof usage.codex_rollout_budget_units !== "number" || !Number.isFinite(usage.codex_rollout_budget_units))
+  ) return false;
+  return true;
+}
+
+function hasCodexCompletedEventWithUsage(responseWindow: string, adapter: ProviderAdapter): boolean {
+  for (const line of responseWindow.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) continue;
+    const payload = trimmed.slice("data:".length).trim();
+    if (!payload.startsWith("{")) continue;
+    try {
+      const event = JSON.parse(payload) as unknown;
+      if (!isRecord(event) || !isCodexCompletedEventWithUsage(event)) continue;
+      const usage = adapter.extractUsage(payload);
+      if (
+        usage.source === "provider-reported" &&
+        usage.inputTokens !== undefined && usage.inputTokens >= 0 &&
+        usage.outputTokens !== undefined && usage.outputTokens >= 0
+      ) {
+        return true;
+      }
+    } catch {
+      // A partial/truncated SSE line is not authoritative terminal evidence.
+    }
+  }
+  return false;
+}
+
 /** Best-effort, content-free extraction of the `model` field from a request body (metadata, not content). */
 function requestModel(body: Buffer): string | undefined {
   const text = body.toString("utf8").trim();
@@ -316,25 +409,65 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
   if (options.claudeSubscription && (options.provider !== "anthropic" || options.workflow !== "claude-code")) {
     throw new Error("Claude subscription transport requires the anthropic provider and claude-code workflow");
   }
+  if (options.codexSubscription && (options.provider !== "openai" || options.workflow !== "codex")) {
+    throw new Error("Codex subscription transport requires the openai provider and codex workflow");
+  }
+  if (options.claudeSubscription && options.codexSubscription) {
+    throw new Error("Claude and Codex subscription transports are mutually exclusive");
+  }
   // Subscription traffic is unconditionally pinned. Tests may replace only the request transport;
-  // the request options presented to that seam still name api.anthropic.com.
-  const upstreamOrigin = options.claudeSubscription ? CLAUDE_SUBSCRIPTION_UPSTREAM : new URL(options.upstream).origin;
+  // the request options presented to that seam still name the matching first-party provider origin.
+  const upstreamOrigin = options.codexSubscription
+    ? CODEX_SUBSCRIPTION_UPSTREAM
+    : options.claudeSubscription
+      ? CLAUDE_SUBSCRIPTION_UPSTREAM
+      : new URL(options.upstream).origin;
   // Resolved ONCE at server creation; when disabled (the default) handleProxy's shadow branch is dead.
   const lcmShadow = resolveLcmShadowConfig(options.lcmShadow);
   // The supervised private native engine. Created once per server; it spawns the engine child
   // lazily on the FIRST stored-authorization apply attempt and reuses it (the whole point of the
   // supervisor). When the engine is absent (the default dev/npm state until `engine install` delivers the signed
   // artifact) every request degrades fail-open and the gateway forwards the original unchanged.
-  const engineSupervisor = new EngineSupervisor();
+  const engineSupervisor = new EngineSupervisor({ verifiedInstalledArtifact: options.verifiedInstalledArtifact });
   // The detached bookkeeping writes (receipt append, auto-apply activity append) still in flight.
   // The REQUEST path never awaits them; `close()` does, so stopping the gateway does not discard the
   // last turn's receipt (`pending-bookkeeping.ts`).
   const pendingBookkeeping = new PendingBookkeeping();
   const upstreamTimeoutMs = options.upstreamTimeoutMs ?? UPSTREAM_STALL_TIMEOUT_MS;
+  let activeRequests = 0;
+  const control = options.releaseIdentity ? gatewayControlHandler(options.releaseIdentity, () => ({
+    activeRequests,
+    pendingBookkeeping: pendingBookkeeping.size,
+    ...readGatewaySettlementState(options.entitlementEnv)
+  }), () => server) : undefined;
   const server = http.createServer((req, res) => {
+    if (control?.(req, res)) return;
+    activeRequests += 1;
+    const responseClosed = new Promise<void>((resolve) => res.once("close", resolve));
+    const trackRequest = (work: Promise<void>): void => {
+      void Promise.all([responseClosed, work]).then(() => { activeRequests -= 1; });
+    };
+    if (options.codexSubscription) {
+      const classified = classifyCodexSubscriptionTarget(req.url, req.method, options.codexSubscription.capability);
+      if (!classified) {
+        trackRequest(Promise.resolve());
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "compaction gateway: route unavailable", type: "gateway_error" } }));
+        return;
+      }
+      // Remove the local capability before constructing or logging any upstream target.
+      req.url = classified.upstreamTarget;
+      if (classified.route === "models") {
+        trackRequest(handleCodexSupportRequest(req, res, upstreamOrigin, classified.upstreamTarget, upstreamTimeoutMs));
+        return;
+      }
+      trackRequest(handleProxy(req, res, options, upstreamOrigin, log, lcmShadow, engineSupervisor, pendingBookkeeping));
+      return;
+    }
     if (options.claudeSubscription) {
       const classified = classifyClaudeSubscriptionTarget(req.url, req.method, options.claudeSubscription.capability);
       if (!classified) {
+        trackRequest(Promise.resolve());
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: "compaction gateway: route unavailable", type: "gateway_error" } }));
         return;
@@ -342,25 +475,25 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
       // Strip the bearer-like local route capability before any upstream construction or logging.
       req.url = classified.upstreamTarget;
       if (classified.route !== "messages") {
-        void handleClaudeSupportRequest(
+        trackRequest(handleClaudeSupportRequest(
           req,
           res,
           upstreamOrigin,
           classified.upstreamTarget,
           classified.route === "count-tokens",
           upstreamTimeoutMs
-        );
+        ));
         return;
       }
       // Subscription 'messages' uses the pinned upstream, multi-provider routing does not apply.
-      void handleProxy(req, res, options, upstreamOrigin, log, lcmShadow, engineSupervisor, pendingBookkeeping);
+      trackRequest(handleProxy(req, res, options, upstreamOrigin, log, lcmShadow, engineSupervisor, pendingBookkeeping));
       return;
     }
     // Multi-provider routing: pick the upstream + provider for THIS request's endpoint. Default
     // single-upstream behavior when no `providerRoutes` match.
     const route = resolveProviderRoute(req.url ?? "/", options, upstreamOrigin);
     const effectiveOptions = route.provider === options.provider ? options : { ...options, provider: route.provider };
-    void handleProxy(req, res, effectiveOptions, route.upstreamOrigin, log, lcmShadow, engineSupervisor, pendingBookkeeping);
+    trackRequest(handleProxy(req, res, effectiveOptions, route.upstreamOrigin, log, lcmShadow, engineSupervisor, pendingBookkeeping));
   });
   // Client-facing connection lifecycle: keep pooled client sockets alive across inter-turn idle
   // (node's 5s default silently drops them mid-session); headersTimeout must stay >= keepAliveTimeout.
@@ -373,6 +506,65 @@ export function createGatewayServer(options: GatewayServerOptions): http.Server 
   // stopped gateway does not silently drop the receipt for the turn that just completed.
   attachBookkeepingDrain(server, pendingBookkeeping);
   return server;
+}
+
+/** Codex's authenticated model discovery is bounded opaque passthrough and never creates a receipt. */
+function handleCodexSupportRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  upstreamOrigin: string,
+  upstreamTarget: string,
+  upstreamTimeoutMs: number
+): Promise<void> {
+  req.resume();
+  return new Promise((resolve) => {
+    const target = new URL(upstreamTarget, upstreamOrigin);
+    const client = target.protocol === "http:" ? http : https;
+    const upstreamReq = client.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname + target.search,
+      method: "GET",
+      headers: forwardedCodexRawRequestHeaders(req, target.host)
+    }, (upstreamRes) => {
+      upstreamReq.setTimeout(0);
+      if (res.destroyed || res.writableEnded) {
+        upstreamRes.destroy();
+        resolve();
+        return;
+      }
+      const status = upstreamRes.statusCode ?? 502;
+      const headers = safeCodexSubscriptionResponseHeaders(status, upstreamRes.rawHeaders);
+      if (!headers) {
+        upstreamRes.resume();
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "compaction gateway: upstream redirect rejected", type: "gateway_error" } }));
+        resolve();
+        return;
+      }
+      res.writeHead(status, headers);
+      pipeline(upstreamRes, res, (err) => {
+        if (err) res.destroy();
+        resolve();
+      });
+    });
+    upstreamReq.setTimeout(upstreamTimeoutMs, () => upstreamReq.destroy(new Error("upstream timeout")));
+    upstreamReq.on("error", () => {
+      if (res.destroyed || res.writableEnded) {
+        resolve();
+        return;
+      }
+      if (!res.headersSent) {
+        res.writeHead(502, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "compaction gateway: upstream request failed", type: "gateway_error" } }));
+      } else {
+        res.end();
+      }
+      resolve();
+    });
+    upstreamReq.end();
+  });
 }
 
 /**
@@ -490,6 +682,11 @@ function passThroughClaudeSupportRequest(
         // Response started: release the connect/first-byte guard so a long or quiet stream is never
         // killed mid-flight (the streaming phase stays unbounded, as before).
         upstreamReq.setTimeout(0);
+        if (res.destroyed || res.writableEnded) {
+          upstreamRes.destroy();
+          resolve();
+          return;
+        }
         const status = upstreamRes.statusCode ?? 502;
         const headers = safeClaudeSubscriptionResponseHeaders(status, upstreamRes.rawHeaders, upstreamOrigin);
         if (!headers) {
@@ -511,6 +708,10 @@ function passThroughClaudeSupportRequest(
     // Connect + time-to-first-byte guard only (released in the response callback once bytes flow).
     upstreamReq.setTimeout(upstreamTimeoutMs, () => upstreamReq.destroy(new Error("upstream timeout")));
     upstreamReq.on("error", () => {
+      if (res.destroyed || res.writableEnded) {
+        resolve();
+        return;
+      }
       // Never splice an error JSON into an already-streaming body: after headers, just end.
       if (!res.headersSent) {
         res.writeHead(502, { "content-type": "application/json" });
@@ -537,10 +738,11 @@ async function handleProxy(
 ): Promise<void> {
   const endpoint = (req.url ?? "/").split("?")[0];
   // WHEN THE REQUEST ARRIVED, stamped before anything is read or forwarded. The receipt's own
-  // `captured_at` is assigned only after the response has fully streamed and the usage window has been
-  // assembled (on a compressed response, after an asynchronous decompressor flush) — by which time the
-  // client has the response and its `Stop` hook may already have closed the run. Run membership keys on
-  // THIS instant, which is provably before any response and therefore before any `Stop` it triggers.
+  // `captured_at` is assigned only after the response has reached EOF or authoritative Codex terminal
+  // evidence and the usage window has been assembled (after an asynchronous decompressor flush when
+  // needed) — by which time the client has the response and its `Stop` hook may already have closed
+  // the run. Run membership keys on THIS instant, which is provably before any response and therefore
+  // before any `Stop` it triggers.
   const requestStartedAt = new Date().toISOString();
   // THE UPSTREAM BILLING ROUTE for this request, evidenced by what this request presented (see
   // `upstreamRouteTypeFor`). Resolved once here and handed to both records that need it — the signed
@@ -653,9 +855,11 @@ async function handleProxy(
   // forwarded body), hop-by-hop headers, and Compaction's own control headers (mode/policy are local-only
   // and are NEVER sent upstream). The client's Authorization rides through untouched and is NEVER read,
   // stored, or logged by the gateway.
-  const headers: http.OutgoingHttpHeaders | string[] = options.claudeSubscription
-    ? forwardedRawRequestHeaders(req, target.host, bodyToForward.length)
-    : ordinaryForwardedHeaders(req, target.host, bodyToForward.length);
+  const headers: http.OutgoingHttpHeaders | string[] = options.codexSubscription
+    ? forwardedCodexRawRequestHeaders(req, target.host, bodyToForward.length)
+    : options.claudeSubscription
+      ? forwardedRawRequestHeaders(req, target.host, bodyToForward.length)
+      : ordinaryForwardedHeaders(req, target.host, bodyToForward.length);
 
   const requestOptions: http.RequestOptions = {
     protocol: target.protocol,
@@ -672,12 +876,26 @@ async function handleProxy(
         // killed mid-flight (an LLM turn can go quiet for extended thinking / a slow tool call). The
         // streaming phase stays unbounded, as before, while a never-responding upstream is still bounded.
         upstreamReq.setTimeout(0);
+        // The client may have disconnected before the upstream sent its first response headers.
+        if (res.destroyed || res.writableEnded) {
+          upstreamRes.destroy();
+          return;
+        }
         // Forward status + headers VERBATIM, then stream the body byte-for-byte to the client.
         const status = upstreamRes.statusCode ?? 502;
-        const subscriptionHeaders = options.claudeSubscription
-          ? safeClaudeSubscriptionResponseHeaders(status, upstreamRes.rawHeaders, upstreamOrigin)
-          : undefined;
-        if (options.claudeSubscription && !subscriptionHeaders) {
+        const hasContentTypeHeader = Object.prototype.hasOwnProperty.call(upstreamRes.headers, "content-type");
+        const contentType = headerValue(upstreamRes.headers["content-type"])?.toLowerCase();
+        const isCodexResponsesSse = contentType?.split(";", 1)[0].trim() === "text/event-stream";
+        // The pinned ChatGPT Codex Responses backend legitimately omits Content-Type on its SSE
+        // stream. Absence is eligible for the same strict terminal-event parser; an explicit
+        // non-SSE type remains fail-closed.
+        const mayBeCodexResponsesSse = isCodexResponsesSse || !hasContentTypeHeader;
+        const subscriptionHeaders = options.codexSubscription
+          ? safeCodexSubscriptionResponseHeaders(status, upstreamRes.rawHeaders)
+          : options.claudeSubscription
+            ? safeClaudeSubscriptionResponseHeaders(status, upstreamRes.rawHeaders, upstreamOrigin)
+            : undefined;
+        if ((options.claudeSubscription || options.codexSubscription) && !subscriptionHeaders) {
           upstreamRes.resume();
           res.writeHead(502, { "content-type": "application/json" });
           res.end(JSON.stringify({ error: { message: "compaction gateway: upstream redirect rejected", type: "gateway_error" } }));
@@ -685,19 +903,8 @@ async function handleProxy(
         }
         res.writeHead(
           status,
-          options.claudeSubscription ? subscriptionHeaders! : upstreamRes.headers
+          options.claudeSubscription || options.codexSubscription ? subscriptionHeaders! : upstreamRes.headers
         );
-        // Byte-safe: the client sees the exact upstream bytes (streaming or not). `pipeline` (not raw
-        // pipe) so a mid-stream upstream error is CAUGHT instead of becoming an uncaught 'error' that
-        // crashes the process: on failure the client stream is aborted cleanly (truncation stays
-        // visible to the client - nothing is ever spliced into a partially streamed body).
-        pipeline(upstreamRes, res, (err) => {
-          if (err) {
-            log(`compaction gateway: response stream ended abnormally for ${endpoint}: ${(err as Error).message}`);
-            res.destroy();
-          }
-        });
-
         // Tee a bounded HEAD *and* a bounded TAIL of the response for usage parsing. Anthropic streaming
         // splits usage: `input_tokens` (+ cache) rides the FIRST SSE event (`message_start`, captured by the
         // head) and `output_tokens` rides the LAST (`message_delta`, captured by the tail); OpenAI / a
@@ -710,12 +917,15 @@ async function handleProxy(
         // token counts; a decompression failure fails open to `unavailable` with an honest reason. The whole
         // decompressed body is never buffered (streaming, bounded head+tail).
         const usageTee = createUsageTee(upstreamRes.headers["content-encoding"], USAGE_HEAD_BYTES, USAGE_TAIL_BYTES);
-        const runEnd = async (): Promise<void> => {
+        const runEnd = async (requireCodexCompletedEvent = false): Promise<void> => {
           const window = await usageTee.finish();
           // A supported-but-corrupt/unsupported compressed stream fails open: feed the adapter nothing so the
           // receipt is honestly `unavailable`, carrying the decompression reason instead of a fabricated zero.
           const responseTail = window.ok ? window.windowText : "";
           const usageUnavailableReason = window.ok ? undefined : window.reason;
+          if (requireCodexCompletedEvent && (!window.ok || !hasCodexCompletedEventWithUsage(responseTail, adapter))) {
+            return;
+          }
           // Computed ONCE per request: it reads the salt file and runs an HMAC, and this is the
           // per-call hot path.
           const correlationEnv = options.entitlementEnv ?? process.env;
@@ -808,8 +1018,9 @@ async function handleProxy(
             }));
           }
           // LCM SHADOW (explicit opt-in, default OFF): starts only AFTER the upstream response has
-          // fully arrived, on a DETACHED promise this handler never awaits, it cannot touch the
-          // forwarded request (already sent, unchanged) or the response (already streamed, unchanged).
+          // reached EOF or authoritative Codex terminal evidence, on a DETACHED promise this handler
+          // never awaits. It cannot touch the forwarded request (already sent, unchanged) or the
+          // response (already streamed, unchanged).
           // Record-mode POST requests only: the deterministic apply/dry-run path (explicit OR
           // stored-authorization) is never shadowed. `runGatewayLcmShadowEvaluation` never throws.
           if (lcmShadow.enabled && req.method === "POST" && !effectiveActivation.requested) {
@@ -822,32 +1033,55 @@ async function handleProxy(
             });
           }
         };
+        let settleResponse!: (kind: "eof" | "premature") => void;
+        const responseSettlement = new Promise<void>((resolve) => {
+          let settled = false;
+          settleResponse = (kind): void => {
+            if (settled) return;
+            settled = true;
+            const mayUseTerminalEvent =
+              kind === "premature" && options.codexSubscription !== undefined && mayBeCodexResponsesSse &&
+              status >= 200 && status < 300;
+            if (kind === "premature" && !mayUseTerminalEvent) {
+              resolve();
+              return;
+            }
+            void runEnd(mayUseTerminalEvent).then(resolve, resolve);
+          };
+        });
+        // Register BEFORE any response byte can be piped to Codex. Its SSE consumer stops at the
+        // terminal event and may close the socket before upstream EOF; close() must already know the
+        // settlement work exists at that instant.
+        pendingBookkeeping.track(responseSettlement);
+        if (options.codexSubscription !== undefined && mayBeCodexResponsesSse && status >= 200 && status < 300) {
+          res.once("close", () => settleResponse("premature"));
+        }
+        // Byte-safe: the client sees the exact upstream bytes (streaming or not). `pipeline` (not raw
+        // pipe) so a mid-stream upstream error is CAUGHT instead of becoming an uncaught 'error' that
+        // crashes the process: on failure the client stream is aborted cleanly (truncation stays
+        // visible to the client - nothing is ever spliced into a partially streamed body).
+        pipeline(upstreamRes, res, (err) => {
+          if (err) {
+            settleResponse("premature");
+            log(`compaction gateway: response stream ended abnormally for ${endpoint}: ${(err as Error).message}`);
+            res.destroy();
+          }
+        });
+
         upstreamRes.on("data", (c: Buffer) => usageTee.push(c));
         upstreamRes.on("end", () => {
-          // Detached: the client response is already fully streamed (pipeline above). Assembling the usage
-          // window (which may flush a streaming decompressor) never touches the forwarded bytes; a failure
-          // there is swallowed so the receipt path can never disturb the client response.
-          //
-          // `track` is the same fire-and-forget this line always was — synchronous, `void`-returning, and
-          // rejection-swallowing (so the former `.catch` is now redundant, not dropped). It only records
-          // the promise so `close()` can wait for it.
-          //
-          // `runEnd` is tracked IN ADDITION TO the individual appends inside it, and both are needed.
-          // `runEnd` first awaits `usageTee.finish()` and only then starts (and tracks) the appends, so
-          // tracking the appends alone leaves a window in which a drain would find nothing pending and
-          // shut down over the very write it exists to wait for; tracking `runEnd` alone is not enough
-          // either, because it `track`s the appends rather than awaiting them and so resolves while they
-          // are still in flight. Together they chain: the drain holds for `runEnd`, which registers the
-          // appends before it resolves, and the drain then holds for those.
-          //
-          // Registering HERE — in the same synchronous emit that ends the client response, because this
-          // listener is attached after the `pipeline(upstreamRes, res, …)` call above — is what makes a
-          // request that is still in flight when `close()` is called covered too.
+          // Detached: the client response has reached its terminal point (pipeline above). Assembling
+          // the usage window (which may flush a streaming decompressor) never touches the forwarded
+          // bytes; a failure there is swallowed so the receipt path can never disturb the client
+          // response.
           //
           // The LCM shadow evaluation started inside `runEnd` stays detached and untracked on purpose:
           // it is opt-in and can run arbitrarily long, and shutdown latency is user-facing.
-          pendingBookkeeping.track(runEnd());
+          settleResponse("eof");
         });
+        upstreamRes.on("aborted", () => settleResponse("premature"));
+        upstreamRes.on("error", () => settleResponse("premature"));
+        upstreamRes.on("close", () => settleResponse("premature"));
       }
     );
 
@@ -857,6 +1091,7 @@ async function handleProxy(
     upstreamReq.setTimeout(options.upstreamTimeoutMs ?? UPSTREAM_STALL_TIMEOUT_MS, () => upstreamReq.destroy(new Error("upstream timeout")));
 
     upstreamReq.on("error", (err) => {
+      if (res.destroyed || res.writableEnded) return;
       // The gateway itself failed to reach upstream, an honest gateway error (never a faked success).
       log(`compaction gateway: upstream error for ${endpoint}: ${(err as Error).message}`);
       if (!res.headersSent) {
@@ -870,6 +1105,8 @@ async function handleProxy(
 
   if (bodyToForward.length > 0) upstreamReq.write(bodyToForward);
   upstreamReq.end();
+  // A disconnected downstream client does not prove its upstream request/bookkeeping finished.
+  await new Promise<void>((resolve) => upstreamReq.once("close", resolve));
 }
 
 function ordinaryForwardedHeaders(req: http.IncomingMessage, host: string, contentLength: number): http.OutgoingHttpHeaders {
@@ -900,15 +1137,16 @@ function headerValue(v: string | string[] | undefined): string | undefined {
  *
  * DERIVED FROM WHAT THE CLIENT ACTUALLY PRESENTED, never from key contents and never from a default:
  *
- *  1. An explicit `--subscription` transport (`options.claudeSubscription`) already IS the declaration.
+ *  1. An explicit `--subscription` transport (`options.claudeSubscription` or
+ *     `options.codexSubscription`) already IS the declaration.
  *  2. Otherwise, on the Claude Code route only, the request itself is the evidence. An Anthropic
  *     API-key call authenticates with `x-api-key`; a saved-login / Claude Max session has no API key
  *     to put there and authenticates with its own credential instead. So the PRESENCE of a non-empty
  *     `x-api-key` header — the header NAME only, the value is never read, compared, hashed, logged or
  *     retained — is direct evidence of the API-key route, and its absence is evidence against it.
- *  3. Every other route (`codex`/`cursor`/OpenAI, an explicitly started gateway with no workflow
- *     identity) keeps `api-key` exactly as before. Those transports have no subscription form here,
- *     so there is nothing for this to decide and their behaviour is untouched.
+ *  3. Every other route (`cursor`/ordinary OpenAI, an explicitly started gateway with no workflow
+ *     identity) keeps `api-key` exactly as before. The Codex subscription form is explicit, so no
+ *     credential-name inference is needed for it.
  *
  * WHY THIS SHAPE. Before, the absence of a `--subscription` transport was read as proof of an API key,
  * which is not something the gateway knew: `gateway ensure` — the path the `claude` PATH shim takes on
@@ -923,7 +1161,7 @@ function upstreamRouteTypeFor(
   options: GatewayServerOptions,
   req: Pick<http.IncomingMessage, "headers">
 ): "api-key" | "subscription" {
-  if (options.claudeSubscription) return SUBSCRIPTION_ROUTE_TYPE;
+  if (options.claudeSubscription || options.codexSubscription) return SUBSCRIPTION_ROUTE_TYPE;
   if (options.provider !== "anthropic" || options.workflow !== "claude-code") return API_KEY_ROUTE_TYPE;
   return headerValue(req.headers["x-api-key"]) !== undefined ? API_KEY_ROUTE_TYPE : SUBSCRIPTION_ROUTE_TYPE;
 }
@@ -982,7 +1220,7 @@ interface ApplyOutcome {
  * it. That rule is `receiptProvenOpenLabel`, shared with the surfaces that replay receipts (`watch`,
  * `status`) so the same receipt cannot be labelled two ways by two renderers.
  *
- * A REAL full apply takes the COMMUNITY BUILDER, exactly as `watch`, `statusline` and the Claude Code
+ * A receipt proving a successful stored-policy private LCM apply takes the COMMUNITY BUILDER, exactly as `watch`, `statusline` and the Claude Code
  * Stop hook do. This path used to fall through to the unlabelled Open rendering instead, so one
  * full-apply receipt rendered `input B→A (−PP%) · output N · id …` here and
  * `input B→A (−PP%) · output B→A (−PP%, est. …) · −$X (list price) · full apply · id …` on the other
@@ -993,8 +1231,9 @@ interface ApplyOutcome {
  * The dispatch is deliberately the SAME SHAPE as the other three surfaces (`full` tier → community
  * builder, with the Open line as the fallback for a non-apply turn on a full-tier device), so a future
  * change to the rule has one obvious set of call sites rather than three-plus-an-exception. The builder
- * itself still refuses to synthesize: it returns undefined unless the receipt carries a REAL apply
- * before→after, so a record or Open receipt can never acquire a `full apply` label here.
+ * itself still refuses to synthesize: it returns undefined unless the receipt proves a successful
+ * stored-policy private LCM input reduction, so a deterministic, failed, record, or Open receipt can
+ * never acquire a `full apply` label here.
  *
  * The output arrow rides the calibrated rate applied to THIS turn's own output, on BOTH branches. It is
  * requested only when `outputShapingActiveForTurn` proves the final request was shaped; a real input
@@ -1052,10 +1291,9 @@ export async function perTurnLineFromReceipt(
   }
 
   if (realApply) {
-    // The tier is asked of the DEVICE here, not of the receipt, because `full apply` is an
-    // entitlement statement and the receipt does not carry one. `communityFullApplyReceiptLine`
-    // independently re-checks that the receipt is a real apply, so a mis-resolved tier can widen
-    // nothing: a non-apply receipt still returns undefined and falls through.
+    // The tier is asked of the DEVICE here, while private component, authorization, reduction, and
+    // upstream success come from the receipt. `communityFullApplyReceiptLine` independently checks all
+    // receipt evidence, so a mis-resolved tier cannot promote deterministic, failed, or shaping-only work.
     try {
       const { tier } = await resolveOpenTier(env);
       if (tier === "full") {
@@ -1269,7 +1507,50 @@ async function resolveStoredAuthorizationApply(
     // the journal rather than against the lease. The reader used to fold a spent balance into this
     // verdict, which made this gate withdraw the whole capability — including the output shaping the
     // allowance never bought and which must keep running on a spent period.
-    const leaseVerdict = readLeaseVerdict(options.entitlementEnv ?? process.env);
+    const entitlementEnv = options.entitlementEnv ?? process.env;
+    let leaseVerdict = readLeaseVerdict(entitlementEnv);
+    if (leaseVerdict.label !== "lease-valid") {
+      // REQUEST-TIME RECOVERY. A long-lived gateway can outlive the 24h lease TTL, and start-time
+      // repair is fire-and-forget — so a signed-in, still-entitled device can hit this gate with an
+      // expired lease while Community is still valid server-side. Lease-only silent renew (no engine
+      // download) restores authorization when the service still grants it; authoritative denials
+      // fail closed below. Open devices (no credentials) are a no-op inside the repair.
+      //
+      // BOUNDED. An unbounded await would stall provider traffic for the network stack's full timeout
+      // when the entitlement endpoint hangs. After the deadline the current request fails open to
+      // record-only; the next request can retry.
+      try {
+        const { ensureCommunityRuntime, REQUEST_TIME_LEASE_RENEW_MS } = await import(
+          "../entitlement/community-runtime.js"
+        );
+        const controller = new AbortController();
+        // CALLER-LOCAL DEADLINE. Aborting the signal is not enough by itself: if this request joined
+        // an in-flight lease repair started without its signal (gateway start / status), the shared
+        // promise ignores the abort. Promise.race guarantees this request stops waiting at the bound
+        // and fails open to record-only; the shared repair continues for later retries.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const deadline = new Promise<"timeout">((resolve) => {
+          timer = setTimeout(() => {
+            controller.abort();
+            resolve("timeout");
+          }, REQUEST_TIME_LEASE_RENEW_MS);
+        });
+        try {
+          await Promise.race([
+            ensureCommunityRuntime(entitlementEnv, () => {}, {
+              leaseOnly: true,
+              signal: controller.signal
+            }).then(() => "done" as const),
+            deadline
+          ]);
+        } finally {
+          if (timer !== undefined) clearTimeout(timer);
+        }
+      } catch {
+        // Repair never throws by contract; this catch only protects the apply path.
+      }
+      leaseVerdict = readLeaseVerdict(entitlementEnv);
+    }
     if (leaseVerdict.label !== "lease-valid") {
       log(
         `compaction gateway: stored authorization ${authorization.id} did not apply - entitlement ${leaseVerdict.label} (record mode, original forwarded unchanged).`
@@ -1395,7 +1676,17 @@ async function resolveStoredAuthorizationApply(
       //
       // Passed in the frame so the engine's activation is auditable and bound to THIS request. The
       // supervisor's env allowlist stays two keys, so there is no ambient way to switch it on.
-      input_compaction_enabled: true,
+      //
+      // AND WITHDRAWN WHEN THE PAIR CANNOT METER IT. An engine whose SIGNED manifest declares a meter
+      // unit this client cannot place will have every input-compacted body refused at the meter guard
+      // below — after the engine has already spent the work, LCM model round trip included. That
+      // refusal is correct and stays (see the guard); asking for the work first is not. So the request
+      // is narrowed to what the pair can actually deliver, and output shaping — which costs no input
+      // allowance and is unaffected by the input meter — is still requested exactly as before.
+      //
+      // `unsupported` ONLY: `unknown` (dev build, env/option override — no manifest to read) keeps the
+      // previous behaviour, because for those the request-time guard is still the only authority.
+      input_compaction_enabled: supervisor.inputCompactionSupport.support !== "unsupported",
       request_body: originalText,
       authorization: { policy_id: authorization.id, scope_hash: authorization.scope.tool },
       // ENTITLEMENT: a content-free opaque proof-of-entitlement (the verified lease's period; never
@@ -1586,8 +1877,19 @@ async function resolveStoredAuthorizationApply(
       // This is NOT an allowance decision, so it does not degrade to output shaping and does not
       // claim a pause: nothing about the user's allowance is known here.
       if (wouldMeterVersion !== ACTIVE_USAGE_METER_VERSION) {
+        // A MANIFEST THAT DISAGREES WITH ITS OWN ARTIFACT is its own defect, and worth naming
+        // separately. The pairing gate reads the SIGNED MANIFEST's declared unit; this reads what the
+        // running engine actually stamped on the response. They are two statements about one engine,
+        // and a release that ships them out of step (a manifest re-declared without a rebuilt
+        // artifact) would silence the pairing surface while every apply is still discarded here —
+        // exactly the invisible outage the pairing gate exists to end. So the disagreement is logged
+        // as a disagreement rather than as an old engine, because "update the engine" is not the
+        // remedy for it.
+        const declared = supervisor.inputCompactionSupport;
         log(
-          `compaction gateway: stored authorization ${authorization.id} did not apply - the engine reported an optimized-input count in an unrecognized meter unit (${wouldMeterVersion}); nothing debited, original forwarded unchanged. Update the engine to restore input optimization.`
+          declared.support === "supported"
+            ? `compaction gateway: stored authorization ${authorization.id} did not apply - the installed engine's signed manifest declares ${declared.meterVersion} but the running artifact reported ${wouldMeterVersion}; nothing debited, original forwarded unchanged. The engine release is internally inconsistent - reinstall it.`
+            : `compaction gateway: stored authorization ${authorization.id} did not apply - the engine reported an optimized-input count in an unrecognized meter unit (${wouldMeterVersion}); nothing debited, original forwarded unchanged. Update the engine to restore input optimization.`
         );
         return null;
       }

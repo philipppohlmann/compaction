@@ -17,6 +17,12 @@ import { probeListening } from "../../src/core/gateway/status.js";
  */
 
 let cwd: string;
+/**
+ * The routing slot registry is USER-GLOBAL. Redirect the Compaction home to a temp directory so this
+ * test can never read, write, or stop anything in the developer's real `~/.compaction`.
+ */
+let compactionHome: string;
+let env: { COMPACTION_HOME: string };
 let upstream: { port: number; close: () => Promise<void> };
 let running: RunningGateway[] = [];
 
@@ -51,7 +57,7 @@ function pidfile(): string {
   return path.join(cwd, ".compaction", "gateway", "gateway.json");
 }
 
-function startViaCli(config: { idleTtlMs?: number; port?: number }): Promise<RunningGateway> {
+function startViaCli(config: { idleTtlMs?: number; port?: number; routingSlot?: string }): Promise<RunningGateway> {
   return runGatewayStart({
     provider: "anthropic",
     upstream: `http://127.0.0.1:${upstream.port}`,
@@ -61,11 +67,17 @@ function startViaCli(config: { idleTtlMs?: number; port?: number }): Promise<Run
     cwd,
     log: () => {},
     installSignals: false,
+    ...(config.routingSlot ? { routingSlot: config.routingSlot } : {}),
     ...(config.idleTtlMs !== undefined ? { idleTtlMs: config.idleTtlMs } : {})
   }).then((g) => {
     running.push(g);
     return g;
   });
+}
+
+/** Read a flag's value out of a spawned `gateway start …` argv tail. */
+function argOf(args: string[], flag: string): string {
+  return args[args.indexOf(flag) + 1];
 }
 
 function portOf(g: RunningGateway): number {
@@ -74,6 +86,9 @@ function portOf(g: RunningGateway): number {
 
 beforeEach(async () => {
   cwd = mkdtempSync(path.join(tmpdir(), "gw-idle-cli-"));
+  compactionHome = mkdtempSync(path.join(tmpdir(), "gw-idle-home-"));
+  env = { COMPACTION_HOME: compactionHome };
+  process.env.COMPACTION_HOME = compactionHome;
   upstream = await startFakeUpstream();
 });
 
@@ -81,7 +96,9 @@ afterEach(async () => {
   for (const g of running) await g.close().catch(() => undefined);
   running = [];
   await upstream.close();
+  delete process.env.COMPACTION_HOME;
   rmSync(cwd, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  rmSync(compactionHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 describe("idle shutdown lifecycle (runGatewayStart)", () => {
@@ -97,16 +114,22 @@ describe("idle shutdown lifecycle (runGatewayStart)", () => {
     expect(await waitFor(async () => !(await probeListening("127.0.0.1", portOf(dead))), 3000)).toBe(true);
 
     // The shim's next run calls ensure: no live gateway → start (here: in-process, same config path).
+    // The stand-in honours the two things the real detached child is told - WHICH port to bind and
+    // WHICH routing slot to own - so the record ensure polls for is the one a real start would write.
     const result = await ensureGateway({
       provider: "anthropic",
       upstream: `http://127.0.0.1:${upstream.port}`,
       cwd,
+      env,
       pollMs: 20,
       waitMs: 3000,
-      spawnGatewayStart: () => {
-        void startViaCli({ idleTtlMs: 60_000 });
-      },
-      pickPort: async () => 0
+      spawnGatewayStart: (args) => {
+        void startViaCli({
+          port: Number(new URL(argOf(args, "--listen")).port),
+          routingSlot: argOf(args, "--routing-slot"),
+          idleTtlMs: 60_000
+        });
+      }
     });
     expect(result.status).toBe("started");
     if (result.status !== "started") return;

@@ -68,20 +68,30 @@ export const READY_PER_TURN_EXAMPLE_HOOK_ONLY = formatReceiptLine({
 });
 
 /**
- * The honest per-turn description lines, exactly what prints, per tool. The GATEWAY example is scoped
- * to the route that actually produces it: `Codex (Gateway route)` used to ride this same line, which
- * attached an input `−NN%` and a `−$X` cost clause to Codex setups that have no Gateway route at all.
- * The route is named as the condition, never as the default.
+ * The honest per-turn description lines, exactly what prints, per tool. The APPLY-style GATEWAY example
+ * (an input `−NN%` before→after AND a `−$X` cost clause) is scoped to Claude Code only: those figures
+ * are real only for a request the Gateway actually APPLIED. A static Codex onboarding example has no
+ * settled request evidence, so attaching that reduction and dollar figure would claim facts this
+ * screen cannot back. (`runThroughGateway` refuses the explicit gateway-wide `--mode apply` flag with
+ * `--subscription`, while stored Community authorization is evaluated independently on eligible turns.)
+ *
+ * Codex's PATH shim IS a Gateway route now (`core/tool-shim.ts`, `kind: "gateway-route"`): connecting
+ * Codex routes every normal invocation - interactive included - through the local Gateway unless
+ * Compaction detects the user's own route or an OpenAI API key, in which case that run falls back
+ * unmeasured. Receipt evidence is shown only for settled artifacts; requests without one are not
+ * inferred as measured. That is stated in its own line rather than folded into the Claude Code Gateway
+ * example, so this array never claims a reduction/cost figure without settled Codex evidence.
  */
 export const READY_PER_TURN_LINES = [
   READY_PER_TURN_HEADER,
   `  Claude Code (Gateway route):  ${READY_PER_TURN_EXAMPLE_GATEWAY}`,
   `  Claude Code (hook only, no Gateway):  ${READY_PER_TURN_EXAMPLE_HOOK_ONLY}`,
-  `  Codex (hooks, no Gateway route):  ${READY_PER_TURN_EXAMPLE_HOOK_ONLY}`,
+  `  Codex (hook, if your build displays it; settled evidence only when recorded):  ${READY_PER_TURN_EXAMPLE_HOOK_ONLY}`,
+  "  Codex: every normal invocation also routes through the local Gateway unless your own model-provider route or an OpenAI API key is detected; settled receipt evidence is shown only when recorded.",
   "  Cursor: no inline line - Cursor has no channel to display one; see `compaction watch`.",
   "  Counts + labels + source + short receipt id only (never your prompt, code, or response).",
-  "  Input reduction is shown only on the Gateway route; output is a count, never a per-turn reduction.",
-  "  Silence it anytime with COMPACTION_RECEIPT_LINE=0 (receipts are still written)."
+  "  Input reduction is shown only on the Gateway APPLY route; output is a count, never a per-turn reduction.",
+  "  Silence it anytime with COMPACTION_RECEIPT_LINE=0 (receipt collection remains enabled)."
 ] as const;
 
 /**
@@ -103,14 +113,30 @@ const READY_PER_TURN_CURSOR_NO_HOOK_LINE =
   "  Cursor: no inline line - Cursor has no channel to display one; see `compaction watch`. And this setup's Cursor session hook is NOT confirmed on disk, so nothing is attached to what the model sees; local-estimate counts only. Install it:  compaction hooks install --tool cursor";
 
 /**
- * The Codex per-turn block for the setup THIS onboarding flow produces: a capture shim plus the native
- * `UserPromptSubmit` shaping hook and the `Stop` per-turn-line hook. That is NOT a Gateway route.
+ * The Codex GATEWAY-ROUTE lines, shared by all three hook-state variants below. Codex being "enabled"
+ * on the Ready screen means its PATH shim is connected (`core/tool-shim.ts`, `kind: "gateway-route"`),
+ * which is INDEPENDENT of the separate output-shaping hooks these three variants otherwise differ on:
+ * every normal `codex` invocation - interactive included - routes through the local Gateway whether
+ * or not the shaping hooks are installed, confirmed, or pending approval. Receipt evidence is shown
+ * only when a settled artifact exists.
+ * The one exception is a run where Compaction detects the user's OWN route already declared (env,
+ * argv, or a top-level `model_provider` in `~/.codex/config.toml`) or an OpenAI API key present - that
+ * run falls back to the legacy measurable-batch-form capture (`codex exec --json` only) and is
+ * otherwise unmeasured, same as Cursor.
  *
- * The Gateway example line carries an input `−NN%` AND a `−$0.14 (list price)` cost clause, both of
- * which are real only for a request the local Gateway actually compacted. Printing it here attached a
- * reduction and a dollar figure to a setup that produces neither — so the hook-only shape (an output
- * COUNT, no reduction, no dollar figure) is what a connected Codex is shown, and the Gateway route is
- * named separately as the thing the user does NOT currently have.
+ * NO reduction/cost figure is claimed here (unlike Claude Code's Gateway APPLY example): this static
+ * onboarding block has no settled Codex request evidence, so it states only the route and evidence
+ * boundary, never an input `−NN%` or a `−$X` clause.
+ */
+const READY_PER_TURN_CODEX_GATEWAY_LINES = [
+  "  Codex: every normal `codex` invocation - interactive included - routes through the local Gateway unless Compaction detects your own model-provider route or an OpenAI API key. Settled receipt evidence is shown only when recorded; nothing is inferred for a request without one.",
+  "  `compaction watch` shows settled Gateway evidence when recorded, including interactive Codex sessions."
+] as const;
+
+/**
+ * The Codex per-turn block for a setup whose output-shaping hooks (`UserPromptSubmit` + `Stop`
+ * per-turn-line) ARE confirmed installed. The Gateway-route lines above are ALWAYS appended, because
+ * routing is a property of the connected PATH shim, not of these hooks.
  *
  * RENDERING IS UNPROVEN, DELIBERATELY SAID SO. `core/codex-turn-line-hook.ts` records that Codex's hook
  * schema ACCEPTS `systemMessage` and that only a live run proves it RENDERS it. "You'll see a line after
@@ -118,21 +144,17 @@ const READY_PER_TURN_CURSOR_NO_HOOK_LINE =
  * either way.
  */
 const READY_PER_TURN_CODEX_LINES = [
-  `  Codex (hook installed - if your Codex build displays it, one line per turn):  ${READY_PER_TURN_EXAMPLE_HOOK_ONLY}`,
-  "  Codex: no input reduction and no cost figure from this setup - it installs hooks, not a Gateway route.",
-  "  The Gateway route (a separate, explicit `compaction gateway run -- codex …`) is what adds an input before→after line.",
-  // NOT "guaranteed either way". `compaction watch` reads Gateway receipts and shim-captured runs; an
-  // INTERACTIVE codex session produces neither, so a blanket guarantee would move the defect this
-  // block exists to avoid (a surface that stays empty for the workflow you just set up) one screen later.
-  "  `compaction watch` shows Gateway-routed Codex turns; interactive sessions are not measured."
+  `  Codex (hook installed - if your Codex build displays it, settled evidence only when recorded):  ${READY_PER_TURN_EXAMPLE_HOOK_ONLY}`,
+  ...READY_PER_TURN_CODEX_GATEWAY_LINES
 ] as const;
 
 /**
- * The Codex block for a setup whose hooks are NOT confirmed on disk — the install was refused, failed
- * its verify re-read, or never ran because shaping is switched off (`COMPACTION_SHAPING_HOOKS=0` /
- * `compaction stop`). The block above states the hook is installed; printing it in that state put a
+ * The Codex block for a setup whose shaping hooks are NOT confirmed on disk — the install was refused,
+ * failed its verify re-read, or never ran because shaping is switched off (`COMPACTION_SHAPING_HOOKS=0`
+ * / `compaction stop`). The block above states the hook is installed; printing it in that state put a
  * claim about a hook that is not there directly beside the routing subsection that reads the real
- * state off disk, inside one screen.
+ * state off disk, inside one screen. The Gateway-route lines still apply: the PATH shim's routing is
+ * unaffected by whether these separate shaping hooks are installed.
  *
  * It says "not confirmed" rather than naming which entry is missing, because the confirmation is a
  * single re-read that requires BOTH of this setup's Codex entries; the caller cannot honestly say more.
@@ -140,16 +162,21 @@ const READY_PER_TURN_CODEX_LINES = [
  */
 const READY_PER_TURN_CODEX_NO_HOOK_LINES = [
   "  Codex: no per-turn receipt line - this setup's Codex hooks are NOT confirmed on disk (shaping is switched off, or the install did not verify).",
-  "  Codex: no input reduction and no cost figure from this setup either - it installs hooks, not a Gateway route.",
   "  Install or retry them when you want them:  compaction hooks install --tool codex",
-  "  `compaction watch` shows Gateway-routed Codex turns; interactive sessions are not measured."
+  ...READY_PER_TURN_CODEX_GATEWAY_LINES
+] as const;
+const READY_PER_TURN_CODEX_CONFIGURED_LINES = [
+  "  Codex: hooks are configured on disk, but whether Codex is running them depends on its one-time hook approval.",
+  "  Codex: no active per-turn receipt or attached shaping instruction is claimed until Codex reports that approval active.",
+  "  The hooks do not need reinstalling. Check their native state with:  compaction status",
+  ...READY_PER_TURN_CODEX_GATEWAY_LINES
 ] as const;
 /** The content-free scope line: what a receipt line does (and does not) contain. */
 const READY_PER_TURN_CONTENT_FREE_LINE =
   "  Counts + labels + source + short receipt id only (never your prompt, code, or response).";
 /** The silence line: how to turn the receipt line off (receipts still written). */
 const READY_PER_TURN_SILENCE_LINE =
-  "  Silence it anytime with COMPACTION_RECEIPT_LINE=0 (receipts are still written).";
+  "  Silence it anytime with COMPACTION_RECEIPT_LINE=0 (receipt collection remains enabled).";
 
 /**
  * Does this workflow have an UNHEDGED per-turn line - one the header may promise flatly? Only Claude
@@ -193,11 +220,11 @@ function readyPerTurnHeader(enabledToolKeys: readonly ReadyToolKey[]): string {
  * The dropped "Input reduction is shown only on the Gateway route…" meta line is not needed once the
  * block is scoped to the enabled tool(s); the per-example labels already carry that boundary.
  *
- * `shapingHooksInstalled` is the set whose native hooks are CONFIRMED on disk (the caller re-reads the
- * tool's own config after the enable). Codex and Cursor each get their not-confirmed variant when they
- * are absent from it, so this block can never claim a hook the routing subsection beside it denies.
- * The default is EMPTY on purpose: a caller that cannot confirm must understate, never claim. Claude
- * Code's lines describe the Gateway/hook-only ROUTES and are unaffected by this axis.
+ * `shapingHooksInstalled` is the native-active set. `shapingHooksConfigured` preserves Codex's
+ * distinct approval-pending state: the complete bundle is on disk, but no attached/running claim is
+ * made until Codex reports it active. When neither state is present, Codex/Cursor get the genuinely
+ * not-installed variant. Both defaults are EMPTY so an unknown caller understates. Claude Code's
+ * lines describe the Gateway/hook-only ROUTES and are unaffected by these axes.
  *
  * The HEADER is resolved from the ENABLED SET ALONE (see `readyPerTurnHeader`), so it can never promise
  * a per-turn line that a body line below it then denies or hedges. It deliberately does not read
@@ -206,7 +233,8 @@ function readyPerTurnHeader(enabledToolKeys: readonly ReadyToolKey[]): string {
  */
 export function readyPerTurnLinesForTools(
   enabledToolKeys: readonly ReadyToolKey[],
-  shapingHooksInstalled: readonly ReadyToolKey[] = []
+  shapingHooksInstalled: readonly ReadyToolKey[] = [],
+  shapingHooksConfigured: readonly ReadyToolKey[] = []
 ): string[] {
   const lines: string[] = [readyPerTurnHeader(enabledToolKeys)];
   if (enabledToolKeys.includes("claude-code")) {
@@ -214,7 +242,13 @@ export function readyPerTurnLinesForTools(
     lines.push(`  Claude Code (hook only, no Gateway):  ${READY_PER_TURN_EXAMPLE_HOOK_ONLY}`);
   }
   if (enabledToolKeys.includes("codex")) {
-    lines.push(...(shapingHooksInstalled.includes("codex") ? READY_PER_TURN_CODEX_LINES : READY_PER_TURN_CODEX_NO_HOOK_LINES));
+    lines.push(
+      ...(shapingHooksInstalled.includes("codex")
+        ? READY_PER_TURN_CODEX_LINES
+        : shapingHooksConfigured.includes("codex")
+          ? READY_PER_TURN_CODEX_CONFIGURED_LINES
+          : READY_PER_TURN_CODEX_NO_HOOK_LINES)
+    );
   }
   if (enabledToolKeys.includes("cursor")) {
     lines.push(shapingHooksInstalled.includes("cursor") ? READY_PER_TURN_CURSOR_LINE : READY_PER_TURN_CURSOR_NO_HOOK_LINE);

@@ -24,12 +24,20 @@ let home: string;
 let projDir: string;
 let compactionBin: string;
 
-function env(pathValue: string): ShimEnv & { COMPACTION_BIN: string; TMPDIR: string; NO_COLOR: string } {
+function env(pathValue: string): ShimEnv & {
+  COMPACTION_BIN: string;
+  TMPDIR: string;
+  NO_COLOR: string;
+  OPENAI_BASE_URL: string;
+} {
   return {
     HOME: home,
     COMPACTION_HOME: path.join(home, ".compaction"),
     PATH: pathValue,
     COMPACTION_BIN: compactionBin,
+    // Preserve this capture-only compatibility contract when the user owns the upstream route.
+    // The no-override subscription route has its own end-to-end transparency coverage.
+    OPENAI_BASE_URL: "http://127.0.0.1:9999/v1",
     TMPDIR: root,
     NO_COLOR: "1"
   };

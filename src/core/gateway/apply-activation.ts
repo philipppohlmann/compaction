@@ -8,7 +8,7 @@
  * always record (byte-safe, no mutation).
  */
 import { DEDUPE_POLICY, type ApplyPolicyName } from "./request-shape.js";
-import type { LcmApplyPolicyName } from "./lcm-qualified-classes.js";
+import type { LcmApplyPolicyName } from "./lcm-apply-policy-name.js";
 // TYPE-ONLY, so nothing is imported at runtime and the value-level dependency stays one-way
 // (`apply-receipt` -> `apply-activation`). The Open-basic output policy is a policy this activation
 // can legitimately name: the gateway's shaping-only degradation applies exactly that public plan, and

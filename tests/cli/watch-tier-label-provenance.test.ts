@@ -238,6 +238,7 @@ describe("a full apply is never relabelled as Open `basic shaping`", () => {
       request_mutated: true,
       model_visible_bytes_changed: true,
       approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
       recovery_id: "rec-full",
       applied_components: ["lcm-compaction", "deterministic-compaction", "output-shaping"],
       output_shaping_state: "attached-this-pass",
@@ -380,6 +381,7 @@ describe("the replay output arrow rides the receipt's own shaping evidence", () 
       estimated_input_tokens_before: 40203,
       estimated_input_tokens_after: 38999,
       estimated_model_visible_input_reduction_percent: 3,
+      authorization_id: "pref-1234567890abcdef12345678",
       applied_components: ["lcm-compaction", "output-shaping"],
       output_shaping_state: "attached-this-pass",
       tokens: { prompt_input: 28239, output: 327 }
@@ -427,8 +429,8 @@ describe("the replay output arrow rides the receipt's own shaping evidence", () 
    * `isRealApply` answers "did we mutate", and the engine composes a real apply from EITHER layer
    * (`apply-pipeline.ts`: `shapedChanged = deterministicPlan.changed || outputShapingPlan?.changed`).
    * An input-only apply is therefore a real apply on which output shaping never ran -- and every
-   * `lcm-compaction` turn in the 0.6.7 founder journey has exactly this receipt, because the
-   * task-aware gate holds shaping back on tool-call turns while input compaction still fires.
+   * An input-only `lcm-compaction` turn has exactly this receipt when the task-aware gate holds
+   * shaping back on tool-call turns while input compaction still fires.
    *
    * Under that gate this receipt rendered `output 617→327 (−47%, est. …)`: a
    * reconstructed BEFORE for a saving that did not happen. The input axis is real and must survive;
@@ -456,8 +458,8 @@ describe("the replay output arrow rides the receipt's own shaping evidence", () 
    * THE CASE #941 COULD NOT SEE. `applied_components: ["lcm-compaction"]` with NO `output-shaping` —
    * because the tool's own prompt hook attached the policy upstream, so the planner correctly attached
    * nothing. The turn IS shaped: the engine measured the final model-visible request and recorded
-   * `already-active`. Under the #941 gate this rendered a bare `output 327`; it is the ordinary shape of
-   * an LCM turn (all five 0.6.7 Founder Journey turns, 261/261 replayable captures).
+   * `already-active`. Under the #941 gate this rendered a bare `output 327`; it is an ordinary shape
+   * of an LCM turn whose policy was attached upstream.
    */
   it("an ALREADY-ACTIVE turn renders the arrow even though applied_components omits output-shaping", async () => {
     const alreadyActive = {

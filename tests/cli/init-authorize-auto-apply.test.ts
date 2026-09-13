@@ -126,7 +126,7 @@ describe("init --authorize-auto-apply - explicit scoped opt-in (default OFF)", (
   it("cursor is rejected with the honest vendor-gap reason; nothing written", async () => {
     const result = await run(["init", "--authorize-auto-apply", "cursor"]);
     expect(result.code).not.toBe(0);
-    expect(result.stderr).toMatch(/no Gateway routing path|vendor gap/);
+    expect(result.stderr).toContain("Compaction has no verified Cursor Gateway route");
     expect(existsSync(prefsPath())).toBe(false);
     expect(existsSync(legacyProjectPrefsPath())).toBe(false);
   });

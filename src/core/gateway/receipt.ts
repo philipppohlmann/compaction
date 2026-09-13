@@ -102,11 +102,11 @@ export interface GatewayReceipt {
   captured_at: string;
   /**
    * ISO timestamp the gateway RECEIVED the request this receipt describes. Recorded on every receipt,
-   * both modes, because `captured_at` is assigned only after the response has fully streamed and the
-   * usage window has been assembled — on a compressed response that is after an asynchronous
-   * decompressor flush, and the client may already have acted on the response by then. Run membership
-   * (`run-boundary.ts`) therefore reads THIS timestamp: a request the client sent inside its run is
-   * provably inside the run, whatever the ledger append latency. Absent on receipts written before the
+   * both modes, because `captured_at` is assigned only after response EOF or authoritative Codex
+   * terminal evidence and the usage window has been assembled — on a compressed response that is after
+   * an asynchronous decompressor flush, and the client may already have acted on the response by then.
+   * Run membership (`run-boundary.ts`) therefore reads THIS timestamp: a request the client sent inside
+   * its run is provably inside the run, whatever the ledger append latency. Absent on receipts written before the
    * field existed; readers fall back to `captured_at`.
    */
   request_started_at?: string;
@@ -237,8 +237,7 @@ export interface GatewayReceipt {
    *    `output-shaping`.
    *  - `already-active` — the current policy was ALREADY at instruction level on the final request, so
    *    nothing was attached and no duplicate was created. `applied_components` does NOT contain
-   *    `output-shaping`. This is the ordinary LCM case: 5/5 Founder Journey turns and 261/261 replayable
-   *    captures classify here.
+   *    `output-shaping`. This is the ordinary LCM case when the policy was attached upstream.
    *  - `absent` — the current policy is not at instruction level on the final request. Covers shaping
    *    disabled, the task-aware classifier hold, and fail-closed shapes.
    *
@@ -502,30 +501,69 @@ export interface GatewayReceiptTailWindow {
  * aggregates only the part that fits, which under-reports rather than invents — and `truncated` is
  * how the caller can tell a partial total from a total instead of presenting one as the other.
  */
+export const GATEWAY_RECEIPT_TAIL_BYTES = 512 * 1024;
+
+/**
+ * Hard ceiling on the run-covering escalation below. The status line runs inside Claude Code's render
+ * loop, so the read must stay bounded even for a pathological ledger; past this the window reports
+ * `truncated` honestly and the run line falls back to plain totals, exactly as before.
+ */
+export const GATEWAY_RECEIPT_TAIL_MAX_BYTES = 8 * 1024 * 1024;
+
 export async function readGatewayReceiptTailWindow(
   cwd: string = process.cwd(),
-  tailBytes = 512 * 1024
+  tailBytes = GATEWAY_RECEIPT_TAIL_BYTES,
+  /**
+   * COVER THIS RUN. The fixed byte tail is measured from the END of the ledger, which has nothing to
+   * do with where a run begins — so a NORMAL long agent run (measured: 353 provider calls over a 2 MB
+   * ledger) fell outside it, the window reported `truncated`, and the run line dropped BOTH axes to
+   * plain totals. That turned the primary run-level surface into an ambiguous partial: it rendered
+   * `output 137,697` where the same run read completely renders `output N/A→137,697 (N/A%, est.)`.
+   *
+   * Given the current run's `started_at`, the window now grows (doubling) until it reaches back past
+   * that instant or hits `maxBytes`. A run that fits is COMPLETE and keeps its rate; only a run that
+   * genuinely exceeds the ceiling still reports `truncated`. Cost is paid only when a run actually
+   * extends beyond the first window, and the ledger is append-ordered so reaching an older receipt
+   * proves the run is covered.
+   */
+  coverFrom?: string,
+  maxBytes = GATEWAY_RECEIPT_TAIL_MAX_BYTES
 ): Promise<GatewayReceiptTailWindow> {
   const file = path.join(cwd, DEFAULT_GATEWAY_RECEIPTS_DIR, GATEWAY_RECEIPTS_FILE);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     const info = await stat(file);
     if (info.size === 0) return { receipts: [], truncated: false };
-    const start = Math.max(0, info.size - tailBytes);
-    const length = info.size - start;
     handle = await open(file, "r");
-    const buffer = Buffer.alloc(length);
-    await handle.read(buffer, 0, length, start);
-    const out: GatewayReceipt[] = [];
-    for (const line of buffer.toString("utf8").split("\n")) {
-      const trimmed = line.trim();
-      if (trimmed === "") continue;
-      try {
-        const parsed = JSON.parse(trimmed) as GatewayReceipt;
-        if (typeof parsed?.receipt_id === "string") out.push(parsed);
-      } catch {
-        // A partial first line from the byte window, or a corrupt row: skipped, never guessed at.
+    // Clamp the FIRST read to the ceiling too. Only the escalation was bounded, so a caller passing
+    // `tailBytes > maxBytes` would exceed the documented hard cap on its very first read — unreachable
+    // today (both callers use the defaults), but the ceiling should hold by construction, not by luck.
+    let want = Math.min(Math.max(1, tailBytes), Math.max(1, maxBytes));
+    let out: GatewayReceipt[] = [];
+    let start = 0;
+    for (;;) {
+      start = Math.max(0, info.size - want);
+      const length = info.size - start;
+      const buffer = Buffer.alloc(length);
+      await handle.read(buffer, 0, length, start);
+      out = [];
+      for (const line of buffer.toString("utf8").split("\n")) {
+        const trimmed = line.trim();
+        if (trimmed === "") continue;
+        try {
+          const parsed = JSON.parse(trimmed) as GatewayReceipt;
+          if (typeof parsed?.receipt_id === "string") out.push(parsed);
+        } catch {
+          // A partial first line from the byte window, or a corrupt row: skipped, never guessed at.
+        }
       }
+      if (start === 0 || coverFrom === undefined || want >= maxBytes) break;
+      const oldest = out.reduce<string | undefined>(
+        (min, r) => (typeof r.captured_at === "string" && (min === undefined || r.captured_at < min) ? r.captured_at : min),
+        undefined
+      );
+      if (oldest !== undefined && oldest <= coverFrom) break; // reached past the run's start: covered
+      want = Math.min(want * 2, maxBytes);
     }
     return { receipts: out, truncated: start > 0 };
   } catch {

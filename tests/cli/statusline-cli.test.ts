@@ -8,6 +8,7 @@ import { computeStatusLine, STATUS_LINE_PLACEHOLDER } from "../../src/cli/comman
 import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import { recordShapingOutcome } from "../../src/core/output-shaping-turn-state.js";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
+import { sessionCorrelationId } from "../../src/core/gateway/session-correlation.js";
 
 /**
  * `compaction statusline` core (`computeStatusLine`). This is the Claude Code status-line surface - the
@@ -63,6 +64,11 @@ function receipt(overrides: Partial<GatewayReceipt> = {}): GatewayReceipt {
     output_shaping_policy_version: TEST_OUTPUT_POLICY_VERSION,
     ...overrides
   };
+}
+
+/** A modern Gateway receipt attributable to the named status-line session under this device key. */
+function sessionReceipt(sessionId: string, env: NodeJS.ProcessEnv): GatewayReceipt {
+  return receipt({ session_correlation_id: sessionCorrelationId(sessionId, env)! });
 }
 
 /** The content-free shape: a canonical line carries only the prefix, count/label clauses, and a short id. */
@@ -346,9 +352,10 @@ describe("computeStatusLine — per-session shaping evidence", () => {
     const dir = await isolatedConfigDir("basic");
     try {
       await record(dir, SESSION_A, "shape", 21);
+      const env = { COMPACTION_CONFIG_DIR: dir };
       const line = await computeStatusLine(stdinFor(SESSION_A), {
-        readReceipt: async () => recordModeReceipt(),
-        env: { COMPACTION_CONFIG_DIR: dir }
+        readReceipt: async () => sessionReceipt(SESSION_A, env),
+        env
       });
       expect(line).toMatch(/output [\d,]+→412 \(−\d+%, est\./);
       expect(line).toContain("basic shaping");
@@ -363,9 +370,10 @@ describe("computeStatusLine — per-session shaping evidence", () => {
     try {
       await record(dir, SESSION_A, "shape");
       await record(dir, SESSION_B, "hold-planning");
+      const env = { COMPACTION_CONFIG_DIR: dir };
       const line = await computeStatusLine(stdinFor(SESSION_B), {
-        readReceipt: async () => recordModeReceipt(),
-        env: { COMPACTION_CONFIG_DIR: dir }
+        readReceipt: async () => sessionReceipt(SESSION_B, env),
+        env
       });
       expect(line, "a held turn must never draw an output arrow").not.toContain("→");
       expect(line).not.toContain("basic shaping");
@@ -373,8 +381,8 @@ describe("computeStatusLine — per-session shaping evidence", () => {
       // CONTROL: the very same store, read as A, DOES render — so the assertion above cannot pass
       // merely because no evidence was written.
       const aLine = await computeStatusLine(stdinFor(SESSION_A), {
-        readReceipt: async () => recordModeReceipt(),
-        env: { COMPACTION_CONFIG_DIR: dir }
+        readReceipt: async () => sessionReceipt(SESSION_A, env),
+        env
       });
       expect(aLine).toContain("→");
     } finally {
@@ -386,9 +394,10 @@ describe("computeStatusLine — per-session shaping evidence", () => {
     const dir = await isolatedConfigDir("basic");
     try {
       await record(dir, SESSION_A, "shape");
+      const env = { COMPACTION_CONFIG_DIR: dir };
       const line = await computeStatusLine(stdinFor(SESSION_B), {
-        readReceipt: async () => recordModeReceipt(),
-        env: { COMPACTION_CONFIG_DIR: dir }
+        readReceipt: async () => sessionReceipt(SESSION_B, env),
+        env
       });
       expect(line).not.toContain("→");
       expect(line).not.toContain("basic shaping");
@@ -417,9 +426,10 @@ describe("computeStatusLine — per-session shaping evidence", () => {
     const dir = await isolatedConfigDir();
     try {
       await record(dir, SESSION_A, "shape");
+      const env = { COMPACTION_CONFIG_DIR: dir };
       const line = await computeStatusLine(stdinFor(SESSION_A), {
-        readReceipt: async () => recordModeReceipt(), // record mode: request_mutated absent
-        env: { COMPACTION_CONFIG_DIR: dir }
+        readReceipt: async () => sessionReceipt(SESSION_A, env), // record mode: request_mutated absent
+        env
       });
       expect(line).toMatch(/output [\d,]+→412 \(−\d+%, est\./);
     } finally {
@@ -433,9 +443,10 @@ describe("computeStatusLine — per-session shaping evidence", () => {
     const dir = await isolatedConfigDir();
     try {
       await record(dir, SESSION_A, "hold-planning");
+      const env = { COMPACTION_CONFIG_DIR: dir };
       const line = await computeStatusLine(stdinFor(SESSION_A), {
-        readReceipt: async () => recordModeReceipt(),
-        env: { COMPACTION_CONFIG_DIR: dir }
+        readReceipt: async () => sessionReceipt(SESSION_A, env),
+        env
       });
       expect(line).not.toContain("→");
       expect(line).not.toContain("basic shaping");
@@ -467,11 +478,12 @@ describe("computeStatusLine — exact-turn Codex scope", () => {
     const dir = await isolatedConfigDir();
     try {
       // The writer, verbatim: the same call `hooks shape codex` makes.
-      await recordShapingOutcome(CODEX_SCOPE, "shape", { COMPACTION_CONFIG_DIR: dir });
+      const env = { COMPACTION_CONFIG_DIR: dir };
+      await recordShapingOutcome(CODEX_SCOPE, "shape", env);
       const line = await computeStatusLine(CODEX_STDIN, {
         shapingScope: CODEX_SCOPE,
-        readReceipt: async () => receipt(),
-        env: { COMPACTION_CONFIG_DIR: dir }
+        readReceipt: async () => sessionReceipt(CODEX_SESSION, env),
+        env
       });
       expect(line, "a shaped Codex turn must keep its calibrated arrow").toMatch(
         /output [\d,]+→412 \(−\d+%, est\./
@@ -486,11 +498,12 @@ describe("computeStatusLine — exact-turn Codex scope", () => {
     // The scope must carry the outcome, not merely unlock the arrow.
     const dir = await isolatedConfigDir();
     try {
-      await recordShapingOutcome(CODEX_SCOPE, "hold-planning", { COMPACTION_CONFIG_DIR: dir });
+      const env = { COMPACTION_CONFIG_DIR: dir };
+      await recordShapingOutcome(CODEX_SCOPE, "hold-planning", env);
       const line = await computeStatusLine(CODEX_STDIN, {
         shapingScope: CODEX_SCOPE,
-        readReceipt: async () => receipt(),
-        env: { COMPACTION_CONFIG_DIR: dir }
+        readReceipt: async () => sessionReceipt(CODEX_SESSION, env),
+        env
       });
       expect(line).not.toContain("→");
       expect(line).not.toContain("basic shaping");
@@ -503,22 +516,24 @@ describe("computeStatusLine — exact-turn Codex scope", () => {
     // The tool scope and the session scopes remain separate namespaces.
     const dir = await isolatedConfigDir();
     try {
-      await recordShapingOutcome(CODEX_SCOPE, "shape", { COMPACTION_CONFIG_DIR: dir });
+      const env = { COMPACTION_CONFIG_DIR: dir };
+      await recordShapingOutcome(CODEX_SCOPE, "shape", env);
+      const claudeSession = "cccccccc-3333-4333-8333-cccccccccccc";
       const claudeLine = await computeStatusLine(
-        JSON.stringify({ cwd: "/some/proj", session_id: "cccccccc-3333-4333-8333-cccccccccccc" }),
-        { readReceipt: async () => receipt(), env: { COMPACTION_CONFIG_DIR: dir } }
+        JSON.stringify({ cwd: "/some/proj", session_id: claudeSession }),
+        { readReceipt: async () => sessionReceipt(claudeSession, env), env }
       );
       expect(claudeLine, "a Claude Code session must not inherit Codex's shape").not.toContain("→");
 
       await recordShapingOutcome(
         { tool: "claude-code", sessionId: "dddddddd-4444-4444-8444-dddddddddddd" },
         "shape",
-        { COMPACTION_CONFIG_DIR: dir }
+        env
       );
       const codexHeld = await computeStatusLine(CODEX_STDIN, {
         shapingScope: { tool: "cursor" }, // a THIRD scope with nothing written under it
-        readReceipt: async () => receipt(),
-        env: { COMPACTION_CONFIG_DIR: dir }
+        readReceipt: async () => sessionReceipt(CODEX_SESSION, env),
+        env
       });
       expect(codexHeld, "an unwritten scope claims nothing").not.toContain("→");
     } finally {
@@ -530,13 +545,15 @@ describe("computeStatusLine — exact-turn Codex scope", () => {
     // Precedence is deliberate: the caller knows which surface it is, the payload only guesses.
     const dir = await isolatedConfigDir();
     try {
-      await recordShapingOutcome(CODEX_SCOPE, "shape", { COMPACTION_CONFIG_DIR: dir });
+      const env = { COMPACTION_CONFIG_DIR: dir };
+      await recordShapingOutcome(CODEX_SCOPE, "shape", env);
+      const stdinSession = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee";
       const line = await computeStatusLine(
-        JSON.stringify({ cwd: "/some/proj", session_id: "eeeeeeee-5555-4555-8555-eeeeeeeeeeee" }),
+        JSON.stringify({ cwd: "/some/proj", session_id: stdinSession }),
         {
           shapingScope: CODEX_SCOPE,
-          readReceipt: async () => receipt(),
-          env: { COMPACTION_CONFIG_DIR: dir }
+          readReceipt: async () => sessionReceipt(stdinSession, env),
+          env
         }
       );
       expect(line).toContain("→");
@@ -572,6 +589,8 @@ describe("computeStatusLine — Community allowance countdown", () => {
       estimated_input_tokens_after: 51_682,
       estimated_model_visible_input_reduction_percent: 31.9,
       token_source_before: "local-estimate",
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
       applied_components: ["lcm-compaction", "output-shaping"],
       output_shaping_state: "attached-this-pass",
       ...overrides

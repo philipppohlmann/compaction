@@ -23,17 +23,17 @@ All content is **synthetic** — no secrets, no customer data.
 
 ---
 
-## How to run against fixtures
+## Validate the public catalog
 
-From repo root (private monorepo; requires full build):
+From the repository root:
 
 ```bash
-npm run build
-npx compaction eval tests/fixtures/eval/01-valid-exact-recoverability.json
-npx compaction eval tests/fixtures/eval/
+npm test -- tests/security/public-eval-registry-closure.test.ts
+npm test -- tests/core/input-compaction-ab.test.ts tests/core/output-shaping-ab.test.ts
 ```
 
-Engine-gated eval paths require local engine availability (private monorepo / `apps/api` — not in public npm install).
+The signed engine's recoverability evaluator is delivered separately. These public fixtures document
+its input and expected labels; the npm package does not pretend to execute an absent evaluator.
 
 ---
 

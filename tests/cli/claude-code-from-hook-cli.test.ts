@@ -299,7 +299,20 @@ describe("captureClaudeCodeFromHook - activity bridge", () => {
       hostedConfigured: noHosted,
       readStdin: async () => JSON.stringify({ session_id: "s1", transcript_path: "/x/y.jsonl" }),
       normalize: async () => ({ usage: providerUsage, messageCount: 8, fingerprint: "fp-frozen" }),
-      readGatewayReceipts: async () => ({ receipts: [receipt], truncated: false }),
+      readGatewayReceipts: async () => ({
+        receipts: [
+          {
+            ...receipt,
+            receipt_id: "foreign-coverage",
+            captured_at: "2026-06-28T23:59:59.000Z",
+            request_started_at: "2026-06-28T23:59:58.000Z",
+            session_correlation_id: "f".repeat(32),
+            tokens: { prompt_input: 50_000, output: 10_000 }
+          },
+          receipt
+        ],
+        truncated: true
+      }),
       appendActivity: append,
       printReceiptLine: (line: string) => lines.push(line)
     };

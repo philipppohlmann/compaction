@@ -15,6 +15,7 @@
  * disable (kill-switch). Content-free and fail-open regardless.
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { claudeSettingsPathForScope } from "../../core/claude-code-connect.js";
 import { homedir } from "node:os";
 import path from "node:path";
 import chalk from "chalk";
@@ -58,14 +59,22 @@ interface HooksScopeOptions {
   user?: boolean;
   dryRun?: boolean;
   beforeCall?: boolean;
+  /** Explicit project scope (advanced): `<cwd>/.claude/settings.json`. */
+  project?: boolean;
 }
 
-/** Resolve the target settings file from the scope flags. Default: project `.claude/settings.json`. */
+/**
+ * Resolve the target settings file from the scope flags.
+ *
+ * DEFAULT IS USER/GLOBAL — Compaction is install-once, so `hooks install` and `init --connect` must
+ * land in the same place and stay effective in every directory. `--project` / `--local` remain the
+ * explicit, advanced project-scoped overrides.
+ */
 function resolveSettingsPath(options: HooksScopeOptions): string {
   if (options.settings) return options.settings;
-  if (options.user) return path.join(homedir(), ".claude", "settings.json");
-  if (options.local) return path.join(process.cwd(), ".claude", "settings.local.json");
-  return path.join(process.cwd(), ".claude", "settings.json");
+  if (options.local) return claudeSettingsPathForScope("project-local");
+  if (options.project) return claudeSettingsPathForScope("project");
+  return claudeSettingsPathForScope("user"); // `--user` is now the default; the flag stays accepted.
 }
 
 async function readSettings(file: string): Promise<{ settings: ClaudeSettings; existed: boolean }> {
@@ -122,7 +131,7 @@ async function installSubscriptionShapingHook(tool: SubscriptionHookTool, option
   console.log(`  target config:   ${file}${existed ? "" : " (will be created)"}`);
   console.log(`  shaping hook:    ${shapingHookCommand(tool)}  (${event})`);
   if (tool === "codex") {
-    console.log(`  per-turn line:   ${codexTurnLineCommand()}  (Stop, after each turn)`);
+    console.log(`  Stop line:       ${codexTurnLineCommand()}  (settled evidence only when recorded; otherwise no message)`);
   }
   console.log("  posture:         content-free; fail-open (never breaks the tool); merge-not-replace; AUTO-APPLY (default-on).");
   // Report what THIS build's hook actually does, for THIS tool, and promise nothing beyond it.
@@ -233,7 +242,8 @@ export function registerHooksCommand(program: Command): void {
     .option("--tool <tool>", "Which tool to install for: claude-code (default) | codex | cursor.", "claude-code")
     .option("--settings <path>", "Explicit settings/config file to edit (overrides --local/--user).")
     .option("--local", "Target project-local config (Claude Code .claude/settings.local.json; Codex .codex/hooks.json).")
-    .option("--user", "Target ~/.claude/settings.json (all your projects).")
+    .option("--user", "Default. Target ~/.claude/settings.json so the hook stays installed in every project.")
+    .option("--project", "Advanced: target this project's .claude/settings.json instead.")
     .option("--before-call", "ALSO install the UserPromptSubmit before-call RECOMMENDATION hook (a genuine pre-call event; content-free, fail-open, silent; recommendation-only - apply is a proven blocker on Claude Code hooks).")
     .option("--dry-run", "Print the resulting settings/config without writing anything.")
     .action(async (options: HooksScopeOptions & { tool?: string }) => {
@@ -291,7 +301,8 @@ export function registerHooksCommand(program: Command): void {
     .option("--tool <tool>", "Which tool to uninstall for: claude-code (default) | codex | cursor.", "claude-code")
     .option("--settings <path>", "Explicit settings/config file to edit (overrides --local/--user).")
     .option("--local", "Target project-local config (Claude Code .claude/settings.local.json; Codex .codex/hooks.json).")
-    .option("--user", "Target ~/.claude/settings.json.")
+    .option("--user", "Default. Target ~/.claude/settings.json.")
+    .option("--project", "Advanced: target this project's .claude/settings.json instead.")
     .option("--dry-run", "Print the resulting settings/config without writing anything.")
     .action(async (options: HooksScopeOptions & { tool?: string }) => {
       const tool = (options.tool ?? "claude-code") as HookTargetTool;
@@ -375,10 +386,9 @@ export function registerHooksCommand(program: Command): void {
     .command("line <tool>")
     .description(
       "RUNTIME hook the installed Codex `Stop` hook calls - reads the turn payload on stdin and returns " +
-        "the content-free per-turn receipt line as `systemMessage`, Codex's user-facing hook channel. " +
+        "settled content-free receipt evidence as `systemMessage` when recorded; otherwise returns no message. " +
         "Codex's own `[tui] status_line` selects built-in segments only and takes no external command, so " +
-        "this is how Codex gets the line Claude Code gets from its status line. Content-free, fail-open, " +
-        "no network. Not for manual use."
+        "this hook is the Codex channel for settled lines. Content-free, fail-open, no network. Not for manual use."
     )
     .action(async (tool: string) => {
       // FAIL-OPEN by contract: this runs inside Codex's hook pipeline. Never throw, never print anything

@@ -17,8 +17,7 @@ import { runThroughGateway } from "../../src/cli/commands/dev.js";
  *  - the credential NEVER appears in receipts, logs, or CLI output (tripwire);
  *  - default OFF: without `--subscription` no capability route exists and the injected base URL is
  *    the plain gateway address;
- *  - honest rejections: non-anthropic provider (Codex subscription is vendor-blocked), a
- *    non-claude command, an incompatible --workflow, and --upstream are all refused up front.
+ *  - honest rejections: mismatched provider/binary, incompatible --workflow, and --upstream are refused.
  */
 const CLIENT_CRED = "Bearer sk-fake-saved-login-cli-NEVER-STORED";
 const REQUEST_BODY = JSON.stringify({ model: "claude-x", messages: [{ role: "user", content: "hello from the fake claude cli" }] });
@@ -161,7 +160,12 @@ describe("gateway run --subscription (public flag, fake upstream, no keys)", () 
     const allOutput = `${receipts}\n${errors.join("\n")}`;
     expect(allOutput).not.toContain(CLIENT_CRED);
     expect(allOutput).not.toContain("sk-fake-saved-login");
-    expect(errors.join("\n")).toContain("ephemeral local subscription route");
+    const liveCopy = errors.join("\n");
+    expect(liveCopy).toContain("ephemeral local subscription route");
+    expect(liveCopy).toContain("credential and response-stream transit is byte-safe");
+    expect(liveCopy).toContain("stored Community authorization may evaluate and apply input optimization");
+    expect(liveCopy).not.toContain("record mode; byte-safe");
+    expect(liveCopy).not.toContain("request/response byte-safe");
   }, 20000);
 
   it("default OFF: without --subscription the injected base URL is the plain gateway address (no capability route)", async () => {
@@ -179,19 +183,18 @@ describe("gateway run --subscription (public flag, fake upstream, no keys)", () 
     expect(observed.base).not.toContain("__compaction/claude");
   }, 20000);
 
-  it("rejects --subscription for a non-anthropic provider with the honest vendor-blocked reason", async () => {
+  it("accepts OpenAI only for the exact Codex binary", async () => {
     await runThroughGateway(["claude"], { provider: "openai", subscription: true });
     expect(process.exitCode).toBe(1);
     expect(exitCodes).toEqual([]); // no gateway, no child
-    expect(errors.join("\n")).toContain("saved Anthropic login only");
-    expect(errors.join("\n")).toContain("vendor-blocked");
+    expect(errors.join("\n")).toContain("codex binary only");
+    expect(errors.join("\n")).not.toContain("vendor-blocked");
   });
 
   it("rejects --subscription for a non-claude command with the exact usage", async () => {
     await runThroughGateway(["npm", "run", "dev"], { provider: "anthropic", subscription: true });
     expect(process.exitCode).toBe(1);
-    expect(errors.join("\n")).toContain("'npm' is not the claude binary");
-    expect(errors.join("\n")).toContain("compaction gateway run --provider anthropic --subscription -- claude");
+    expect(errors.join("\n")).toContain("claude-code binary only");
   });
 
   it("rejects --subscription with an incompatible --workflow and with --upstream (pinned origin)", async () => {
@@ -203,6 +206,6 @@ describe("gateway run --subscription (public flag, fake upstream, no keys)", () 
     errors = [];
     await runThroughGateway(["claude"], { provider: "anthropic", subscription: true, upstream: "https://evil.invalid" });
     expect(process.exitCode).toBe(1);
-    expect(errors.join("\n")).toContain("pins the Anthropic upstream");
+    expect(errors.join("\n")).toContain("pins its provider upstream");
   });
 });

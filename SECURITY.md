@@ -25,5 +25,5 @@ severity outcome is guaranteed.
 - Never commit secrets or real customer traces.
 - Use synthetic fixtures for tests and examples.
 - Keep local credentials and generated `.compaction/` artifacts out of commits.
-- Do not deploy or expose the private repository or local API without explicit
+- Do not deploy or expose the repository or local API without explicit
   authorization.

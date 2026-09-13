@@ -8,9 +8,12 @@
  * - canonical bytes are stable and round-trip through parse (signature domain never drifts);
  * - malformed manifests parse to undefined (never throw).
  */
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { generateDevSigningKeyPair } from "../../../src/core/engine-install/dev-signing.js";
 import {
+  CURRENT_ENGINE_ROOT_KEY_ID,
+  ENGINE_ROOT_POLICY_SHA256,
   ENGINE_ROOT_KEYS,
   UNPINNED_ROOT_KEY_MARKER,
   canonicalManifestBytes,
@@ -18,6 +21,7 @@ import {
   parseEngineReleaseManifest,
   pinnedRootKeys,
   rootKeyPinned,
+  rootAuthorizesManifest,
   type EngineReleaseManifest
 } from "../../../src/core/engine-install/manifest.js";
 
@@ -116,9 +120,38 @@ describe("trust-root pinning (production root ACTIVE, still fail-closed)", () =>
   // Rotating the root has to break BOTH pins, or the operator tool would go on trusting the old
   // one and accept retirement evidence no client can verify.
   it("pins the exact root key literal the control-plane mirror carries", () => {
-    expect(ENGINE_ROOT_KEYS.map((r) => r.public_key_spki_b64u)).toEqual([
-      "MCowBQYDK2VwAyEAE_hyUbMqPEb08gIjtL7N7Naq0a3Tjg2L_w29HFtOG34"
+    expect(ENGINE_ROOT_KEYS.map((r) => [r.key_id, r.public_key_spki_b64u])).toEqual([
+      ["compaction-engine-root-v1", "MCowBQYDK2VwAyEAE_hyUbMqPEb08gIjtL7N7Naq0a3Tjg2L_w29HFtOG34"],
+      ["compaction-engine-root-v2", "MCowBQYDK2VwAyEAXsFlXsmAzKxB8kY109FcW3LgEQJruUruEIb87M-bIHM"]
     ]);
+  });
+
+  it("binds the policy fingerprint to every root authorization field", () => {
+    expect(createHash("sha256").update(JSON.stringify(ENGINE_ROOT_KEYS)).digest("hex"))
+      .toBe(ENGINE_ROOT_POLICY_SHA256);
+  });
+
+  it("limits v1 to the exact known-good rollback manifest and v2 to canonical schema v2", () => {
+    const legacy = parseEngineReleaseManifest(
+      '{"schema_version":1,"version":"0.6.10","channel":"stable","platform":"any","arch":"any","artifact_kind":"node-script","sha256":"a211bfef01d872dfcd95414bf9fab0cd89040b189c7bdc7624838a7ef7b8037d","size_bytes":139415}'
+    )!;
+    const legacyDigest = "8f52adb6cb09e564416866aadec09f58e7ac7c0aa2ad02c20a9c31d71149b86c";
+    const v1 = ENGINE_ROOT_KEYS.find((root) => root.key_id === "compaction-engine-root-v1")!;
+    const v2 = ENGINE_ROOT_KEYS.find((root) => root.key_id === CURRENT_ENGINE_ROOT_KEY_ID)!;
+    const current: EngineReleaseManifest = {
+      schema_version: 2, version: "0.6.11", channel: "stable", platform: "any", arch: "any",
+      artifact_kind: "node-script", sha256: "b".repeat(64), size_bytes: 149181,
+      cli_min_version: "0.6.8", cli_max_version: "1.0.0", engine_protocol: 1,
+      usage_schema_version: 3, meter_version: "optimized-input-v2", eula_version: "1.0"
+    };
+
+    expect(rootAuthorizesManifest(v1, legacy, legacyDigest)).toBe(true);
+    expect(rootAuthorizesManifest(v1, { ...legacy, version: "0.6.11" }, legacyDigest)).toBe(false);
+    expect(rootAuthorizesManifest(v1, { ...legacy, sha256: "b".repeat(64) }, legacyDigest)).toBe(false);
+    expect(rootAuthorizesManifest(v1, legacy, "0".repeat(64))).toBe(false);
+    expect(rootAuthorizesManifest(v1, current, legacyDigest)).toBe(false);
+    expect(rootAuthorizesManifest(v2, legacy, legacyDigest)).toBe(false);
+    expect(rootAuthorizesManifest(v2, current, "unused")).toBe(true);
   });
 
   it("a real Ed25519 SPKI key WOULD pin (the guard is about the placeholder, not the mechanism)", () => {

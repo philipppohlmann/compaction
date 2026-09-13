@@ -270,7 +270,10 @@ export async function reconcileUsage(
  * position still names a genuinely server-confirmed entry, and a rewind only re-counts already-
  * confirmed entries locally until the next reconcile — the conservative direction, self-healing.
  */
-async function recordWatermark(summary: UsageReconcileSummary, env: ConfigDirEnv): Promise<void> {
+export async function recordReconciliationWatermark(
+  summary: UsageReconcileSummary,
+  env: ConfigDirEnv
+): Promise<void> {
   const addedByPeriod = new Map<string, { entryHash: string; added: number }>();
   for (const entry of summary.confirmed) {
     const seen = addedByPeriod.get(entry.period_id);
@@ -324,12 +327,18 @@ export type StoredUsageReconcileResult =
  *
  * THROWS only `UsageReconcileClientError`. Callers on a non-blocking path must catch — reconciliation
  * must never gate the workflow.
+ *
+ * `deferWatermark` is reserved for the automatic lease-repair transaction. That caller must not
+ * stop charging newly accepted entries locally until it also holds the verified replacement lease
+ * whose allowance reflects them. The caller commits `result.summary` with
+ * `recordReconciliationWatermark` only after that lease lands. All direct/explicit callers retain
+ * the default immediate watermark behavior.
  */
 export async function reconcileStoredUsage(
   apiUrl: string,
   env: ConfigDirEnv & NodeJS.ProcessEnv = process.env,
   now: Date = new Date(),
-  opts: { signal?: AbortSignal } = {}
+  opts: { signal?: AbortSignal; deferWatermark?: boolean } = {}
 ): Promise<StoredUsageReconcileResult> {
   const credentials = readStoredCredentials(env);
   if (!credentials) return { reconciled: false, reason: "not-logged-in" };
@@ -359,14 +368,15 @@ export async function reconcileStoredUsage(
       ...(opts.signal === undefined ? {} : { signal: opts.signal })
     });
   } catch (error) {
-    // A partial failure still COMMITTED its earlier chunks server-side, so their tokens are already
-    // out of the next lease's allowance. Record the watermark for them before rethrowing, or the
-    // client would charge those same tokens locally a second time.
-    if (error instanceof UsageReconcileClientError && error.partial) {
-      await recordWatermark(error.partial, env);
+    // A partial failure still COMMITTED its earlier chunks server-side. Direct callers record that
+    // position before rethrowing. The automatic lease-repair transaction deliberately defers it:
+    // until a replacement lease lands, charging those entries locally is the conservative half of
+    // the stale lease + local journal pair.
+    if (error instanceof UsageReconcileClientError && error.partial && !opts.deferWatermark) {
+      await recordReconciliationWatermark(error.partial, env);
     }
     throw error;
   }
-  await recordWatermark(summary, env);
+  if (!opts.deferWatermark) await recordReconciliationWatermark(summary, env);
   return { reconciled: true, summary };
 }

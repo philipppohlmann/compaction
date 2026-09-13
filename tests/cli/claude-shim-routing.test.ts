@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { installToolShim, type ShimEnv } from "../../src/core/tool-shim.js";
 import { readGatewayPid, isProcessAlive } from "../../src/core/gateway/status.js";
+import { readRoutingSlot, routingSlotKey, routingSlotPath } from "../../src/core/gateway/routing-registry.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -20,7 +21,9 @@ const execFileAsync = promisify(execFile);
  *     preserved, no ANTHROPIC_BASE_URL injected.
  *  2. RECORD byte-safety, the upstream receives the request body + credential headers byte-identical;
  *     the client receives the exact upstream response bytes.
- *  3. Persistent lifecycle, first run starts ONE gateway (pidfile), second run REUSES it.
+ *  3. Persistent lifecycle, first run starts ONE gateway (user-global ROUTING SLOT - the routing
+ *     gateway deliberately does not write the project pidfile, so project/dev cleanup cannot reach
+ *     the endpoint backing a live session), second run REUSES it.
  *  4. Content-free receipts, token counts land; no prompt text, no credential anywhere on disk.
  *  5. No double-capture, routing writes gateway receipts only, never activity events (the Stop
  *     hook remains the sole activity source).
@@ -109,13 +112,23 @@ async function waitFor(check: () => boolean, ms = 5000): Promise<boolean> {
   return check();
 }
 
+function slotEnv(): { COMPACTION_HOME: string } {
+  return { COMPACTION_HOME: path.join(home, ".compaction") };
+}
+
+/** The routing slot this project's shim owns (the routing gateway's lifecycle record). */
+function routingRecord(): ReturnType<typeof readRoutingSlot> {
+  return readRoutingSlot(routingSlotKey({ cwd: projDir, provider: "anthropic" }, slotEnv()), slotEnv());
+}
+
 function killGatewayIfRunning(): void {
-  const rec = readGatewayPid(projDir);
-  if (rec && isProcessAlive(rec.pid)) {
-    try {
-      process.kill(rec.pid, "SIGTERM");
-    } catch {
-      /* already gone */
+  for (const pid of [routingRecord()?.pid, readGatewayPid(projDir)?.pid]) {
+    if (pid && pid > 0 && isProcessAlive(pid)) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {
+        /* already gone */
+      }
     }
   }
 }
@@ -166,7 +179,7 @@ beforeEach(async () => {
 afterEach(async () => {
   killGatewayIfRunning();
   await waitFor(() => {
-    const rec = readGatewayPid(projDir);
+    const rec = routingRecord();
     return !rec || !isProcessAlive(rec.pid);
   }, 3000);
   await new Promise<void>((r) => upstream.close(() => r()));
@@ -191,15 +204,19 @@ describe("claude transparent-routing shim (e2e: fake claude + fake upstream)", (
       expect(seen.headers["x-api-key"]).toBe(FAKE_API_KEY);
       expect(seen.headers.authorization).toBe(FAKE_OAUTH);
 
-      // Persistent gateway: pidfile written, process alive, RECORD mode, NO workflow identity
-      // (the byte-safe shape - the stored-authorization apply path is structurally unreachable).
-      const rec = readGatewayPid(projDir);
+      // Persistent gateway: the user-global ROUTING SLOT is written, process alive, RECORD mode, NO
+      // workflow identity (the byte-safe shape - the stored-authorization apply path is
+      // structurally unreachable).
+      const rec = routingRecord();
       expect(rec).not.toBeNull();
       expect(isProcessAlive(rec!.pid)).toBe(true);
       expect(rec!.mode).toBe("record");
       expect(rec!.provider).toBe("anthropic");
       expect(rec!.workflow).toBeUndefined();
       expect(rec!.host).toBe("127.0.0.1"); // local-only bind
+      // And NOT in the project pidfile: `compaction gateway stop` and the `dev` conflict advice act
+      // on that file, so a routing endpoint recorded there is one ordinary project cleanup can kill.
+      expect(readGatewayPid(projDir)).toBeNull();
 
       // Content-free receipt (async append - poll briefly).
       expect(await waitFor(() => receiptLines().length >= 1)).toBe(true);
@@ -215,8 +232,8 @@ describe("claude transparent-routing shim (e2e: fake claude + fake upstream)", (
 
       // Tripwire: no credential and no prompt/response content anywhere Compaction persisted.
       const receiptsRaw = readFileSync(receiptsPath(), "utf8");
-      const pidRaw = readFileSync(path.join(projDir, ".compaction", "gateway", "gateway.json"), "utf8");
-      for (const persisted of [receiptsRaw, pidRaw]) {
+      const slotRaw = readFileSync(routingSlotPath(routingSlotKey({ cwd: projDir, provider: "anthropic" }, slotEnv()), slotEnv()), "utf8");
+      for (const persisted of [receiptsRaw, slotRaw]) {
         expect(persisted).not.toContain(FAKE_API_KEY);
         expect(persisted).not.toContain("FAKE-oauth-credential");
         expect(persisted).not.toContain(SECRET_PROMPT);
@@ -231,8 +248,9 @@ describe("claude transparent-routing shim (e2e: fake claude + fake upstream)", (
       const second = await runShim(["-p", "again"]);
       expect(second.code).toBe(7);
       expect(second.stdout).toContain("ROUTED ");
-      const rec2 = readGatewayPid(projDir);
+      const rec2 = routingRecord();
       expect(rec2!.pid).toBe(rec!.pid);
+      expect(rec2!.reservedPort).toBe(rec!.reservedPort);
       expect(upstreamSeen).toHaveLength(2);
       expect(await waitFor(() => receiptLines().length >= 2)).toBe(true);
     },
@@ -247,6 +265,7 @@ describe("claude transparent-routing shim (e2e: fake claude + fake upstream)", (
     expect(res.code).toBe(7); // the real tool still ran, exit code preserved
     expect(res.stdout).toContain("DIRECT args=-p hello"); // no ANTHROPIC_BASE_URL leaked into the child
     expect(readGatewayPid(projDir)).toBeNull();
+    expect(routingRecord()).toBeNull(); // fail-open started nothing at all
     expect(receiptLines()).toHaveLength(0);
   });
 
@@ -274,7 +293,8 @@ describe("claude transparent-routing shim (e2e: fake claude + fake upstream)", (
     });
     expect(res.code).toBe(7); // the real tool ran; its exit code preserved
     expect(res.stdout).toContain("DIRECT args=-p still works"); // unrouted - no ANTHROPIC_BASE_URL injected
-    expect(readGatewayPid(projDir)).toBeNull(); // no gateway on the stale-path fallback
+    expect(readGatewayPid(projDir)).toBeNull();
+    expect(routingRecord()).toBeNull(); // no gateway on the stale-path fallback
     expect(receiptLines()).toHaveLength(0);
   });
 
@@ -286,7 +306,7 @@ describe("claude transparent-routing shim (e2e: fake claude + fake upstream)", (
     });
     expect(res.code).toBe(127);
     expect(res.stderr).toContain("no other claude is on PATH");
-    expect(res.stderr).toContain("re-run 'compaction init --connect 1'");
+    expect(res.stderr).toContain("re-run 'compaction init --connect claude-code'");
     expect(res.stdout).not.toContain("DIRECT"); // it did not run anything
   });
 
@@ -296,6 +316,7 @@ describe("claude transparent-routing shim (e2e: fake claude + fake upstream)", (
     // The fake claude hit the PRE-SET base directly; the shim started no gateway and injected nothing.
     expect(res.stdout).toContain(`ROUTED ${UPSTREAM_RESPONSE}`);
     expect(readGatewayPid(projDir)).toBeNull();
+    expect(routingRecord()).toBeNull(); // fail-open started nothing at all
     expect(receiptLines()).toHaveLength(0);
   });
 });

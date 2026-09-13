@@ -3,7 +3,7 @@ import path from "node:path";
 import { writeJsonArtifact, writeTextArtifact } from "../../core/artifact-writer.js";
 import { ClaudeCodeAdapter, PRIVACY_WARNING } from "../../core/adapters/claude-code-adapter.js";
 import { discoverClaudeCodeSessions, DISCOVERY_PRIVACY_NOTE } from "../../core/adapters/claude-code-discovery.js";
-import { recordCaptureContentFree } from "../../core/capture-record.js";
+import { recordCaptureContentFree, writeCaptureUsageSidecar } from "../../core/capture-record.js";
 import { buildRunFlowTokenReport, formatRunFlowTokenReport } from "../../core/run-flow-report.js";
 import { buildRunCrossSurfaceEvent } from "../../core/cross-surface-event.js";
 import { buildMeasureOnlyActivityEvent, computeActivityEventId, type ActivityEvent } from "../../core/activity-event.js";
@@ -22,6 +22,8 @@ import {
 import {
   buildClaudeStopActivityEvent,
   buildClaudeTranscriptStopActivityEvent,
+  claudeStopOutputCalibrationQuery,
+  claudeTranscriptOutputCalibrationQuery,
   type ClaudeTranscriptUsageBaseline
 } from "../../core/claude-stop-activity.js";
 import {
@@ -38,11 +40,12 @@ import { invalidateShapingTurnRecord, lastTurnShapingOutcome, recordShapingOutco
 import type { ShapingTurnScope } from "../../core/output-shaping-turn-state.js";
 import { isShapingHooksActivated } from "../../core/output-shaping-hook-activation.js";
 import {
+  activateSharedOutputCalibration,
   estimatePerTurnOutputSaved,
   loadCalibrationReduction,
   loadOutputCalibrationResolver
 } from "../../core/output-shaping-savings.js";
-import { outputCalibrationQuery } from "../../core/output-shaping-calibration-store.js";
+import { outputCalibrationQuery, type OutputShapingCalibrationQuery } from "../../core/output-shaping-calibration-store.js";
 import { buildOutputShapingPolicy } from "../../core/output-shaping.js";
 import { resolveOpenTier } from "../../core/onboarding-preferences.js";
 import {
@@ -294,6 +297,14 @@ export async function captureClaudeCodeCommand(options: CaptureClaudeCodeOptions
 
   // 7. Print artifacts written
   console.log(`Artifacts written to: ${outDir}/`);
+
+  // Content-free A/B evidence sidecar (provider-reported counts + honest source) for
+  // `output-shaping-ab add`. No policy attribution here: Claude Code output-shaping is attached by the
+  // UserPromptSubmit hook (a separate process/surface), not by this capture call site, and there is no
+  // truthful per-session record of which policy names applied to THIS session's turns to attach without
+  // inventing one - so `outputShaping` is omitted rather than fabricated.
+  const usagePath = await writeCaptureUsageSidecar(outDir, "claude-code", usage);
+  console.log(`Wrote ${usagePath}`);
 
   // Unified flow: content-free record (input/output separate +
   // honest source) when hosted-configured. No default network call - only when COMPACTION_API_URL +
@@ -740,6 +751,7 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
     let logicalIdentity: ClaudeLogicalRunIdentity | undefined;
     let settledRun: import("../../core/gateway/run-boundary.js").UserRun | undefined;
     let settledActivityEvent: ActivityEvent | undefined;
+    let settledCalibrationQuery: OutputShapingCalibrationQuery | undefined;
     let settledPending: ClaudeSettledProvisionalPending | undefined;
     let normalized: HookNormalizeResult | undefined;
     let dedupKey: string | undefined;
@@ -778,11 +790,15 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
         });
         if (projected) {
           try {
+            const window = await readReceiptWindow(cwd);
             settledActivityEvent = buildClaudeStopActivityEvent({
               run: projected,
-              window: await readReceiptWindow(cwd),
+              window,
               calibrationResolver: await loadOutputCalibrationResolver(env)
             });
+            settledCalibrationQuery = settledActivityEvent
+              ? claudeStopOutputCalibrationQuery({ run: projected, window })
+              : undefined;
           } catch {
             // Without exact frozen bytes, a positive pair may not collapse into unrecoverable state.
           }
@@ -820,12 +836,23 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
                   () => new Date(stopAt)
                 )
               : undefined;
+            const positiveShapingOutcome = shapingOutcome === "shape" || shapingOutcome === "shape-basic"
+              ? shapingOutcome
+              : undefined;
+            const calibrationResolver = await loadOutputCalibrationResolver(env);
             settledActivityEvent = buildClaudeTranscriptStopActivityEvent({
               run: projected,
               usage: normalized.usage,
-              shaped: shapingOutcome === "shape" || shapingOutcome === "shape-basic",
+              ...(positiveShapingOutcome ? { shapingOutcome: positiveShapingOutcome } : {}),
+              calibrationResolver,
               ...(baseline ? { baseline } : {})
             });
+            settledCalibrationQuery = settledActivityEvent
+              ? claudeTranscriptOutputCalibrationQuery({
+                  usage: normalized.usage,
+                  ...(positiveShapingOutcome ? { shapingOutcome: positiveShapingOutcome } : {})
+                })
+              : undefined;
             positiveSettlementEvidenceInsufficient = settledActivityEvent === undefined;
           }
         }
@@ -923,11 +950,15 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
 
     if (!settledActivityEvent && settledRun && logicalIdentity) {
       try {
+        const window = await readReceiptWindow(cwd);
         settledActivityEvent = buildClaudeStopActivityEvent({
           run: settledRun,
-          window: await readReceiptWindow(cwd),
+          window,
           calibrationResolver: await loadOutputCalibrationResolver(env)
         });
+        settledCalibrationQuery = settledActivityEvent
+          ? claudeStopOutputCalibrationQuery({ run: settledRun, window })
+          : undefined;
       } catch {
         // Exact gateway settlement is additive. Any read/validation failure retains the legacy
         // transcript snapshot and never guesses a whole-run event.
@@ -977,6 +1008,13 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
       ...(settledActivityEvent ? { settledEvent: settledActivityEvent } : {}),
       appendEvent: appendActivity
     });
+    if (activityResult === "appended" && settledCalibrationQuery) {
+      try {
+        await activateSharedOutputCalibration(settledCalibrationQuery, env);
+      } catch {
+        // The settled event is authoritative; optional local calibration remains fail-open.
+      }
+    }
     if (settledPending && activityResult !== "failed") {
       completeClaudeSettlement(correlationId!, settledPending, env);
     }
@@ -1090,6 +1128,33 @@ function claudeCodeScopeFromHookStdin(
   }
 }
 
+/** The session's working directory as Claude Code reports it on the hook payload, else this process's. */
+function claudeCwdFromHookStdin(stdinText: string): string {
+  try {
+    const payload = JSON.parse(stdinText) as { cwd?: unknown } | null;
+    return typeof payload?.cwd === "string" && payload.cwd.trim() !== "" ? payload.cwd : process.cwd();
+  } catch {
+    return process.cwd();
+  }
+}
+
+/**
+ * Repair the session's existing route before its next provider call. The hook is bounded and
+ * fail-open; an unrouted session or failed repair leaves the turn untouched.
+ */
+async function reviveRoutingEndpointBeforeTurn(stdinText: string): Promise<void> {
+  try {
+    const { reviveRoutingGatewayIfDown, REVIVAL_BUDGET_MS } = await import("../../core/gateway/routing-revival.js");
+    const cwd = claudeCwdFromHookStdin(stdinText);
+    await Promise.race([
+      reviveRoutingGatewayIfDown(cwd, { wait: true, budgetMs: REVIVAL_BUDGET_MS }),
+      new Promise((resolve) => setTimeout(resolve, REVIVAL_BUDGET_MS + 200))
+    ]);
+  } catch {
+    /* FAIL-OPEN: a repair that cannot run must never cost the user their turn. */
+  }
+}
+
 function claudePromptIdFromHookStdin(stdinText: string): string | undefined {
   try {
     const payload = JSON.parse(stdinText) as { prompt_id?: unknown } | null;
@@ -1127,6 +1192,10 @@ export async function captureClaudeCodeShapeFromPromptHook(deps: ShapePromptHook
     const stdinText = await readStdin();
     const env = deps.env ?? process.env;
     const now = deps.now ?? (() => new Date().toISOString());
+    // FIRST, before any shaping work: put the routing endpoint back if it died while the session was
+    // idle. This turn's provider call has not been issued yet, which is the only moment at which the
+    // repair can still save it. Bounded and fail-open - see `reviveRoutingEndpointBeforeTurn`.
+    await reviveRoutingEndpointBeforeTurn(stdinText);
     // See `hooks shape`: the status line needs to know whether THIS turn was shaped, and only the
     // decision itself knows that. Recorded UNDER THIS SESSION'S ID, taken from the same payload the
     // decision was made from, so the status line and Stop hook for THIS session — and no other — can

@@ -36,6 +36,7 @@ import { leasePath } from "../../src/core/entitlement/lease-store.js";
 import { currentPeriodId } from "../../src/core/entitlement/lease.js";
 import { meterConfirmedApply } from "../../src/core/usage/usage-metering.js";
 import { readReconciliationWatermark } from "../../src/core/usage/reconciliation-watermark.js";
+import { readPeriodConsumption } from "../../src/core/usage/usage-journal.js";
 
 /** A dead port: a connection attempt fails immediately and cannot reach any real service. */
 const DEAD_SERVICE = "http://127.0.0.1:1";
@@ -192,15 +193,11 @@ describe("ensureCommunityRuntime", () => {
  *
  * The device's ceiling is the sum of two DISJOINT halves: the allowance the service signed into the
  * lease (already net of every debit it has recorded) plus the local journal entries it has not seen
- * yet. Reconciling moves tokens from the second half into the first — the watermark advances and
- * `readPeriodConsumption` stops counting them — and the device only ever LEARNS the first half's new
- * value by acquiring a fresh lease. So a handover whose renewal does not land leaves those tokens
- * counted in NEITHER half, and the stale lease on disk keeps promising an allowance the service has
- * already spent.
- *
- * That does not heal on its own, which is what makes it worth a test rather than a comment: the next
- * invocation finds nothing left to reconcile and a lease that still verifies, so it takes the cheap
- * path and never re-acquires.
+ * yet. Reconciling moves tokens from the second half into the first, but the device only ever LEARNS
+ * the first half's new value by acquiring a fresh lease. Automatic repair therefore defers the
+ * watermark until that verified lease lands. If renewal fails, the entries remain in the local
+ * tally and the next invocation retries the same idempotent handover instead of taking the cheap
+ * valid-lease path.
  */
 describe("ensureCommunityRuntime - a committed usage handover and the lease that must follow it", () => {
   /** Point the fixture's credentials at a real loopback service WITHOUT touching the device key the lease is bound to. */
@@ -271,9 +268,15 @@ describe("ensureCommunityRuntime - a committed usage handover and the lease that
     }
   };
 
-  it("REMOVES the stale lease when the handover committed but the renewal did not land", async () => {
+  it("KEEPS authorization without replenishing headroom and retries the lease after a transient post-reconcile failure", async () => {
+    // Deleting the lease on a 503 after reconcile silently turned a
+    // signed-in Community device into Plan: Open / "needs activation". Transient renew failure must
+    // leave existing authorization on disk; only authoritative denials clear it.
     const leaseEnv = provisionValidLease(dir) as NodeJS.ProcessEnv;
     await seedUnreconciledUsage(leaseEnv);
+    const before = await readPeriodConsumption(2_000_000, currentPeriodId(), leaseEnv);
+    expect(before).toEqual({ ok: true, consumed: 2_000, remaining: 1_998_000 });
+    const stillValidSignedLease = JSON.parse(readFileSync(leasePath(leaseEnv), "utf8"));
     const service = await startService({
       reconcile: acceptedReconcile,
       lease: { status: 503, body: { error: "temporarily_unavailable" } }
@@ -283,18 +286,55 @@ describe("ensureCommunityRuntime - a committed usage handover and the lease that
     try {
       const outcome = await ensureCommunityRuntime(leaseEnv);
 
-      // The handover really happened — otherwise this test would be proving nothing.
       const watermark = await readReconciliationWatermark(leaseEnv);
-      expect(JSON.stringify(watermark)).toContain(currentPeriodId());
+      expect(JSON.stringify(watermark)).not.toContain(currentPeriodId());
       expect(service.paths.some((p) => p.includes("/v0/lease"))).toBe(true);
 
-      // And the lease that no longer describes this device's allowance is gone, so the gate that
-      // re-reads the verdict on every request fails closed instead of spending a debited allowance.
+      expect(outcome.lease).toBe("valid");
+      expect(existsSync(leasePath(leaseEnv))).toBe(true);
+      expect(readLeaseVerdict(leaseEnv).label).toBe("lease-valid");
+
+      // The service accepted these debits, but the stale lease does not reflect them. They must
+      // therefore remain charged locally until a replacement lease lands; otherwise a transient
+      // renewal failure silently replenishes 2,000 tokens of headroom.
+      const afterFailure = await readPeriodConsumption(2_000_000, currentPeriodId(), leaseEnv);
+      expect(afterFailure).toEqual({ ok: true, consumed: 2_000, remaining: 1_998_000 });
+    } finally {
+      await service.stop();
+    }
+
+    // The old lease is fresh, not near expiry. A later repair must still retry acquisition because
+    // the preceding usage handover was not completed by a verified replacement lease.
+    const recovery = await startService({
+      reconcile: acceptedReconcile,
+      lease: { status: 200, body: stillValidSignedLease }
+    });
+    repointCredentials(recovery.url);
+    try {
+      const outcome = await ensureCommunityRuntime(leaseEnv);
+      expect(outcome.lease).toBe("renewed");
+      expect(recovery.paths.some((p) => p.includes("/v0/lease"))).toBe(true);
+    } finally {
+      await recovery.stop();
+    }
+  });
+
+  it("CLEARS the lease when the service authoritatively denies Community", async () => {
+    const leaseEnv = provisionValidLease(dir) as NodeJS.ProcessEnv;
+    await seedUnreconciledUsage(leaseEnv);
+    const service = await startService({
+      reconcile: acceptedReconcile,
+      lease: { status: 403, body: { error: "not_entitled" } }
+    });
+    repointCredentials(service.url);
+
+    try {
+      const outcome = await ensureCommunityRuntime(leaseEnv);
+
       expect(outcome.lease).toBe("unavailable");
-      expect(typeof outcome.reason).toBe("string");
+      expect(outcome.reason).toBe("not_entitled");
       expect(existsSync(leasePath(leaseEnv))).toBe(false);
       expect(readLeaseVerdict(leaseEnv).label).not.toBe("lease-valid");
-      expect(communityRuntimeReady(outcome)).toBe(false);
     } finally {
       await service.stop();
     }

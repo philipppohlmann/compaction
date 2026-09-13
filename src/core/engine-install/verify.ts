@@ -26,6 +26,7 @@ import {
   canonicalManifestBytes,
   parseEngineReleaseManifest,
   pinnedRootKeys,
+  rootAuthorizesManifest,
   type EngineReleaseManifest
 } from "./manifest.js";
 
@@ -71,8 +72,9 @@ export function readDevRootKey(env: EnvLike = process.env): KeyObject | undefine
 }
 
 export type ManifestVerification =
-  | { verified: true; trust: EngineTrustSource }
-  | { verified: false; reason: "root-key-not-pinned" | "signature-invalid" };
+  | { verified: true; trust: "pinned-root"; key_id: string }
+  | { verified: true; trust: "dev-root" }
+  | { verified: false; reason: "root-key-not-pinned" | "signature-invalid" | "manifest-invalid" };
 
 /**
  * Verify a manifest's signature bytes against the allowed trust roots: pinned roots first, then
@@ -86,12 +88,19 @@ export function verifyManifestSignature(
   env: EnvLike = process.env
 ): ManifestVerification {
   let sawUsableRoot = false;
+  const manifest = parseEngineReleaseManifest(manifestBytes.toString("utf8"));
+  const canonical = manifest === undefined ? undefined : canonicalManifestBytes(manifest);
+  if (manifest === undefined || canonical === undefined || !canonical.equals(manifestBytes)) {
+    return { verified: false, reason: "manifest-invalid" };
+  }
+  const canonicalDigest = createHash("sha256").update(canonical).digest("hex");
   for (const root of pinnedRootKeys()) {
     const key = publicKeyFromSpkiB64u(root.public_key_spki_b64u);
     if (!key) continue;
     sawUsableRoot = true;
-    if (verifyDetachedSignature(manifestBytes, signatureB64u, key)) {
-      return { verified: true, trust: "pinned-root" };
+    if (rootAuthorizesManifest(root, manifest, canonicalDigest) &&
+        verifyDetachedSignature(manifestBytes, signatureB64u, key)) {
+      return { verified: true, trust: "pinned-root", key_id: root.key_id };
     }
   }
   const devRoot = readDevRootKey(env);
@@ -114,7 +123,8 @@ export type InstalledArtifactFailure =
   | "artifact-unreadable";
 
 export type InstalledArtifactVerification =
-  | { verified: true; trust: EngineTrustSource; manifest: EngineReleaseManifest }
+  | { verified: true; trust: "pinned-root"; key_id: string; manifest: EngineReleaseManifest }
+  | { verified: true; trust: "dev-root"; manifest: EngineReleaseManifest }
   | { verified: false; reason: InstalledArtifactFailure };
 
 /**
@@ -146,7 +156,11 @@ export function verifyInstalledArtifact(
 
   // The signature covers the CANONICAL bytes; a stored manifest that verifies but re-serializes
   // differently would be a tamper vector, so verify against the canonical form of what we parsed.
-  const signatureCheck = verifyManifestSignature(canonicalManifestBytes(manifest), signature, env);
+  const canonical = canonicalManifestBytes(manifest);
+  if (manifest.schema_version === 2 && !canonical.equals(Buffer.from(manifestText, "utf8"))) {
+    return { verified: false, reason: "manifest-invalid" };
+  }
+  const signatureCheck = verifyManifestSignature(canonical, signature, env);
   if (!signatureCheck.verified) return { verified: false, reason: signatureCheck.reason };
 
   let digest: string;
@@ -158,5 +172,7 @@ export function verifyInstalledArtifact(
   if (digest !== manifest.sha256.toLowerCase()) {
     return { verified: false, reason: "artifact-digest-mismatch" };
   }
-  return { verified: true, trust: signatureCheck.trust, manifest };
+  return signatureCheck.trust === "pinned-root"
+    ? { verified: true, trust: signatureCheck.trust, key_id: signatureCheck.key_id, manifest }
+    : { verified: true, trust: signatureCheck.trust, manifest };
 }

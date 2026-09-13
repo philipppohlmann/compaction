@@ -18,10 +18,19 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { Command } from "commander";
+import { createInterface } from "node:readline/promises";
+import * as installer from "../../src/core/engine-install/installer.js";
+import * as manifests from "../../src/core/engine-install/manifest.js";
+import { registerEngineCommand } from "../../src/cli/commands/engine.js";
+import { writeStoredCredentials } from "../../src/core/auth/credentials.js";
+import { engineEulaAccepted, readEngineEulaAcceptance, recordEngineEulaAcceptance } from "../../src/core/legal/engine-eula.js";
 import { generateDevSigningKeyPair } from "../../src/core/engine-install/dev-signing.js";
 import { signManifest } from "../../src/core/engine-install/dev-signing.js";
 import { canonicalManifestBytes, type EngineReleaseManifest } from "../../src/core/engine-install/manifest.js";
+
+vi.mock("node:readline/promises", () => ({ createInterface: vi.fn() }));
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const CLI = path.join(repoRoot, "dist", "cli", "index.js");
@@ -199,5 +208,99 @@ describe.runIf(CLI_BUILT)("compaction engine (built CLI)", () => {
     } finally {
       rmSync(configDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("verified EULA consent through engine command (controlled release I/O)", () => {
+  let dir: string;
+  let env: NodeJS.ProcessEnv;
+  let manifest: manifests.EngineReleaseManifestV2;
+  let signer: ReturnType<typeof generateDevSigningKeyPair>;
+  let tty: PropertyDescriptor | undefined;
+  let output: string[];
+  const actualInstall = installer.installEngineRelease;
+  const question = vi.fn();
+  const close = vi.fn();
+  const fetchRelease = vi.fn();
+  const download = vi.fn();
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "engine-consent-command-")); env = { COMPACTION_CONFIG_DIR: dir };
+    vi.stubEnv("COMPACTION_CONFIG_DIR", dir); vi.stubEnv("COMPACTION_HOME", "");
+    signer = generateDevSigningKeyPair();
+    writeStoredCredentials({ schema_version: 1, api_url: "http://127.0.0.1:9", account_id: "fixture", device_id: "fixture",
+      device_token: "synthetic-only", device_private_key_pem: signer.privateKeyPem, device_public_key: signer.publicKeySpkiB64u,
+      created_at: new Date().toISOString() }, env);
+    const body = "// synthetic engine artifact; never executed\n";
+    manifest = { schema_version: 2, version: "0.6.8", channel: "stable", platform: "any", arch: "any", artifact_kind: "node-script",
+      sha256: createHash("sha256").update(body).digest("hex"), size_bytes: Buffer.byteLength(body),
+      cli_min_version: "0.6.0", cli_max_version: "0.8.0", engine_protocol: 1, usage_schema_version: 3,
+      meter_version: "optimized-input-v2", eula_version: "1.0" };
+    vi.spyOn(manifests, "pinnedRootKeys").mockReturnValue([{ key_id: "synthetic-only", public_key_spki_b64u: signer.publicKeySpkiB64u,
+      authorization: { kind: "current-release", schema_version: 2 } }]);
+    fetchRelease.mockReset().mockImplementation(async () => ({ manifest: canonicalManifestBytes(manifest).toString(),
+      signature: signManifest(manifest, signer.privateKeyPem), artifact_url: "http://127.0.0.1:9/artifact" }));
+    download.mockReset().mockImplementation(async (_url: string, target: string) => { writeFileSync(target, body); });
+    vi.spyOn(installer, "installEngineRelease").mockImplementation(input => actualInstall({ ...input, ops: { fetchLatestRelease: fetchRelease, download } }));
+    question.mockReset().mockResolvedValue("yes"); close.mockReset();
+    vi.mocked(createInterface).mockReturnValue({ question, close } as unknown as ReturnType<typeof createInterface>);
+    tty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+    Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+    output = []; vi.spyOn(console, "log").mockImplementation((...args) => { output.push(args.join(" ")); });
+  });
+  afterEach(() => {
+    if (tty) Object.defineProperty(process.stdin, "isTTY", tty); else delete (process.stdin as { isTTY?: boolean }).isTTY;
+    process.exitCode = undefined; vi.restoreAllMocks(); vi.unstubAllEnvs();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  async function run(): Promise<void> {
+    const command = new Command(); registerEngineCommand(command);
+    await command.parseAsync(["engine", "install"], { from: "user" });
+  }
+  it("offers verified known terms, requires explicit yes, and reverifies before download", async () => {
+    await run();
+    expect(output.join("\n")).toContain("Compaction Engine License Agreement (version 1.0)");
+    expect(question).toHaveBeenCalledTimes(1); expect(close).toHaveBeenCalledTimes(1);
+    expect(fetchRelease).toHaveBeenCalledTimes(2); expect(download).toHaveBeenCalledTimes(1);
+    expect(engineEulaAccepted(env)).toBe(true);
+  });
+  it.each(["no", "", "EOF"])("decline/EOF %s never records consent or downloads", async answer => {
+    if (answer === "EOF") question.mockRejectedValueOnce(new Error("synthetic EOF")); else question.mockResolvedValueOnce(answer);
+    await run();
+    expect(process.exitCode).toBe(1); expect(readEngineEulaAcceptance(env)).toBeUndefined();
+    expect(fetchRelease).toHaveBeenCalledTimes(1); expect(download).not.toHaveBeenCalled();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+  it("does not prompt without a terminal and retains explicit license guidance", async () => {
+    Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: false });
+    await run();
+    expect(output.join("\n")).toContain("compaction engine license --accept");
+    expect(question).not.toHaveBeenCalled(); expect(download).not.toHaveBeenCalled();
+    expect(readEngineEulaAcceptance(env)).toBeUndefined();
+  });
+  it("never offers unknown terms or treats a direct helper record as presentable consent", async () => {
+    manifest.eula_version = "2.0"; recordEngineEulaAcceptance(env, new Date(), "2.0");
+    const record = readEngineEulaAcceptance(env);
+    await run();
+    expect(output.join("\n")).toContain("signed engine release requires EULA 2.0");
+    expect(output.join("\n")).toContain("can present only EULA 1.0");
+    expect(output.join("\n")).toContain("Update and activate a CLI");
+    expect(output.join("\n")).toContain("compaction engine license");
+    expect(question).not.toHaveBeenCalled(); expect(download).not.toHaveBeenCalled();
+    expect(readEngineEulaAcceptance(env)).toEqual(record);
+  });
+  it("does not reuse consent when a retry requires a different signed version", async () => {
+    question.mockImplementationOnce(async () => { manifest.eula_version = "2.0"; return "yes"; });
+    await run();
+    expect(fetchRelease).toHaveBeenCalledTimes(2); expect(download).not.toHaveBeenCalled();
+    expect(engineEulaAccepted(env, "1.0")).toBe(true); expect(engineEulaAccepted(env, "2.0")).toBe(false);
+    expect(output.join("\n")).toContain("signed engine release requires EULA 2.0");
+  });
+  it("does not present unverified EULA metadata as a consent requirement", async () => {
+    manifest.eula_version = "2.0";
+    fetchRelease.mockResolvedValueOnce({ manifest: canonicalManifestBytes(manifest).toString(), signature: "invalid", artifact_url: "http://127.0.0.1:9/artifact" });
+    await run();
+    expect(question).not.toHaveBeenCalled(); expect(download).not.toHaveBeenCalled();
+    expect(output.join("\n")).not.toContain("requires EULA 2.0");
+    expect(readEngineEulaAcceptance(env)).toBeUndefined();
   });
 });

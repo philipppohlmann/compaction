@@ -43,6 +43,8 @@ import { pipeline } from "node:stream/promises";
 import { configDir } from "../api-client/persisted-config.js";
 import type { EnvLike } from "../api-client/config.js";
 import { readStoredCredentials } from "../auth/credentials.js";
+import { ENGINE_EULA_VERSION, canPresentEngineEula, engineEulaAccepted } from "../legal/engine-eula.js";
+import { compatibleFull, type ReleaseCompatibility } from "../update/compatibility.js";
 import { credentialedFetchInit } from "../net/credentialed-fetch.js";
 import {
   canonicalManifestBytes,
@@ -79,8 +81,12 @@ export class EngineInstallError extends Error {
       | "artifact-digest-mismatch"
       | "install-write-failed"
       | "dev-root-key-invalid"
+      | "eula-not-accepted"
+      | "release-incompatible"
       /** The caller aborted the install (user pressed Esc / Ctrl-C). NOT a download or trust failure. */
-      | "cancelled"
+      | "cancelled",
+    /** Present only after the release signature and canonical manifest have been verified. */
+    readonly requiredEulaVersion?: string
   ) {
     super(message);
     this.name = "EngineInstallError";
@@ -276,11 +282,14 @@ export function installDevRootKey(spkiB64u: string, env: EnvLike = process.env):
 }
 
 export interface EngineInstallResult {
+  manifest: EngineReleaseManifest;
   version: string;
   channel: EngineChannel;
   artifactKind: EngineReleaseManifest["artifact_kind"];
   /** Which trust root verified the release. `dev-root` ⇒ DEV-SIGNED, loudly labeled by callers. */
   trust: EngineTrustSource;
+  /** Present for a production-signed release; identifies the authorizing compiled-in root. */
+  keyId?: string;
   /** Absolute path of the installed artifact (what the `current` pointer names). */
   artifactPath: string;
   /** False when the requested release is ALREADY current and verifying (nothing downloaded or written). */
@@ -297,17 +306,17 @@ function sameOrigin(apiUrl: string, artifactUrl: string): boolean {
 }
 
 /**
- * Fetch, verify, and atomically install the latest published release of `channel`.
+ * Inputs shared by legacy installation and managed release staging.
  *
  * Order is verify-then-promote: manifest signature (pinned roots, else explicit dev root) →
  * manifest schema + host match → download to a private temp dir → streaming sha256 vs the signed
  * digest (mismatch ⇒ delete, never promote) → STAGE the complete release (artifact + manifest +
  * signature) in a directory of its OWN inside the install root → verify the staged release exactly
- * as verify-before-run will → atomically rewrite the `current` pointer (the single publication
- * step). Any failure leaves the previous install (and pointer) untouched and still verifying:
+ * as verify-before-run will. Legacy installation separately rewrites `current`; staging never
+ * publishes a pointer. Any failure leaves the previous install untouched and still verifying:
  * no existing release directory is ever written into, renamed over, or removed.
  */
-export async function installEngineRelease(input: {
+export interface EngineInstallInput {
   channel?: EngineChannel;
   env?: EnvLike;
   ops?: EngineInstallOps;
@@ -317,7 +326,12 @@ export async function installEngineRelease(input: {
    * pointer swap is the only thing that makes a release live and it happens after every check.
    */
   signal?: AbortSignal;
-}): Promise<EngineInstallResult> {
+  /** When provided, only a production-signed compatible v2 release can be staged. */
+  compatibility?: ReleaseCompatibility;
+}
+
+/** Acquire a verified immutable release without changing the legacy current pointer. */
+export async function stageEngineRelease(input: EngineInstallInput): Promise<EngineInstallResult> {
   const env = input.env ?? process.env;
   const channel = input.channel ?? "stable";
   const ops = input.ops ?? createEngineInstallOps();
@@ -345,7 +359,9 @@ export async function installEngineRelease(input: {
     throw new EngineInstallError(
       signatureCheck.reason === "root-key-not-pinned"
         ? "no trust root is pinned in this build; releases cannot be verified"
-        : "the release signature did not verify against any trusted root",
+        : signatureCheck.reason === "manifest-invalid"
+          ? "the signed release manifest is invalid"
+          : "the release signature did not verify against any trusted root",
       signatureCheck.reason
     );
   }
@@ -362,6 +378,15 @@ export async function installEngineRelease(input: {
       `the ${channel} release targets ${manifest.platform}/${manifest.arch}, not this host`,
       "release-not-for-host"
     );
+  }
+  if (manifest.channel !== channel) throw new EngineInstallError("release channel mismatch", "release-incompatible");
+  const eulaVersion = manifest.schema_version === 2 ? manifest.eula_version : ENGINE_EULA_VERSION;
+  if (!canPresentEngineEula(eulaVersion) || !engineEulaAccepted(env, eulaVersion)) {
+    throw new EngineInstallError(`accept engine EULA ${eulaVersion} before acquisition`, "eula-not-accepted", eulaVersion);
+  }
+  if (input.compatibility && !compatibleFull(input.compatibility,
+    { verified: true, trust: signatureCheck.trust, manifest }, eulaVersion)) {
+    throw new EngineInstallError("the signed release is incompatible with this CLI", "release-incompatible");
   }
 
   // CONTAINMENT (belt-and-braces over the parse-time version-segment rule): the release dir must
@@ -382,16 +407,20 @@ export async function installEngineRelease(input: {
     const existing = verifyInstalledArtifact(currentTarget, env);
     if (
       existing.verified &&
+      existing.trust === signatureCheck.trust &&
+      canonicalManifestBytes(existing.manifest).equals(canonicalManifestBytes(manifest)) &&
       existing.manifest.version === manifest.version &&
       existing.manifest.channel === manifest.channel &&
       existing.manifest.artifact_kind === manifest.artifact_kind &&
       existing.manifest.sha256.toLowerCase() === manifest.sha256.toLowerCase()
     ) {
       return {
+        manifest: existing.manifest,
         version: existing.manifest.version,
         channel: existing.manifest.channel,
         artifactKind: existing.manifest.artifact_kind,
         trust: existing.trust,
+        keyId: existing.trust === "pinned-root" ? existing.key_id : undefined,
         artifactPath: currentTarget,
         updated: false
       };
@@ -435,8 +464,8 @@ export async function installEngineRelease(input: {
     // created by `mkdtemp`, so it belongs exclusively to this install. No existing directory is
     // written into, renamed over, or removed: a concurrent installer's release (and the live one)
     // cannot be disturbed, and an interruption anywhere in here leaves the previous signed install
-    // byte-for-byte intact and still verifying. The directory is unreachable until the pointer names
-    // it — `current` is the only path in, nothing enumerates the install root.
+    // byte-for-byte intact and still verifying. Publication by the caller is separate: either a
+    // managed session pair pins this immutable artifact or legacy installation updates `current`.
     let releaseDir: string;
     try {
       mkdirSync(installRoot, { recursive: true, mode: 0o700 });
@@ -453,7 +482,11 @@ export async function installEngineRelease(input: {
       writeFileSync(join(releaseDir, SIGNATURE_FILENAME), `${release.signature}\n`, { mode: 0o600 });
       // The staged release must pass the SAME check the supervisor runs before every spawn. Only a
       // release that already verifies on disk may become current.
-      if (!verifyInstalledArtifact(artifactPath, env).verified) {
+      const stagedVerification = verifyInstalledArtifact(artifactPath, env);
+      if (!stagedVerification.verified || stagedVerification.trust !== signatureCheck.trust ||
+          (signatureCheck.trust === "pinned-root" &&
+            (stagedVerification.trust !== "pinned-root" || stagedVerification.key_id !== signatureCheck.key_id)) ||
+          !canonicalManifestBytes(stagedVerification.manifest).equals(canonicalManifestBytes(manifest))) {
         throw new EngineInstallError("the staged engine install did not verify", "install-write-failed");
       }
       // LAST CALL, INSIDE THE STAGING GUARD so a cancellation here takes the staged directory with
@@ -467,28 +500,39 @@ export async function installEngineRelease(input: {
       throw new EngineInstallError("the engine install could not be written", "install-write-failed");
     }
 
-    try {
-      // PROMOTE — the pointer swap is the ONLY publication step, and it is atomic (write-then-rename,
-      // so the supervisor never reads a partial pointer). Until it succeeds the previous install
-      // stays current and complete; after it succeeds the previous install is merely unreferenced,
-      // never deleted, so no other process can be left pointing at a removed tree.
-      const pointer = enginePointerPath(env);
-      const pointerTmp = `${pointer}.tmp`;
-      writeFileSync(pointerTmp, `${artifactPath}\n`, { mode: 0o600 });
-      renameSync(pointerTmp, pointer);
-    } catch {
-      throw new EngineInstallError("the engine install could not be written", "install-write-failed");
-    }
-
     return {
+      manifest,
       version: manifest.version,
       channel: manifest.channel,
       artifactKind: manifest.artifact_kind,
       trust: signatureCheck.trust,
+      keyId: signatureCheck.trust === "pinned-root" ? signatureCheck.key_id : undefined,
       artifactPath,
       updated: true
     };
   } finally {
     rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+/** Legacy installation explicitly promotes only after acquisition and verification succeed. */
+export async function installEngineRelease(input: EngineInstallInput): Promise<EngineInstallResult> {
+  const result = await stageEngineRelease(input);
+  if (!result.updated) return result;
+  const env = input.env ?? process.env;
+  if (input.signal?.aborted) throw new EngineInstallError("the engine install was cancelled", "cancelled");
+  let pointerDir: string | undefined;
+  try {
+    // A call owns its temp directory. Concurrent promotions cannot overwrite each other's temp
+    // file; rename is the single atomic, last-completed publication step.
+    pointerDir = mkdtempSync(join(engineInstallRoot(env), ".current-"));
+    const pointerTmp = join(pointerDir, "pointer");
+    writeFileSync(pointerTmp, `${result.artifactPath}\n`, { mode: 0o600 });
+    renameSync(pointerTmp, enginePointerPath(env));
+  } catch {
+    throw new EngineInstallError("the engine install could not be written", "install-write-failed");
+  } finally {
+    if (pointerDir) rmSync(pointerDir, { recursive: true, force: true });
+  }
+  return result;
 }

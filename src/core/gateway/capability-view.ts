@@ -45,7 +45,7 @@ function cacheProofLine(row: WorkflowProviderCapability): string {
  */
 function planAuthLine(row: WorkflowProviderCapability): string {
   if (row.planAuthReady) {
-    return "ready (default) - run this workflow normally with your existing CLI auth; content-free usage recorded (no API key).";
+    return "ready (default) - run this workflow normally with your existing CLI auth; content-free evidence is shown only from recorded artifacts (no API key).";
   }
   return "n/a - Advanced gateway-routable path (no shim/hook to install).";
 }
@@ -56,7 +56,7 @@ export const CAPABILITIES_SUBHEAD =
   "What is actually supported for each workflow - plan-auth is the default (keyless); provider cache proof and live verification are OPTIONAL add-ons. Rendered from the capability matrix (content-free).";
 /** Plan-auth-first framing: a workflow is ready via plan auth even when cache proof / live verification is undone. */
 export const CAPABILITIES_PLAN_AUTH_NOTE =
-  "Plan-auth (default): detected CLI workflows record content-free usage with your existing auth - no API key requested or stored. Provider cache proof and live verification are optional (Advanced); a workflow is not unavailable when they are not done.";
+  "Plan-auth (default): detected CLI workflows route or capture with your existing auth; content-free evidence is shown only from recorded artifacts - no API key requested or stored. Provider cache proof and live verification are optional (Advanced); a workflow is not unavailable when they are not done.";
 export const CAPABILITIES_LIVE_NOTE = `Note: supported ≠ live-verified. No workflow is live-verified yet - ${LIVE_UNVERIFIED_REASON}`;
 
 /** The live note reflecting actual state: which rows are live-verified from real evidence (none → default note). */

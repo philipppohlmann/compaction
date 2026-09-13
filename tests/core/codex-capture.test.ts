@@ -26,7 +26,7 @@ describe("normalizeCodexExecEvents - provider-reported usage from turn.completed
     expect(r.usageMetadata.input_tokens).toBe(24763);
     expect(r.usageMetadata.output_tokens).toBe(122);
     expect(r.usageMetadata.cache_read_input_tokens).toBe(24448); // cached_input_tokens → cache read
-    expect(r.usageMetadata.total_tokens).toBe(24763 + 122 + 7); // reasoning included in total, not double-counted as output
+    expect(r.usageMetadata.total_tokens).toBe(24763 + 122); // reasoning is already a subset of output
     expect(r.usageMetadata.provider).toBe("openai");
     // Tokens are provider-reported, but no COST/pricing is known for the unknown model → cost stays
     // honestly "unknown" (we never synthesize a cost from provider-reported tokens alone).
@@ -80,7 +80,29 @@ describe("normalizeCodexExecEvents - provider-reported usage from turn.completed
     expect(r.usageMetadata.input_tokens).toBe(300);
     expect(r.usageMetadata.output_tokens).toBe(30);
     expect(r.usageMetadata.cache_read_input_tokens).toBe(20);
-    expect(r.usageMetadata.total_tokens).toBe(300 + 30 + 3);
+    expect(r.usageMetadata.total_tokens).toBe(300 + 30);
+  });
+
+  it("does not add the reasoning subset again for closed usage counts", () => {
+    const rawOutput = JSON.stringify({
+      type: "turn.completed",
+      usage: { input_tokens: 9502, cached_input_tokens: 0, output_tokens: 24, reasoning_output_tokens: 17 }
+    });
+    const r = normalizeCodexExecEvents({ captureId: "reasoning-subset", rawOutput });
+    expect(r.usageMetadata.input_tokens).toBe(9502);
+    expect(r.usageMetadata.output_tokens).toBe(24);
+    expect(r.usageMetadata.total_tokens).toBe(9526);
+    expect(r.usageMetadata.limitations.some((note) => note.includes("Reasoning output tokens"))).toBe(true);
+  });
+
+  it.each([undefined, 0])("preserves totals with reasoning_output_tokens=%s", (reasoning) => {
+    const rawOutput = JSON.stringify({
+      type: "turn.completed",
+      usage: { input_tokens: 100, output_tokens: 10, reasoning_output_tokens: reasoning }
+    });
+    const r = normalizeCodexExecEvents({ captureId: "no-reasoning-subset", rawOutput });
+    expect(r.usageMetadata.total_tokens).toBe(110);
+    expect(r.usageMetadata.limitations.some((note) => note.includes("Reasoning output tokens"))).toBe(false);
   });
 
   it("parseCodexEvents ignores non-JSON noise lines", () => {
@@ -106,7 +128,7 @@ describe("committed SYNTHETIC demo fixture (src/examples/codex-exec-demo.jsonl)"
     expect(r.usageMetadata.input_tokens).toBe(24000);
     expect(r.usageMetadata.output_tokens).toBe(1800);
     expect(r.usageMetadata.cache_read_input_tokens).toBe(16000);
-    expect(r.usageMetadata.total_tokens).toBe(24000 + 1800 + 200);
+    expect(r.usageMetadata.total_tokens).toBe(24000 + 1800);
     // The fixture's messages must be consumable so the demo compaction has real content to act on.
     const roles = r.trace.messages.map((m) => m.role);
     expect(roles).toContain("assistant");

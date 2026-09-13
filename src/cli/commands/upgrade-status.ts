@@ -23,8 +23,17 @@ import {
   type ProductMode
 } from "../../core/onboarding-preferences.js";
 import { readStoredCredentials } from "../../core/auth/credentials.js";
-import { readLeaseVerdict, type LeaseVerdictLabel } from "../../core/entitlement/lease-store.js";
-import { engineAvailability, type EngineAvailability } from "../../core/engine-availability.js";
+import {
+  leaseNeedsRenewal,
+  readLeaseVerdict,
+  type LeaseVerdictLabel
+} from "../../core/entitlement/lease-store.js";
+import {
+  engineAvailability,
+  engineInputCompaction,
+  type EngineAvailability,
+  type EngineInputCompaction
+} from "../../core/engine-availability.js";
 
 /** How many recent per-turn receipt lines `compaction status` shows in its "Last turns" section. */
 export const STATUS_LAST_TURNS = 3;
@@ -191,14 +200,37 @@ function renderLastTurnsSection(
 export const ACCOUNT_ACCESS_HEADING = "Account & access";
 export const SET_UP_COMMUNITY_REMEDY = "Run compaction to set up Community.";
 export const RESTORE_COMMUNITY_REMEDY = "Run compaction to restore Community access.";
+/** Signed in, lease missing/expired, and silent renew could not restore authorization. */
+export const REFRESH_COMMUNITY_REMEDY =
+  "Community authorization could not be refreshed automatically. Check the network, then run compaction status again.";
+/** Server authoritatively denied Community for this device/account. */
+export const COMMUNITY_DENIED_REMEDY =
+  "This device is no longer entitled to Community. Sign in again with `compaction login`, or continue on Open.";
 export const COMPACTION_ACTIVE_FOOTER = "Compaction is active.";
 
 /**
- * The content-free account + entitlement + engine snapshot behind the `Account & access` section,
- * read from LOCAL disk ONLY (credentials file, signed lease, stored product mode, engine resolution)
- * — no network, reusing the SAME pure readers the gateway/receipt-line use so `status` can never
- * disagree with them (F55). It surfaces the state a set-up device ALREADY holds so `status` can no
- * longer describe an entitled device as unconfigured / "local-only" (F52).
+ * THE LINE THAT WOULD HAVE SHOWN THE OUTAGE. Printed only when the resolved engine's SIGNED manifest
+ * declares a meter unit this client cannot place — a state in which the gateway forwards every
+ * request unchanged no matter how much it could have compacted.
+ *
+ * Both sentences are deliberately narrow. The first states what is off and why, in the engine's own
+ * terms, without naming a unit string at a user. The second does NOT promise that a compatible engine
+ * exists to install — at the time of writing none had been published — because a remedy that cannot
+ * work is worse than none; it says what the command does WHEN one is published, and states the
+ * capability the user still has.
+ */
+export const INPUT_COMPACTION_UNSUPPORTED =
+  "Input compaction: unavailable - the installed engine predates this release's metering contract.";
+export const INPUT_COMPACTION_UNSUPPORTED_REMEDY =
+  "Output shaping continues. Run compaction engine install to pick up a compatible engine once one is published.";
+
+/**
+ * The content-free account + entitlement + engine snapshot behind the `Account & access` section.
+ *
+ * Identity (credentials present), authorization (lease verdict), and engine readiness are separate
+ * facts. Status may silently renew a connected device's lease when it is missing/expired/near
+ * expiry — that is the same repair `login`/`mode`/`gateway` already run — then re-reads local disk
+ * so Plan/Community cannot claim Open while a still-entitled device only needed a refresh.
  *
  * PRIVACY (load-bearing): the account is reduced to a boolean `connected` here — the account id, the
  * email, and the device token are NEVER carried on this snapshot, so no identifier can reach the
@@ -212,10 +244,63 @@ interface AccountAccessState {
   entitled: boolean;
   /** Valid lease verified against the explicit DEV trust root — surfaced loudly, never omitted. */
   communityDevSigned: boolean;
+  /** Content-free lease verdict label — distinguishes never-activated from expired/denied. */
+  leaseLabel: LeaseVerdictLabel;
+  /**
+   * Why Community is not active when connected but not entitled, after any silent renew attempt.
+   * `needs-activation` = never had usable authorization; `refresh-failed` = transient renew miss;
+   * `denied` = authoritative server refusal; `none` when entitled or not connected.
+   */
+  communityGap: "none" | "needs-activation" | "refresh-failed" | "denied";
   /** The clamped effective tier (the SAME clamp the gateway apply gate reads). Drives the Optimization line. */
   tier: "observe" | "basic" | "full";
   /** An engine actually resolves and verifies on this machine. Drives the Engine line. */
   engineReady: boolean;
+  /**
+   * The resolved engine's signed manifest declares a meter unit this client cannot place, so input
+   * compaction cannot run on this pair. Distinct from `engineReady`: this device HAS a working engine
+   * and still gets no input compaction from it. Drives the input-compaction line.
+   */
+  inputCompactionUnsupported: boolean;
+}
+
+/**
+ * Attempt silent Community lease renew when this device is signed in and the lease needs it.
+ * Never throws. Open devices (no credentials) are a no-op with no network call.
+ */
+async function maybeRenewCommunityAuthorization(env: EnvLike): Promise<string | undefined> {
+  if (readStoredCredentials(env) === undefined) return undefined;
+  if (!leaseNeedsRenewal(env)) return undefined;
+  try {
+    const { ensureCommunityRuntime } = await import("../../core/entitlement/community-runtime.js");
+    const outcome = await ensureCommunityRuntime(env, () => {}, { leaseOnly: true });
+    return outcome.reason;
+  } catch {
+    return "lease-unavailable";
+  }
+}
+
+function communityGapFrom(
+  connected: boolean,
+  entitled: boolean,
+  leaseLabel: LeaseVerdictLabel,
+  renewReason: string | undefined
+): AccountAccessState["communityGap"] {
+  if (!connected || entitled) return "none";
+  if (renewReason === "not_entitled" || renewReason === "unauthorized" || renewReason === "device_inactive") {
+    return "denied";
+  }
+  // Expired / wrong-period / absent after a renew attempt that was not an authoritative denial:
+  // this device was previously in the Community lifecycle (or still is server-side) — do not send
+  // the user through "needs activation" browser copy.
+  if (
+    leaseLabel === "lease-expired" ||
+    leaseLabel === "lease-wrong-period" ||
+    renewReason !== undefined
+  ) {
+    return "refresh-failed";
+  }
+  return "needs-activation";
 }
 
 /**
@@ -226,18 +311,24 @@ interface AccountAccessState {
  */
 async function collectAccountAccess(
   env: EnvLike,
-  tier: "observe" | "basic" | "full"
+  tier: "observe" | "basic" | "full",
+  renewReason?: string
 ): Promise<AccountAccessState> {
   // Truthiness only: the parsed credentials are never propagated, so no identifier can reach a render path.
   const connected = readStoredCredentials(env) !== undefined;
   const verdict = readLeaseVerdict(env);
+  const entitled = verdict.label === "lease-valid";
   const engine = await engineAvailability(env as NodeJS.ProcessEnv);
+  const inputCompaction = await engineInputCompaction(env as NodeJS.ProcessEnv);
   return {
     connected,
-    entitled: verdict.label === "lease-valid",
-    communityDevSigned: verdict.label === "lease-valid" && verdict.trust === "dev-lease-root",
+    entitled,
+    communityDevSigned: entitled && verdict.trust === "dev-lease-root",
+    leaseLabel: verdict.label,
+    communityGap: communityGapFrom(connected, entitled, verdict.label, renewReason),
     tier,
-    engineReady: engine === "present"
+    engineReady: engine === "present",
+    inputCompactionUnsupported: inputCompaction === "unsupported"
   };
 }
 
@@ -245,10 +336,9 @@ async function collectAccountAccess(
  * Render the `Account & access` section. Every branch below is a decided rule, not a choice:
  *  - Account: presence only, never the id/token; absent → the set-up remedy on the next line.
  *  - Plan: user-facing vocabulary is ONLY `Community` (entitled) or `Open` (not entitled) — never a
- *    raw product_mode string.
- *  - Community: `active` (valid), `active (DEV-SIGNED)` (dev-signed valid), or `needs activation` +
- *    the restore remedy when signed in with no currently-valid access. Omitted when not connected
- *    (a device that is not signed in cannot "need activation").
+ *    raw product_mode string. Entitled means a verified lease AFTER any silent renew.
+ *  - Community: `active` / `active (DEV-SIGNED)`, or a gap that distinguishes never-activated from
+ *    refresh failure / denial (never "needs activation" for a signed-in device that only needs renew).
  *  - Optimization: the posture, shown SEPARATELY from the plan — `Full`/`Basic`, and OMITTED for
  *    observe/none (no posture claim off a bare intent).
  *  - Engine: `ready` only when an engine actually resolves; otherwise omitted.
@@ -269,14 +359,31 @@ function renderAccountAccessSection(s: AccountAccessState): string[] {
   if (s.entitled) {
     lines.push(s.communityDevSigned ? "Community: active (DEV-SIGNED)" : "Community: active");
   } else if (s.connected) {
-    lines.push("Community: needs activation");
-    lines.push(RESTORE_COMMUNITY_REMEDY);
+    if (s.communityGap === "denied") {
+      lines.push("Community: not entitled");
+      lines.push(COMMUNITY_DENIED_REMEDY);
+    } else if (s.communityGap === "refresh-failed") {
+      lines.push("Community: authorization needs refresh");
+      lines.push(REFRESH_COMMUNITY_REMEDY);
+    } else {
+      lines.push("Community: needs activation");
+      lines.push(RESTORE_COMMUNITY_REMEDY);
+    }
   }
 
   if (s.tier === "full") lines.push("Optimization: Full");
   else if (s.tier === "basic") lines.push("Optimization: Basic");
 
   if (s.engineReady) lines.push("Engine: ready");
+
+  // Immediately after the Engine line, because it is the qualification of that line: an engine can be
+  // ready and still be unable to compact input. Shown whenever the pair declares it, independent of
+  // plan/tier — an Open device's engine is equally incapable, and hiding the reason behind an
+  // entitlement check is how this stayed invisible.
+  if (s.inputCompactionUnsupported) {
+    lines.push(INPUT_COMPACTION_UNSUPPORTED);
+    lines.push(INPUT_COMPACTION_UNSUPPORTED_REMEDY);
+  }
 
   // Footer only when the device is fully set up AND the effective posture is `full` — the healthy
   // state that pairs with `Optimization: Full`. Gating on `full` (not merely
@@ -305,6 +412,8 @@ interface AccountAccessJson {
     productMode: ProductMode;
     effectiveTier: "observe" | "basic" | "full";
     engine: EngineAvailability;
+    /** What the resolved pair declares about input compaction — the state a support report needs. */
+    engineInputCompaction: EngineInputCompaction;
   };
 }
 
@@ -324,7 +433,8 @@ async function collectAccountAccessJson(
       ...(verdict.periodId ? { periodId: verdict.periodId } : {}),
       productMode: readProductMode(env),
       effectiveTier: tier,
-      engine
+      engine,
+      engineInputCompaction: await engineInputCompaction(env as NodeJS.ProcessEnv)
     }
   };
 }
@@ -350,17 +460,21 @@ function hostedReasonLine(health: HealthResult): string {
 /**
  * Run `compaction status`. Prints the local readiness report (read-only, content-free,
  * presence-only credentials), the last per-turn receipt lines, and the `Account & access` section:
- * the account/plan/entitlement/optimization/engine state this device ALREADY holds, read from local
- * disk only (F52/F55). When a private-beta HOSTED endpoint is deliberately configured, the hosted
- * reachability diagnostic is appended (masked key + host + a LIVE reachability re-check; capabilities
- * shown ONLY when reachable). Never prints the account id, the device token, or the API key on the
- * human path. Always exits 0.
+ * the account/plan/entitlement/optimization/engine state this device holds after any silent Community
+ * lease renew for a signed-in device whose lease is missing/expired/near expiry. When a private-beta
+ * HOSTED endpoint is deliberately configured, the hosted reachability diagnostic is appended (masked
+ * key + host + a LIVE reachability re-check; capabilities shown ONLY when reachable). Never prints
+ * the account id, the device token, or the API key on the human path. Always exits 0.
  */
 export async function runStatus(
   opts: { env?: EnvLike; version?: string; json?: boolean; projectsDir?: string; checkCodex?: boolean } = {}
 ): Promise<void> {
   const env = opts.env ?? process.env;
   const version = opts.version ?? "unknown";
+  // Silent renew FIRST for a signed-in device whose lease needs it, so Plan/Community and the tier
+  // clamp below describe post-renew authorization rather than a stale expired lease. Open devices
+  // make no network call.
+  const renewReason = await maybeRenewCommunityAuthorization(env);
   // `checkCodex` is the ONLY thing that lets this command start another program. Default off, because
   // the report's headline promise is read-only/no-network and Codex's app-server is neither
   // (`ReadinessOptions.probeCodexTrust`).
@@ -371,7 +485,8 @@ export async function runStatus(
   // duplicate formatting). Read-only, content-free, kill-switch-aware, fail-open (empty store → no lines).
   const lastTurns = await lastReceiptLines(STATUS_LAST_TURNS, { cwd: process.cwd(), env: env as NodeJS.ProcessEnv });
   // The ceiling is a STATE fact, not a property of any replayed line (see `renderLastTurnsSection`).
-  // `tier` is the ONE clamp the `Account & access` posture and the allowance notice both read.
+  // `tier` is the ONE clamp the `Account & access` posture and the allowance notice both read —
+  // evaluated AFTER silent renew so Full is visible when the lease was restored.
   const { tier, allowanceResetsOn, allowancePauseScope } = await resolveOpenTier(env);
   const target = resolveTarget({ env });
   const configured = target.apiKey !== undefined && !isLocalDevUrl(target.url);
@@ -411,7 +526,7 @@ export async function runStatus(
   console.log("");
   for (const line of renderLastTurnsSection(lastTurns, await allowanceNoticeInput(env, process.cwd()))) console.log(line);
   console.log("");
-  const accountAccess = await collectAccountAccess(env, tier);
+  const accountAccess = await collectAccountAccess(env, tier, renewReason);
   for (const line of renderAccountAccessSection(accountAccess)) console.log(line);
 
   // INVARIANT: with no hosted endpoint configured (the common case), the `Account & access` section

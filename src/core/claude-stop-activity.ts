@@ -1,9 +1,13 @@
 /** Build one immutable, content-free, whole-run Claude Stop activity event from exact receipts. */
 import { computeActivityEventId, type ActivityEvent } from "./activity-event.js";
 import { claudeLogicalRunIdentity } from "./claude-logical-run-id.js";
-import type { OutputCalibrationResolver } from "./output-shaping-savings.js";
+import { buildOutputShapingPolicy } from "./output-shaping.js";
+import { outputCalibrationQuery, type OutputShapingCalibrationQuery } from "./output-shaping-calibration-store.js";
+import { estimatePerTurnOutputSaved, type OutputCalibrationResolver } from "./output-shaping-savings.js";
+import type { ShapingDecisionOutcome } from "./subscription-shaping-runtime.js";
 import type { GatewayReceipt, GatewayReceiptTailWindow } from "./gateway/receipt.js";
 import { aggregateRun } from "./gateway/run-aggregate.js";
+import { isRealApply, receiptCompactedInput } from "./gateway/receipt-line.js";
 import { receiptBelongsToRun, type UserRun } from "./gateway/run-boundary.js";
 import { buildRunFlowTokenReport } from "./run-flow-report.js";
 import { settledRunApplyPosture, settledRunOutputEstimate } from "./settled-stop-activity.js";
@@ -18,31 +22,75 @@ export interface ClaudeTranscriptUsageBaseline {
 }
 
 function compatibleInputPair(receipt: GatewayReceipt): boolean {
-  const before = receipt.estimated_input_tokens_before;
-  const after = receipt.estimated_input_tokens_after;
-  if (typeof before !== "number" || typeof after !== "number") return false;
-  const compacted = receipt.applied_components?.some(
-    (component) => component === "lcm-compaction" || component === "deterministic-compaction"
-  ) === true;
-  return !(compacted && before === after);
+  return isRealApply(receipt) && receiptCompactedInput(receipt);
 }
 
 function exactWindowIsIncomplete(
   window: GatewayReceiptTailWindow,
-  run: UserRun,
-  receipts: readonly GatewayReceipt[]
+  run: UserRun
 ): boolean {
   if (!window.truncated) return false;
-  const earliest = receipts.reduce<string | undefined>((value, receipt) => {
-    const at = receipt.request_started_at ?? receipt.captured_at;
-    return typeof at === "string" && (value === undefined || at < value) ? at : value;
-  }, undefined);
-  return earliest === undefined || earliest > run.started_at;
+  const oldestCapturedAt = window.receipts[0]?.captured_at;
+  const capturedAtMs = typeof oldestCapturedAt === "string" ? Date.parse(oldestCapturedAt) : Number.NaN;
+  const runStartedAtMs = Date.parse(run.started_at);
+  if (
+    !Number.isFinite(capturedAtMs) ||
+    !Number.isFinite(runStartedAtMs) ||
+    new Date(capturedAtMs).toISOString() !== oldestCapturedAt ||
+    new Date(runStartedAtMs).toISOString() !== run.started_at
+  ) return true;
+  return capturedAtMs > runStartedAtMs;
 }
 
 function singleValue<T extends string>(values: Array<T | undefined>): T | undefined {
   const present = [...new Set(values.filter((value): value is T => typeof value === "string" && value.length > 0))];
   return present.length === 1 ? present[0] : undefined;
+}
+
+/** Exact shaped receipt cohort for a complete Claude run; incomplete or mixed metadata fails closed. */
+export function claudeStopOutputCalibrationQuery(input: {
+  run: UserRun;
+  window: GatewayReceiptTailWindow;
+}): OutputShapingCalibrationQuery | undefined {
+  const receipts = input.window.receipts.filter((receipt) => receiptBelongsToRun(receipt, input.run));
+  if (receipts.length === 0 || exactWindowIsIncomplete(input.window, input.run)) return undefined;
+  const shaped = receipts.filter((receipt) =>
+    receipt.output_shaping_state === "attached-this-pass" ||
+    receipt.output_shaping_state === "already-active"
+  );
+  const queries = shaped.map((receipt) =>
+    receipt.token_source === "provider-reported" && typeof receipt.tokens?.output === "number"
+      ? outputCalibrationQuery({
+          policyVersion: receipt.output_shaping_policy_version,
+          provider: receipt.provider,
+          model: receipt.model,
+          regime: receipt.output_shaping_regime
+        })
+      : undefined
+  );
+  if (queries.length === 0 || queries.some((query) => query === undefined)) return undefined;
+  const first = JSON.stringify(queries[0]);
+  return queries.every((query) => JSON.stringify(query) === first) ? queries[0] : undefined;
+}
+
+export type PositiveShapingOutcome = Extract<ShapingDecisionOutcome, "shape" | "shape-basic">;
+
+/** Exact transcript cohort; `shape-basic` deliberately has no task-aware regime. */
+export function claudeTranscriptOutputCalibrationQuery(input: {
+  usage: UsageMetadata;
+  shapingOutcome?: PositiveShapingOutcome;
+}): OutputShapingCalibrationQuery | undefined {
+  if (
+    !input.shapingOutcome ||
+    input.usage.provider_reported_tokens !== true ||
+    input.usage.provider !== "anthropic"
+  ) return undefined;
+  return outputCalibrationQuery({
+    policyVersion: buildOutputShapingPolicy().policyVersion,
+    provider: input.usage.provider,
+    model: input.usage.model,
+    ...(input.shapingOutcome === "shape" ? { regime: "default-shapeable" } : {})
+  });
 }
 
 export function buildClaudeStopActivityEvent(input: {
@@ -54,7 +102,7 @@ export function buildClaudeStopActivityEvent(input: {
   const identity = claudeLogicalRunIdentity(input.run);
   if (!identity) return undefined;
   const receipts = input.window.receipts.filter((receipt) => receiptBelongsToRun(receipt, input.run));
-  if (receipts.length === 0 || exactWindowIsIncomplete(input.window, input.run, receipts)) return undefined;
+  if (receipts.length === 0 || exactWindowIsIncomplete(input.window, input.run)) return undefined;
 
   const aggregate = aggregateRun(receipts, { outputCalibrationResolver: input.calibrationResolver });
   if (!aggregate.input && !aggregate.output) return undefined;
@@ -123,7 +171,8 @@ export function buildClaudeStopActivityEvent(input: {
 export function buildClaudeTranscriptStopActivityEvent(input: {
   run: UserRun;
   usage: UsageMetadata;
-  shaped: boolean;
+  shapingOutcome?: PositiveShapingOutcome;
+  calibrationResolver: OutputCalibrationResolver;
   baseline?: ClaudeTranscriptUsageBaseline;
 }): ActivityEvent | undefined {
   if (!input.run.ended_at) return undefined;
@@ -165,7 +214,12 @@ export function buildClaudeTranscriptStopActivityEvent(input: {
   if (observedInput === undefined && observedOutput === undefined) return undefined;
   // An output-shaping claim needs an actual observed output axis beside it. Without that axis the
   // transcript is insufficient evidence for the settled shaped result, so fail closed altogether.
-  if (input.shaped && observedOutput === undefined) return undefined;
+  const shaped = input.shapingOutcome !== undefined;
+  if (shaped && observedOutput === undefined) return undefined;
+  const query = claudeTranscriptOutputCalibrationQuery(input);
+  const estimate = shaped && query
+    ? estimatePerTurnOutputSaved(input.calibrationResolver(query), observedOutput)
+    : undefined;
 
   const inputAxis = observedInput === undefined
     ? {
@@ -200,10 +254,16 @@ export function buildClaudeTranscriptStopActivityEvent(input: {
     recorded_at: input.run.ended_at,
     run_started_at: input.run.started_at,
     measurement_source: "claude-transcript",
-    ...(input.shaped
+    ...(shaped
       ? {
           output_shaping_state: "active" as const,
-          output_estimate_state: "unseeded" as const,
+          ...(estimate?.calibrated === true && estimate.tokensSaved && estimate.basis === "measured"
+            ? {
+                estimated_output_tokens_saved: estimate.tokensSaved,
+                output_estimate_basis: "measured" as const,
+                output_estimate_state: "calibrated" as const
+              }
+            : { output_estimate_state: estimate?.state ?? "unseeded" as const }),
           apply_posture: "basic" as const
         }
       : {})

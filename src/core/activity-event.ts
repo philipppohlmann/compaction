@@ -370,9 +370,7 @@ export function validateActivityEvent(value: unknown): ActivityEventValidation {
       }
       if (
         event.output_before !== undefined ||
-        event.output_estimate !== undefined ||
-        event.estimated_output_tokens_saved !== undefined ||
-        event.output_estimate_basis !== undefined
+        event.output_estimate !== undefined
       ) {
         problems.push("activity_kind claude-stop: transcript usage cannot claim a numerical output counterfactual");
       }

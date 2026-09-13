@@ -42,6 +42,7 @@
  * held. A window known to have cut the run off is rendered without a rate (see `runAggregateLine`).
  */
 import type { GatewayReceipt } from "./receipt.js";
+import { isRealApply, receiptCompactedInput } from "./receipt-line.js";
 import { outputCalibrationQuery } from "../output-shaping-calibration-store.js";
 import type { OutputCalibrationResolver } from "../output-shaping-savings.js";
 
@@ -76,14 +77,16 @@ export interface RunAggregate {
 function compatibleInputPair(receipt: GatewayReceipt): { before: number; after: number } | undefined {
   const before = receipt.estimated_input_tokens_before;
   const after = receipt.estimated_input_tokens_after;
-  if (typeof before !== "number" || typeof after !== "number") return undefined;
-  // A pair that claims a component compacted input while reporting no reduction is the incompatible
-  // historical basis, not a truthful zero: a real no-change apply does not carry `lcm-compaction`.
-  const compactedInput = receipt.applied_components?.some(
-    (c) => c === "lcm-compaction" || c === "deterministic-compaction"
-  );
-  if (compactedInput === true && before === after) return undefined;
+  if (!isNonNegativeSafeInteger(before) || !isNonNegativeSafeInteger(after)) return undefined;
+  if (!isRealApply(receipt) || !receiptCompactedInput(receipt)) return undefined;
+  // The shared predicates above establish apply mode, real mutation, compacting provenance (or the
+  // components-absent legacy fallback), canonical count domains, and a strict net reduction.
   return { before, after };
+}
+
+/** Persisted count fields are untrusted JSON at every replay boundary. */
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
 /** Was output shaping durably proven ACTIVE on this call's final model-visible request? */
@@ -123,7 +126,7 @@ export function aggregateRun(receipts: GatewayReceipt[], options: RunAggregateOp
       inputBefore += pair.before;
       inputAfter += pair.after;
       sawInput = true;
-    } else if (typeof promptInput === "number") {
+    } else if (isNonNegativeSafeInteger(promptInput)) {
       inputBefore += promptInput;
       inputAfter += promptInput;
       sawInput = true;
@@ -135,7 +138,7 @@ export function aggregateRun(receipts: GatewayReceipt[], options: RunAggregateOp
     const shaped = shapingProvenActive(receipt);
     if (shaped) shapedCallCount++;
     const output = receipt.tokens?.output;
-    if (typeof output === "number") {
+    if (isNonNegativeSafeInteger(output)) {
       outputAfter += output;
       sawOutput = true;
       const query = shaped

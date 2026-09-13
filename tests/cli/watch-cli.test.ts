@@ -425,8 +425,12 @@ describe("receiptLinesFromJsonl - tier + per-turn evidence", () => {
       endpoint: "/v1/chat/completions",
       mode: "apply",
       request_mutated: true,
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
       estimated_input_tokens_before: 41210,
       estimated_input_tokens_after: 21876,
+      applied_components: ["lcm-compaction"],
+      upstream_status: 200,
       model: "gpt-4o",
       tokens: { prompt_input: 22012, output: 412 },
       content_uploaded: false
@@ -442,6 +446,89 @@ describe("receiptLinesFromJsonl - tier + per-turn evidence", () => {
     expect(fallback).not.toContain("full apply");
     expect(fallback).not.toContain("apply off");
     expect(fallback).toContain("observed input 100");
+  });
+
+  it("a full-tier device keeps deterministic input evidence without promoting it to private Full", () => {
+    const deterministic = {
+      receipt_id: "ffffffff-0000-0000-0000-000000000000",
+      captured_at: "2026-08-03T00:00:00Z",
+      provider: "openai",
+      endpoint: "/v1/responses",
+      mode: "apply",
+      request_mutated: true,
+      approval_status: "explicit-mode",
+      estimated_input_tokens_before: 100,
+      estimated_input_tokens_after: 80,
+      applied_components: ["deterministic-compaction"],
+      upstream_status: 200,
+      model: "gpt-5",
+      tokens: { prompt_input: 80, output: 12 },
+      content_uploaded: false
+    };
+
+    const [line] = receiptLinesFromJsonl(JSON.stringify(deterministic), { productTier: "full" });
+    expect(line).toContain("input 100→80");
+    expect(line).not.toContain("observed input");
+    expect(line).not.toContain("full apply");
+
+    for (const [before, after] of [
+      ["100", 80],
+      [100, "80"],
+      [100.8, 80.2],
+      [-1, -2],
+      [0, -1]
+    ]) {
+      const [malformed] = receiptLinesFromJsonl(
+        JSON.stringify({
+          ...deterministic,
+          estimated_input_tokens_before: before,
+          estimated_input_tokens_after: after
+        }),
+        { productTier: "full" }
+      );
+      expect(malformed).not.toMatch(/input [-\d,]+→[-\d,]+/);
+      expect(malformed).not.toContain("full apply");
+    }
+  });
+
+  it("persisted malformed token fields fail closed through the real JSONL replay path", () => {
+    const canonical = {
+      receipt_id: "eeeeeeee-0000-0000-0000-000000000000",
+      captured_at: "2026-08-03T00:00:00Z",
+      provider: "openai",
+      endpoint: "/v1/responses",
+      mode: "apply",
+      request_mutated: true,
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      estimated_input_tokens_before: 41210,
+      estimated_input_tokens_after: 21876,
+      applied_components: ["lcm-compaction"],
+      upstream_status: 200,
+      model: "gpt-5",
+      content_uploaded: false
+    };
+
+    for (const tokens of [
+      null,
+      { prompt_input: 22012, output: "999" },
+      { prompt_input: 22012, output: -3 },
+      { prompt_input: 22012, output: 1.8 }
+    ]) {
+      let lines: string[] = [];
+      expect(() => {
+        lines = receiptLinesFromJsonl(JSON.stringify({ ...canonical, tokens }), { productTier: "full" });
+      }).not.toThrow();
+      expect(lines.join("\n")).not.toMatch(/output (?:999|[-−]3|1(?:\.8)?)(?:\D|$)/);
+    }
+
+    const [validInputInvalidOutput] = receiptLinesFromJsonl(
+      JSON.stringify({ ...canonical, tokens: { prompt_input: 22012, output: "999" } }),
+      { productTier: "full" }
+    );
+    expect(validInputInvalidOutput).toContain("input 41,210→21,876");
+    expect(validInputInvalidOutput).toContain("full apply");
+    expect(validInputInvalidOutput).not.toContain("output");
   });
 });
 

@@ -12,8 +12,11 @@ import {
   connectClaudeCodeStatusLine,
   disconnectClaudeCodeShapingHook,
   disconnectClaudeCodeStatusLine,
+  claudeSettingsPathForScope,
+  claudeSettingsReadPaths,
   isShapingHookInstalled,
   isStopHookInstalled,
+  migrateProjectScopeClaudeSettings,
   type ConnectClaudeCodeResult,
   type ConnectShapingHookResult,
   type ConnectStatusLineResult
@@ -32,7 +35,8 @@ import {
 import {
   CODEX_TRUST_ACTION_COMMAND,
   CODEX_TRUST_ACTION_CONTROL,
-  CODEX_TRUST_ACTION_HEADING
+  CODEX_TRUST_ACTION_HEADING,
+  codexShapingHookTrust
 } from "../../core/codex-hook-trust.js";
 import { isShapingTaskClassifierPresent } from "../../core/gateway/task-awareness-seam.js";
 import { fullOptimizationReachable } from "../../core/engine-availability.js";
@@ -106,7 +110,6 @@ import { getGatewayStatus } from "../../core/gateway/status.js";
 import { READY_ROUTE_PROVIDER, type OnboardingReadyStatus } from "../onboarding/model.js";
 import {
   ONBOARDING_AUTH_FALLBACK_LINES,
-  FULL_APPLY_PENDING_REASONS,
   FULL_APPLY_REQUIREMENT_LINE,
   isLocalFullApplyGateReason,
   onboardingAuthFailureLines,
@@ -130,7 +133,6 @@ import {
   OPTIMIZATION_MODE_PREFERENCE_LABELS,
   OPTIMIZATION_MODE_PREFERENCES,
   writeProductMode,
-  readOptimizationMode,
   type OptimizationModePreference
 } from "../../core/onboarding-preferences.js";
 import { applyModeSelection } from "./mode.js";
@@ -147,7 +149,6 @@ import {
   savePolicyPreference
 } from "../../core/policy-preferences.js";
 import { DEDUPE_POLICY } from "../../core/gateway/request-shape.js";
-import { findStoredAuthorization } from "../../core/gateway/apply-eligibility.js";
 
 /**
  * `compaction init`, first-run terminal onboarding.
@@ -220,7 +221,7 @@ function footerBlock(): string[] {
 
 /**
  * The static (non-TTY / `--static`) first screen, the same connect-once model as the TUI:
- * detection + status + the "Enable Compaction for" menu and the exact `--connect N` command
+ * detection + status + the named "Enable Compaction for" commands
  * (nothing is written until the user runs it). A `--path` focus adds that surface's one manual
  * capture/import command.
  */
@@ -244,8 +245,7 @@ function buildStaticScreen(version: string, focus: string | undefined, detection
   lines.push("");
   lines.push(...connectMenuBlock());
   lines.push("");
-  lines.push(chalk.dim("  Enable one now (nothing is written until you run it):"));
-  lines.push(`    ${ACCENT("compaction init --connect 1")}   ${chalk.dim("# Claude Code   (2 Codex · 3 Cursor · 4 all · 5 skip)")}`);
+  lines.push(chalk.dim("  Nothing is written until you run one of these commands."));
   lines.push("");
 
   // 3. Gateway as the underlying byte-safe routing layer (infra, not a peer card).
@@ -293,20 +293,38 @@ function buildStaticScreen(version: string, focus: string | undefined, detection
 type ConnectChoice = "claude-code" | "codex" | "cursor" | "all" | "skip";
 
 /** Human labels + the honest per-tool token-source line shown in the capture-shim connect block. */
-const SHIM_TOOL_LABELS: Record<CaptureShimTool, { title: string; connectNum: string; measurableForm: string; tokenNote: string }> = {
+const SHIM_TOOL_LABELS: Record<CaptureShimTool, { title: string; connectName: string; measurableForm: string; tokenNote: string }> = {
   codex: {
     title: "Codex",
-    connectNum: "2",
+    connectName: "codex",
     measurableForm: "codex exec --json",
     tokenNote: "provider-reported tokens (codex exec --json turn.completed.usage) - NOT billing-confirmed"
   },
   cursor: {
     title: "Cursor",
-    connectNum: "3",
+    connectName: "cursor",
     measurableForm: "cursor-agent … --output-format json",
     tokenNote: "LOCAL-ESTIMATE tokens only because Compaction does not ingest Cursor's conditional result.usage - never provider-reported; output unavailable when the result is not separable"
   }
 };
+
+/**
+ * The honest "what happens to invocations outside the measurable batch form" line, per tool. Codex's
+ * PATH shim is a GATEWAY-ROUTE (`kind: "gateway-route"`, `src/core/tool-shim.ts`): EVERY normal
+ * invocation, interactive included, is routed through the local Gateway. Receipt evidence is shown
+ * only when a settled artifact exists -
+ * UNLESS Compaction detects the user's OWN route already declared (an env override; an argv
+ * `-c`/`--config`, selected profile, or local-provider flag; a top-level `model_provider` already set
+ * in the base or selected profile config; or an OpenAI API key present), in which case that run falls
+ * back to the same measurable-batch-form-only capture Cursor always uses and is NOT measured. Cursor
+ * has no Gateway route at all, so its line never changes.
+ */
+export function interactiveInvocationsLine(tool: CaptureShimTool, shimName: string): string {
+  if (tool === "codex") {
+    return `Every other ${shimName} invocation - interactive included - also routes through the local Gateway unless Compaction detects your own model-provider route (env, -c/--config, -p/--profile, --oss/--local-provider, or Codex config) or an OpenAI API key already configured, in which case it passes through untouched. Settled receipt evidence is shown only when recorded; nothing is inferred for a request without one.`;
+  }
+  return `Interactive / other ${shimName} invocations pass through untouched and are NOT measured (never faked).`;
+}
 
 const CONNECT_ALIASES: Record<string, ConnectChoice> = {
   "1": "claude-code",
@@ -361,7 +379,11 @@ function connectDetectionBlock(detection: ConnectDetection): string[] {
 }
 
 function connectMenuBlock(): string[] {
-  return [header("Enable Compaction for:"), "", ...CONNECT_MENU.map((m) => `    [${m.num}] ${m.label}`)];
+  return [
+    header("Enable Compaction for:"),
+    "",
+    ...CONNECT_MENU.map((m) => `    ${ACCENT(m.command)}   ${chalk.dim(`# ${m.label}`)}`)
+  ];
 }
 
 /**
@@ -395,6 +417,74 @@ function optimizationModeBlock(): string[] {
   return lines;
 }
 
+function shimInstallVerified(result: InstallShimResult): boolean {
+  return result.status === "installed-active" || result.status === "already-active" || result.status === "installed-not-on-path";
+}
+
+function shellConfigStatusLine(result: WriteShellConfigResult): string {
+  return result.status === "already-present"
+    ? `    PATH: already set up - your shell config (${result.rcPath}) already carries the Compaction PATH line.`
+    : `    PATH: added to your shell config - wrote ${result.rcPath}` +
+        (result.backupPath ? ` (backup: ${result.backupPath}).` : " (new file; no backup needed).");
+}
+
+function shellConfigWriteFailureLines(exportLine: string): string[] {
+  return [
+    chalk.yellow("    PATH persistence: your shell config could not be updated. This shell remains active."),
+    chalk.dim("    To keep Compaction active in future shells, add this ONE line yourself:"),
+    `      ${ACCENT(exportLine)}`
+  ];
+}
+
+function shellConfigOptOutLines(exportLine: string, unsupportedShell?: string): string[] {
+  return [
+    chalk.dim("    PATH persistence: --no-write-shell-config left your shell config untouched. This shell remains active."),
+    unsupportedShell === undefined
+      ? chalk.dim("    To keep Compaction active in future shells, add this ONE line yourself:")
+      : chalk.dim(
+          `    To keep Compaction active in future shells, add an equivalent PATH entry using ${unsupportedShell} syntax (the line below is POSIX shell syntax):`
+        ),
+    `      ${ACCENT(exportLine)}`
+  ];
+}
+
+function unsupportedShellConfigLines(shell: string, exportLine: string): string[] {
+  return [
+    chalk.dim(`    PATH persistence: Compaction only edits zsh and bash startup files, and your shell is ${shell}, so nothing was written. This shell remains active.`),
+    chalk.dim("    To keep Compaction active in future shells, add an equivalent PATH entry in your shell's syntax (the line below is POSIX shell syntax):"),
+    `      ${ACCENT(exportLine)}`
+  ];
+}
+
+function activeShellConfigLines(
+  exportLine: string,
+  state: { rc?: WriteShellConfigResult; writeFailed?: boolean; optedOut: boolean; unsupportedShell?: string }
+): string[] {
+  if (state.rc && !state.optedOut) return [chalk.green(shellConfigStatusLine(state.rc))];
+  if (state.writeFailed) return shellConfigWriteFailureLines(exportLine);
+  if (state.optedOut) return shellConfigOptOutLines(exportLine, state.unsupportedShell);
+  if (state.unsupportedShell !== undefined) return unsupportedShellConfigLines(state.unsupportedShell, exportLine);
+  return [];
+}
+
+function pendingShellConfigLines(
+  state: { optedOut: boolean; writeFailed?: boolean; unsupportedShell?: string }
+): string[] {
+  const reason = state.optedOut
+    ? "--no-write-shell-config: your shell config was NOT touched."
+    : state.unsupportedShell !== undefined
+      ? `Compaction only edits zsh and bash startup files, and your shell is ${state.unsupportedShell}, so nothing was written.`
+      : state.writeFailed
+        ? "Your shell config could not be updated."
+        : "Your shell config was not updated.";
+  return [
+    chalk.dim(`    ${reason}`),
+    state.unsupportedShell === undefined
+      ? chalk.dim("    Add this ONE line yourself, then re-run to verify:")
+      : chalk.dim(`    Add an equivalent PATH entry using ${state.unsupportedShell} syntax (the line below is POSIX shell syntax), then re-run to verify:`)
+  ];
+}
+
 /**
  * The Codex/Cursor PATH-shim install-result block. Claims "connected" only when the shim is
  * verified active on PATH; installed-but-not-on-PATH prints the one export line and "not yet
@@ -403,10 +493,11 @@ function optimizationModeBlock(): string[] {
  */
 function shimConnectBlock(
   result: InstallShimResult,
-  wroteShellConfig?: { rcPath: string; backupPath?: string; status: string },
+  wroteShellConfig?: WriteShellConfigResult,
   optedOut = false,
   /** The user's `$SHELL` when Compaction cannot write a startup file it will load; undefined otherwise. */
-  unsupportedShell?: string
+  unsupportedShell?: string,
+  shellConfigWriteFailed = false
 ): string[] {
   const meta = SHIM_TOOL_LABELS[result.tool as CaptureShimTool];
   const title = meta.title;
@@ -416,14 +507,22 @@ function shimConnectBlock(
       `  ${chalk.bold("▸ " + title)} ${chalk.green("- connected")}`,
       "",
       chalk.green(`    Compaction is now active for ${title} (PATH shim: ${result.shimPath} → real ${result.shimName}: ${result.realBin ?? "recorded"}).`),
-      `    From now on, ${chalk.bold(meta.measurableForm)} runs are measured automatically - no manual import needed.`,
-      chalk.dim(`    Interactive / other ${result.shimName} invocations pass through untouched and are NOT measured (never faked).`),
+      ...activeShellConfigLines(result.exportLine, {
+        optedOut,
+        ...(wroteShellConfig ? { rc: wroteShellConfig } : {}),
+        ...(shellConfigWriteFailed ? { writeFailed: true } : {}),
+        ...(unsupportedShell !== undefined ? { unsupportedShell } : {})
+      }),
+      result.tool === "codex"
+        ? `    From now on, ${chalk.bold(meta.measurableForm)} runs route automatically - recorded evidence needs no manual import.`
+        : `    From now on, ${chalk.bold(meta.measurableForm)} runs are measured automatically - no manual import needed.`,
+      chalk.dim(`    ${interactiveInvocationsLine(result.tool as CaptureShimTool, result.shimName)}`),
       chalk.dim(`    Token source: ${meta.tokenNote}.`),
       chalk.dim("    Metrics-only; no prompt or response content is stored or uploaded."),
       "",
       chalk.dim("    See your runs anytime:  compaction activity"),
       chalk.dim(`    Fallback/debug (per-invocation, not needed once connected):  compaction run ${result.tool} -- <cmd>`),
-      chalk.dim(`    Disconnect (reversible):  compaction init --disconnect ${meta.connectNum}`)
+      chalk.dim(`    Disconnect (reversible):  compaction init --disconnect ${meta.connectName}`)
     ];
     return lines;
   }
@@ -436,52 +535,37 @@ function shimConnectBlock(
       // what was written and where the backup is, and never claim this shell is routed. Deliberately
       // NO "then re-run `compaction init --connect N` to verify" step: a second Compaction command is
       // a hidden second set-up, and there is nothing left to set up.
-      const wroteLine =
-        wroteShellConfig.status === "already-present"
-          ? `    PATH: already set up - your shell config (${wroteShellConfig.rcPath}) already carries the Compaction PATH line.`
-          : `    PATH: added to your shell config - wrote ${wroteShellConfig.rcPath}` +
-            (wroteShellConfig.backupPath ? ` (backup: ${wroteShellConfig.backupPath}).` : " (new file; no backup needed).");
       return [
         `  ${chalk.bold("▸ " + title)} ${chalk.green("- installed; active in new shells")}`,
         "",
-        chalk.green(`    The capture shim is installed at ${result.shimPath}.`),
-        chalk.green(wroteLine),
+        chalk.green(`    The shim is installed at ${result.shimPath}.`),
+        chalk.green(shellConfigStatusLine(wroteShellConfig)),
         `      ${ACCENT(result.exportLine)}`,
-        `    Open a NEW shell (or \`source ${wroteShellConfig.rcPath}\`) - from then on ${chalk.bold(meta.measurableForm)} runs are`,
-        "    measured automatically. No manual steps.",
-        chalk.dim(`    Interactive / other ${result.shimName} invocations pass through untouched and are NOT measured (never faked).`),
+        `    Open a NEW shell (or \`source ${wroteShellConfig.rcPath}\`) - from then on ${chalk.bold(meta.measurableForm)} runs`,
+        result.tool === "codex"
+          ? "    route automatically; only recorded evidence is reported. No manual steps."
+          : "    are measured automatically. No manual steps.",
+        chalk.dim(`    ${interactiveInvocationsLine(result.tool as CaptureShimTool, result.shimName)}`),
         chalk.dim(`    This shell still resolves \`${result.shimName}\` to ${resolved ?? "the real binary"}; nothing is captured here until a new shell picks up the PATH.`),
         chalk.dim("    Metrics-only; no prompt or response content is stored or uploaded."),
-        chalk.dim(`    Manage PATH yourself instead?  compaction init --connect ${meta.connectNum} --no-write-shell-config`),
+        chalk.dim(`    Manage PATH yourself instead?  compaction init --connect ${meta.connectName} --no-write-shell-config`),
         "",
         chalk.dim("    See your runs anytime:  compaction activity"),
-        chalk.dim(`    Disconnect (reversible):  compaction init --disconnect ${meta.connectNum}`)
+        chalk.dim(`    Disconnect (reversible):  compaction init --disconnect ${meta.connectName}`)
       ];
     }
-    // Opted out (--no-write-shell-config), an unsupported shell, or a failed rc write: print the ONE
-    // manual line. NOTE what this branch does NOT say - there is no "active in new shells" here, and
-    // the caller leaves the tool out of `connected` in all three cases, so no Ready summary claims it
-    // either. That matters most for the unsupported-shell case: the rc resolver would have written
-    // `~/.bashrc`, which fish (or any other non-POSIX shell) never loads and could not parse, so a
-    // write there activates nothing and claiming activation would leave the user in exactly the
-    // new-shell dead end the default write exists to remove.
-    const reasonLines = optedOut
-      ? [chalk.dim("    --no-write-shell-config: your shell config was NOT touched. Add this ONE line yourself, then re-run to verify:")]
-      : unsupportedShell !== undefined
-        ? [
-            chalk.dim(`    Compaction only edits zsh and bash startup files, and your shell is ${unsupportedShell},`),
-            chalk.dim("    so nothing was written to it. Add the PATH entry yourself - the line below is POSIX shell"),
-            chalk.dim("    syntax, so translate it into your shell's own form - then re-run to verify:")
-          ]
-        : [chalk.dim("    Your shell config could not be updated. Add this ONE line yourself, then re-run to verify:")];
     return [
       `  ${chalk.bold("▸ " + title)} ${chalk.yellow("- installed, NOT yet active")}`,
       "",
       chalk.yellow(`    The shim is installed at ${result.shimPath}, but its directory is not on your PATH yet,`),
       chalk.yellow(`    so \`${result.shimName}\` still resolves to ${resolved ?? "the real binary"} - NOT the shim.`),
-      ...reasonLines,
+      ...pendingShellConfigLines({
+        optedOut,
+        writeFailed: shellConfigWriteFailed,
+        ...(unsupportedShell !== undefined ? { unsupportedShell } : {})
+      }),
       `      ${ACCENT(result.exportLine)}`,
-      `      ${ACCENT(`compaction init --connect ${meta.connectNum}`)}`
+      `      ${ACCENT(`compaction init --connect ${meta.connectName}`)}`
     ];
   }
 
@@ -490,7 +574,7 @@ function shimConnectBlock(
       `  ${chalk.bold("▸ " + title)} ${chalk.dim("- not found")}`,
       "",
       chalk.dim(`    No \`${result.shimName}\` binary was found on your PATH, so there is nothing to measure yet.`),
-      chalk.dim(`    Install ${title} first, then re-run \`compaction init --connect ${meta.connectNum}\`. Nothing was written.`)
+      chalk.dim(`    Install ${title} first, then re-run \`compaction init --connect ${meta.connectName}\`. Nothing was written.`)
     ];
   }
 
@@ -514,9 +598,9 @@ function shimDryRunBlock(tool: ShimTool): string[] {
   return [
     `  ${chalk.bold("▸ " + meta.title)} ${chalk.dim("- dry run")}`,
     "",
-    chalk.dim("    --dry-run: nothing was written. Without it this would install the capture shim into your"),
+    chalk.dim("    --dry-run: nothing was written. Without it this would install the shim into your"),
     chalk.dim("    Compaction shim directory and append the PATH line to your zsh/bash startup file (backed up first)."),
-    chalk.dim(`    Run it for real:  compaction init --connect ${meta.connectNum}`)
+    chalk.dim(`    Run it for real:  compaction init --connect ${meta.connectName}`)
   ];
 }
 
@@ -568,7 +652,7 @@ async function resolveClaudeRoutingPosture(): Promise<ApplyRoutingDecision> {
 /** The shared "runs continuously / stop anytime" closing lines for the Claude Code routing blocks. */
 function claudeContinuousStopLines(): string[] {
   return [
-    chalk.dim("    Compaction runs continuously until you stop it:  compaction gateway stop   ·   Disconnect (removes the shim + the PATH line it wrote):  compaction init --disconnect 1"),
+    chalk.dim("    Compaction runs continuously until you stop it:  compaction gateway stop   ·   Disconnect (removes the shim + the PATH line it wrote):  compaction init --disconnect claude-code"),
     chalk.dim("    See routed traffic:  compaction gateway status")
   ];
 }
@@ -583,14 +667,21 @@ function claudeContinuousStopLines(): string[] {
 function claudeRoutingShimBlock(
   result: InstallShimResult,
   posture: ApplyRoutingDecision,
-  shellConfig?: { optedOut: boolean; rc?: WriteShellConfigResult }
+  shellConfig?: { optedOut: boolean; rc?: WriteShellConfigResult; writeFailed?: boolean; unsupportedShell?: string }
 ): string[] {
   if (result.status === "installed-active" || result.status === "already-active") {
+    const rc = shellConfig?.rc;
     return [
       `  ${chalk.bold("▸ Claude Code routing")} ${chalk.green("- active")}`,
       "",
       chalk.green("    You're set - just use `claude` normally. Runs are routed through the local Compaction gateway and captured automatically and continuously."),
       chalk.green(`    PATH: on-PATH ✓ - \`claude\` resolves to the Compaction shim (${result.shimPath} → real claude: ${result.realBin ?? "recorded"}).`),
+      ...activeShellConfigLines(result.exportLine, {
+        optedOut: shellConfig?.optedOut ?? false,
+        ...(rc ? { rc } : {}),
+        ...(shellConfig?.writeFailed ? { writeFailed: true } : {}),
+        ...(shellConfig?.unsupportedShell !== undefined ? { unsupportedShell: shellConfig.unsupportedShell } : {})
+      }),
       ...claudeRoutingPostureLines(posture),
       chalk.dim("    Your credential (API key or saved login) rides through to Anthropic untouched - never read, stored, or logged."),
       chalk.dim("    Fail-open: if the gateway cannot start or answer, `claude` runs unchanged. Receipts are content-free (token/cache counts only)."),
@@ -605,36 +696,29 @@ function claudeRoutingShimBlock(
     if (rc && !shellConfig?.optedOut) {
       // Default path: the PATH line was written (or already present) - announce exactly what was
       // written and where the backup is; routing activates in NEW shells (this one is unchanged).
-      const wroteLine =
-        rc.status === "already-present"
-          ? `    PATH: already set up - your shell config (${rc.rcPath}) already carries the Compaction PATH line.`
-          : `    PATH: added to your shell config - wrote ${rc.rcPath}` + (rc.backupPath ? ` (backup: ${rc.backupPath}).` : " (new file; no backup needed).");
       return [
         `  ${chalk.bold("▸ Claude Code routing")} ${chalk.green("- installed; active in new shells")}`,
         "",
         chalk.green(`    The routing shim is installed at ${result.shimPath}.`),
-        chalk.green(wroteLine),
+        chalk.green(shellConfigStatusLine(rc)),
         `      ${ACCENT(rc.exportLine)}`,
         `    Open a NEW shell (or \`source ${rc.rcPath}\`) - from then on normal \`claude\` runs are`,
         "    routed through the local Compaction gateway and captured automatically and continuously. No manual steps.",
         ...claudeRoutingPostureLines(posture),
         chalk.dim(`    This shell still resolves \`claude\` to ${resolved ?? "the real binary"}; nothing is routed here until a new shell picks up the PATH.`),
-        chalk.dim("    Manage PATH yourself instead?  compaction init --connect 1 --no-write-shell-config"),
+        chalk.dim("    Manage PATH yourself instead?  compaction init --connect claude-code --no-write-shell-config"),
         "",
         ...claudeContinuousStopLines()
       ];
     }
-    // Opted out (--no-write-shell-config) or the rc write failed: print the ONE manual line.
     return [
       `  ${chalk.bold("▸ Claude Code routing")} ${chalk.yellow("- installed, NOT yet active")}`,
       "",
       chalk.yellow(`    The routing shim is installed at ${result.shimPath}, but its directory is not on your PATH yet,`),
       chalk.yellow(`    so \`claude\` still resolves to ${resolved ?? "the real binary"} - NOT the shim (nothing is routed).`),
-      shellConfig?.optedOut
-        ? chalk.dim("    --no-write-shell-config: your shell config was NOT touched. Add this ONE line yourself, then re-run to verify:")
-        : chalk.dim("    Your shell config could not be updated. Add this ONE line yourself, then re-run to verify:"),
+      ...pendingShellConfigLines(shellConfig ?? { optedOut: false }),
       `      ${ACCENT(result.exportLine)}`,
-      `      ${ACCENT("compaction init --connect 1")}`
+      `      ${ACCENT("compaction init --connect claude-code")}`
     ];
   }
 
@@ -643,7 +727,7 @@ function claudeRoutingShimBlock(
       `  ${chalk.bold("▸ Claude Code routing")} ${chalk.dim("- skipped (no claude binary found on PATH)")}`,
       "",
       chalk.dim("    No `claude` binary was found on your PATH, so no routing shim was written. The consented"),
-      chalk.dim("    Stop hook above still measures sessions. Re-run `compaction init --connect 1` once the claude CLI is available.")
+      chalk.dim("    Stop hook above still measures sessions. Re-run `compaction init --connect claude-code` once the claude CLI is available.")
     ];
   }
 
@@ -670,6 +754,8 @@ function claudeRoutingStatusBlock(posture: ApplyRoutingDecision): string[] {
       chalk.green("    You're set - just use `claude` normally. Runs are routed through the local Compaction gateway and captured automatically and continuously."),
       chalk.green(`    PATH: on-PATH ✓ - \`claude\` resolves to the Compaction shim (${v.shimPath}).`),
       ...claudeRoutingPostureLines(posture),
+      chalk.dim("    Your credential (API key or saved login) rides through to Anthropic untouched - never read, stored, or logged."),
+      chalk.dim("    Fail-open: if the gateway cannot start or answer, `claude` runs unchanged. Receipts are content-free (token/cache counts only)."),
       "",
       ...claudeContinuousStopLines()
     ];
@@ -684,7 +770,7 @@ function claudeRoutingStatusBlock(posture: ApplyRoutingDecision): string[] {
         : chalk.yellow("    PATH: not set up - add this ONE line to your shell config, then re-run to verify:"),
       ...(configured
         ? claudeRoutingPostureLines(posture)
-        : [`      ${ACCENT(v.exportLine)}`, `      ${ACCENT("compaction init --connect 1")}`]),
+        : [`      ${ACCENT(v.exportLine)}`, `      ${ACCENT("compaction init --connect claude-code")}`]),
       "",
       ...claudeContinuousStopLines()
     ];
@@ -693,7 +779,7 @@ function claudeRoutingStatusBlock(posture: ApplyRoutingDecision): string[] {
     `  ${chalk.bold("▸ Claude Code routing")} ${chalk.yellow("- not installed")}`,
     "",
     chalk.yellow("    The transparent routing shim is not installed, so normal `claude` runs are not captured continuously."),
-    `    Install it (reversible):  ${ACCENT("compaction init --connect 1")}`
+    `    Install it (reversible):  ${ACCENT("compaction init --connect claude-code")}`
   ];
 }
 
@@ -719,9 +805,7 @@ function claudeRoutingStatusBlock(posture: ApplyRoutingDecision): string[] {
 async function ensureRoutedClaudeStatusLine(options: ConnectRunOptions): Promise<string[]> {
   try {
     if (!verifyShimActive("claude-code").installed) return []; // no routing → nothing to self-heal.
-    const settingsPath = options.user
-      ? path.join(homedir(), ".claude", "settings.json")
-      : path.join(process.cwd(), ".claude", "settings.json");
+    const settingsPath = claudeSettingsPathForScope(options.project ? "project" : "user");
     const lines: string[] = [];
     // Per-turn VISIBLE surface (honors the receipt-line kill switch: silence → wire nothing).
     if (isReceiptLineEnabled()) {
@@ -737,6 +821,26 @@ async function ensureRoutedClaudeStatusLine(options: ConnectRunOptions): Promise
         lines.push(...claudeShapingHookBlock(shaping, await isShapingTaskClassifierPresent()));
       } catch {
         /* fail-open: display-only self-heal; never break the already-connected surface */
+      }
+    }
+    // MIGRATION on the ALREADY-CONNECTED path too. Migration used to run only when connect ENABLED a
+    // tool, but a user who is already globally connected takes this self-heal branch instead — so
+    // running connect inside an old project-local install left Compaction's hooks in BOTH scopes
+    // forever. Claude Code merges hooks additively, so that is a permanent double capture and double
+    // shaping, hidden behind the single-slot status line. Found by a real fresh-install acceptance,
+    // not by a unit test.
+    if (!options.project) {
+      try {
+        const migrated = await migrateProjectScopeClaudeSettings({ ...(options.dryRun ? { dryRun: true } : {}) });
+        if (migrated.cleaned.length > 0) {
+          lines.push(
+            options.dryRun
+              ? `    Would migrate ${migrated.removedHooks} project-local Compaction hook entr${migrated.removedHooks === 1 ? "y" : "ies"} into the global install (preview - nothing written).`
+              : `    Migrated ${migrated.removedHooks} project-local Compaction hook entr${migrated.removedHooks === 1 ? "y" : "ies"} into the global install (one integration, no double shaping).`
+          );
+        }
+      } catch {
+        /* fail-open: a migration failure never un-connects the global install */
       }
     }
     return lines;
@@ -791,7 +895,7 @@ function skipBlock(): string[] {
   return [
     header("Skipped"),
     "",
-    chalk.dim("  Nothing was installed or changed. Re-run `compaction init --connect 1` anytime to"),
+    chalk.dim("  Nothing was installed or changed. Run `compaction init --connect claude-code` anytime to"),
     chalk.dim("  connect Claude Code, or `compaction hooks install` to install the Stop hook directly.")
   ];
 }
@@ -1018,16 +1122,15 @@ function subscriptionHooksBlock(result: SubscriptionHookInstallOutcome, perTurnH
   }
   if (tool === "codex") {
     lines.push(
-      chalk.dim("    The per-turn line is installed - if your Codex build displays hook `systemMessage`, one line per turn."),
-      // NOT "`compaction watch` shows it either way". `watch` reads Gateway receipts and shim-captured
-      // runs; an INTERACTIVE codex session produces neither - which the shim block eight lines above
-      // states outright ("Interactive / other codex invocations pass through untouched and are NOT
-      // measured"). Naming the measurable forms is the only version of this that is true.
-      chalk.dim("    `compaction watch` shows Codex turns you route through the Gateway (`compaction gateway run -- codex …`); interactive sessions are not measured.")
+      chalk.dim("    The Stop line is installed - if your Codex build displays hook `systemMessage`, it shows settled evidence when recorded."),
+      // `watch` reads settled Gateway receipts, including those from normal interactive Codex
+      // sessions routed by the installed shim. A user-declared provider route stays outside
+      // Compaction and a routed request without settled evidence is not claimed.
+      chalk.dim("    `compaction watch` shows settled Gateway evidence when recorded, including interactive Codex sessions.")
     );
   } else {
     lines.push(
-      chalk.dim("    Cursor has no per-turn line and no Gateway route; output effect is not yet measured on Cursor."),
+      chalk.dim("    Compaction has no verified Cursor per-turn parser or Gateway route; output effect is not yet measured on Cursor."),
       chalk.dim("    `compaction watch` shows `cursor-agent … --output-format json` runs; an IDE session is shaped by this hook but is not measured.")
     );
   }
@@ -1053,7 +1156,7 @@ function activationCopyBlock(): string[] {
   return [
     header("What Compaction does once connected"),
     "",
-    "    - measure input/output tokens (metrics-only)",
+    "    - report observed input/output tokens when a recorded source carries them (metrics-only)",
     "    - detect avoidable context",
     "    - recommend safe compaction before the call where supported",
     "    - ask before applying",
@@ -1091,7 +1194,8 @@ export async function readySummaryBlock(
     ? {
         ...routingInputs,
         claudeRouting: computeClaudeRoutingState(),
-        shapingHooksInstalled: await confirmedShapingHooks(enabled)
+        shapingHooksInstalled: await confirmedShapingHooks(enabled),
+        codexShapingState: await codexReadyShapingState()
       }
     : undefined;
   const routing = refreshed ? deriveReadyRouting(enabled, refreshed) : undefined;
@@ -1128,7 +1232,9 @@ async function computeReadyRoutingInputs(): Promise<ReadyRoutingInputs> {
     // is PUBLIC and ships in the npm package - so this is a per-build question, not a per-tier one, and
     // an account changes nothing. The ready screen may claim the hold only when this build can actually
     // reach it, and must then say the same thing `compaction hooks install --tool codex` says.
-    shapingPerTurnHold: await isShapingTaskClassifierPresent()
+    shapingPerTurnHold: await isShapingTaskClassifierPresent(),
+    shapingHooksInstalled: await confirmedShapingHooks(WORKFLOW_ORDER),
+    codexShapingState: await codexReadyShapingState()
   };
 }
 
@@ -1175,7 +1281,7 @@ export async function computeOnboardingReadyStatus(
   mode: OptimizationModePreference
 ): Promise<OnboardingReadyStatus> {
   const primary = enabled[0];
-  // Launcher verification: Claude Code uses the routing shim; Codex/Cursor use their capture shim.
+  // Launcher verification: Claude Code and Codex use their routing shim; Cursor uses its capture shim.
   const shimTool: ShimTool | undefined = primary === undefined ? undefined : (primary as ShimTool);
   const launcherState = shimTool ? verifyShimActive(shimTool) : undefined;
   const launcherActive = launcherState?.active === true;
@@ -1228,39 +1334,13 @@ export async function computeOnboardingReadyStatus(
 }
 
 /**
- * The LOCAL gates that stand between a valid entitlement lease and a full apply actually happening,
- * or `undefined` when none of them do. These are the gateway's OWN conditions, read from the same
- * stores it reads (`resolveStoredAuthorizationApply` in `src/core/gateway/server.ts`): the persisted
- * optimization mode must be `cache-plus-context`, and a stored `auto-when-gates-pass` authorization
- * must cover an enabled workflow. Local disk only — no account, entitlement, or network call.
- *
- * WHY THE READY SCREEN MUST ASK: the lease is the only gate activation itself can satisfy, so a screen
- * that consulted the lease alone announced `Per turn full apply` to the many users who kept the
- * recommended Output-only mode — for whom every single request stays on the non-apply path. The label
- * has to answer the same question the gateway will, not a subset of it.
- *
- * The FIRST unmet gate is reported, and the optimization mode is checked first on purpose: it is the
- * user's own visible choice from two screens earlier, so it is the reason that will make sense to them.
- *
- * There is no `cwd` here on purpose: both gates are DEVICE facts. The authorization used to be read
- * from the working directory, which made this screen answer differently in different folders.
+ * The LOCAL gates between a valid entitlement lease and a real full apply. MOVED, not changed, to
+ * `./full-apply-gate.js`: `mode.ts` has to ask the same question this screen asks, and its Open static
+ * import graph may not reach the device-login client this file imports. Re-exported so this module
+ * stays the import site it has always been for the onboarding path and its tests.
  */
-export async function pendingFullApplyGate(
-  workflows: readonly ReadyToolKey[],
-  env: NodeJS.ProcessEnv = process.env
-): Promise<string | undefined> {
-  if (readOptimizationMode(env) !== "cache-plus-context") return FULL_APPLY_PENDING_REASONS.optimizationMode;
-  for (const workflow of workflows) {
-    // ONE env for both gates. The mode and the authorization are two facts about the same device, and
-    // this screen must answer the question the gateway will answer - reading them from two different
-    // environments (or the authorization from a working directory) is how the two answers diverge.
-    const authorization = await findStoredAuthorization({ scope: { tool: workflow }, env });
-    if (authorization) return undefined;
-  }
-  // Also the "nothing was enabled" case: no enabled workflow can carry an authorization, so no turn
-  // routed through this device can be a full apply either.
-  return FULL_APPLY_PENDING_REASONS.applyAuthorization;
-}
+import { pendingFullApplyGate } from "./full-apply-gate.js";
+export { pendingFullApplyGate };
 
 /**
  * Why full apply is not live yet, when the engine is the thing missing — read from the attempt that
@@ -1323,7 +1403,7 @@ export async function runCommunityActivation(
     (step) => {
       onProgress({ kind: "provisioning", step });
     },
-    { signal }
+    { signal, engineIntent: "explicit" }
   );
   const leaseReason = runtime.lease === "unavailable" ? (runtime.reason ?? "entitlement service unreachable") : undefined;
 
@@ -1415,10 +1495,9 @@ function connectHeaderLines(detection: ConnectDetection): string[] {
 }
 
 /**
- * Content-free connect detection for the onboarding surfaces. `claude.hookReady` is true only
- * when the Stop hook is present + verified in the project or user `.claude/settings.json`
- * (the same read-only verifier the connect flow runs after an install). Strictly read-only:
- * only a verified hook makes Claude Code `ready`; session discovery alone is at most `found`.
+ * Content-free connect detection for the onboarding surfaces. Claude Code is `ready` only when
+ * the whole promised connection is active: the Stop hook, the before-call shaping hook, and the
+ * transparent-routing shim resolving before the real binary. All checks are read-only.
  */
 async function computeConnectDetection(det: DetectionState): Promise<ConnectDetection> {
   const shimStatus = (tool: ShimTool): "active" | "installed" | "found" | "absent" => {
@@ -1428,11 +1507,19 @@ async function computeConnectDetection(det: DetectionState): Promise<ConnectDete
     const real = resolveExecutableOnPath(SHIM_TOOLS[tool].shimName, process.env, [v.shimDir]);
     return real ? "found" : "absent";
   };
-  const projectSettings = path.join(process.cwd(), ".claude", "settings.json");
-  const userSettings = path.join(homedir(), ".claude", "settings.json");
-  const hookReady = (await isStopHookInstalled(projectSettings)) || (await isStopHookInstalled(userSettings));
+  const claudeStatus = shimStatus("claude-code");
+  // Same resolver as every write path and as readiness, so the onboarding TUI can never disagree
+  // with `compaction status` about where the integration lives. Also covers `settings.local.json`,
+  // which the previous hand-rolled pair missed: Claude Code fires a hook installed there.
+  const stopHookChecks = await Promise.all(claudeSettingsReadPaths().map((file) => isStopHookInstalled(file)));
+  const stopHookReady = stopHookChecks.some(Boolean);
+  const hookReady = stopHookReady && (await isClaudeShapingActive()) && verifyShimActive("claude-code").active;
   return {
-    claude: { detected: det.claudeDetected, sessionCount: det.sessionCount, hookReady },
+    claude: {
+      detected: det.claudeDetected || claudeStatus !== "absent",
+      sessionCount: det.sessionCount,
+      hookReady
+    },
     codex: shimStatus("codex"),
     cursor: shimStatus("cursor")
   };
@@ -1440,6 +1527,8 @@ async function computeConnectDetection(det: DetectionState): Promise<ConnectDete
 
 interface ConnectRunOptions {
   user?: boolean;
+  /** Explicit PROJECT scope (advanced). Default is user/global — Compaction is install-once. */
+  project?: boolean;
   dryRun?: boolean;
   writeShellConfig?: boolean;
 }
@@ -1455,13 +1544,6 @@ interface ConnectSelection {
   countReadyKeys: ReadyToolKey[];
 }
 
-/** Map a legacy single `ConnectChoice` to the generalized selection (back-compat: never counts already-ready). */
-function legacyChoiceToSelection(resolved: ConnectChoice): ConnectSelection {
-  if (resolved === "skip") return { skip: true, enableKeys: [], countReadyKeys: [] };
-  if (resolved === "all") return { skip: false, enableKeys: ["claude-code", "codex", "cursor"], countReadyKeys: [] };
-  return { skip: false, enableKeys: [resolved], countReadyKeys: [] };
-}
-
 /** The three real workflow keys, in the stable Page-1 render order. */
 const WORKFLOW_ORDER: ReadyToolKey[] = ["claude-code", "codex", "cursor"];
 
@@ -1474,7 +1556,7 @@ const COMMA_LIST_WORKFLOWS: Record<string, ReadyToolKey> = {
 
 /**
  * Resolve a `--connect <spec>` into a `ConnectSelection`, or a one-line error. Grammar:
- *  - legacy single token: `1|claude-code`, `2|codex`, `3|cursor`, `4|all`, `5|skip`;
+ *  - named single token, with numeric compatibility aliases retained only by the parser;
  *  - `detected` → enable every `found` workflow; already-`ready` ones are counted, not re-enabled;
  *  - `none` → skip (a `--mode` may still be set);
  *  - comma-list of workflow names → enable exactly those (ready names counted, not re-enabled).
@@ -1483,20 +1565,53 @@ const COMMA_LIST_WORKFLOWS: Record<string, ReadyToolKey> = {
 function resolveConnectSelection(spec: string, detection: ConnectDetection): { selection?: ConnectSelection; error?: string } {
   const raw = spec.trim().toLowerCase();
 
-  // Legacy single tokens keep their exact semantics.
-  const legacy = CONNECT_ALIASES[raw];
-  if (legacy) return { selection: legacyChoiceToSelection(legacy) };
-
   if (raw === "none") return { selection: { skip: true, enableKeys: [], countReadyKeys: [] } };
+
+  // Preserve the shipped numeric interface strictly as an undocumented parser compatibility path.
+  // Unlike the canonical named commands below, these aliases retain their original explicit-choice
+  // semantics so existing scripts do not acquire a new discovery precondition.
+  if (/^[1-5]$/.test(raw)) {
+    const legacy = CONNECT_ALIASES[raw];
+    if (legacy === "skip") {
+      return { selection: { skip: true, enableKeys: [], countReadyKeys: [] } };
+    }
+    return {
+      selection: {
+        skip: false,
+        enableKeys: legacy === "all" ? [...WORKFLOW_ORDER] : legacy ? [legacy] : [],
+        countReadyKeys: []
+      }
+    };
+  }
 
   const discovery = deriveDiscovery(detection);
   const stateOf = (key: ReadyToolKey): WorkflowDiscovery["state"] | undefined =>
     discovery.find((d) => d.key === key)?.state;
 
-  if (raw === "detected") {
+  // `all` means every tool actually detected on this machine. Numeric `4` remains a parser-only
+  // compatibility alias for the same behavior; it is never rendered in help or onboarding copy.
+  if (raw === "all" || raw === "detected") {
     const enableKeys = discovery.filter((d) => d.state === "found").map((d) => d.key) as ReadyToolKey[];
     const countReadyKeys = discovery.filter((d) => d.state === "ready").map((d) => d.key) as ReadyToolKey[];
     return { selection: { skip: false, enableKeys, countReadyKeys } };
+  }
+
+  // Single named choices and their parser-only numeric compatibility aliases require a detected
+  // workflow. Validation happens before every write, so an absent target fails cleanly.
+  const single = CONNECT_ALIASES[raw];
+  if (single) {
+    if (single === "skip") {
+      return { selection: { skip: true, enableKeys: [], countReadyKeys: [] } };
+    }
+    if (single !== "all" && stateOf(single) === "not-found") {
+      return {
+        error: `${single} was not detected on this machine; nothing was changed. Install or expose the tool, then run compaction init --connect ${single}.`
+      };
+    }
+    if (single !== "all" && stateOf(single) === "ready") {
+      return { selection: { skip: false, enableKeys: [], countReadyKeys: [single] } };
+    }
+    return { selection: { skip: false, enableKeys: single === "all" ? [] : [single], countReadyKeys: [] } };
   }
 
   // Comma-list of explicit workflow names.
@@ -1504,20 +1619,23 @@ function resolveConnectSelection(spec: string, detection: ConnectDetection): { s
     .split(",")
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
-  const validList = "claude-code | codex | cursor (or detected | none; or 1|claude-code, 2|codex, 3|cursor, 4|all, 5|skip)";
+  const validList = "claude-code | codex | cursor | all";
   if (parts.length === 0) {
     return { error: `empty --connect '${spec}'. Valid: ${validList}` };
   }
   const enableKeys: ReadyToolKey[] = [];
   const countReadyKeys: ReadyToolKey[] = [];
   const unknown: string[] = [];
+  const absent: ReadyToolKey[] = [];
   for (const part of parts) {
     const key = COMMA_LIST_WORKFLOWS[part];
     if (!key) {
       unknown.push(part);
       continue;
     }
-    if (stateOf(key) === "ready") {
+    if (stateOf(key) === "not-found") {
+      if (!absent.includes(key)) absent.push(key);
+    } else if (stateOf(key) === "ready") {
       if (!countReadyKeys.includes(key)) countReadyKeys.push(key);
     } else if (!enableKeys.includes(key)) {
       enableKeys.push(key);
@@ -1525,6 +1643,11 @@ function resolveConnectSelection(spec: string, detection: ConnectDetection): { s
   }
   if (unknown.length > 0) {
     return { error: `unknown --connect workflow name(s): ${unknown.join(", ")}. Valid: ${validList}` };
+  }
+  if (absent.length > 0) {
+    return {
+      error: `${absent.join(", ")} ${absent.length === 1 ? "was" : "were"} not detected on this machine; nothing was changed.`
+    };
   }
   return { selection: { skip: false, enableKeys, countReadyKeys } };
 }
@@ -1563,12 +1686,29 @@ async function confirmedShapingHooks(keys: readonly ReadyToolKey[]): Promise<Rea
         continue;
       }
       if (key !== "codex" && key !== "cursor") continue;
-      if (await areSubscriptionHooksInstalled(key)) out.push(key);
+      if (!(await areSubscriptionHooksInstalled(key))) continue;
+      if (key === "codex") {
+        const trust = await codexShapingHookTrust({ env: process.env, cwd: process.cwd() });
+        if (trust.state === "active") out.push(key);
+        continue;
+      }
+      out.push(key);
     } catch {
       /* fail-open: an unreadable config is reported as "not installed", never as installed */
     }
   }
   return out;
+}
+
+async function codexReadyShapingState(): Promise<NonNullable<ReadyRoutingInputs["codexShapingState"]>> {
+  if (!(await areSubscriptionHooksInstalled("codex"))) return "not-installed";
+  try {
+    return (await codexShapingHookTrust({ env: process.env, cwd: process.cwd() })).state === "active"
+      ? "active"
+      : "configured";
+  } catch {
+    return "configured";
+  }
 }
 
 /**
@@ -1583,10 +1723,8 @@ async function confirmedShapingHooks(keys: readonly ReadyToolKey[]): Promise<Rea
  */
 async function isClaudeShapingActive(): Promise<boolean> {
   if (!isShapingHooksActivated()) return false;
-  return (
-    (await isShapingHookInstalled(path.join(process.cwd(), ".claude", "settings.json"))) ||
-    (await isShapingHookInstalled(path.join(homedir(), ".claude", "settings.json")))
-  );
+  const checks = await Promise.all(claudeSettingsReadPaths().map((file) => isShapingHookInstalled(file)));
+  return checks.some(Boolean);
 }
 
 async function enableWorkflowSelection(
@@ -1609,16 +1747,21 @@ async function enableWorkflowSelection(
   // The claude-code transparent-routing shim block is rendered LAST (after the connect/mode writes
   // below land) so its apply-routing posture line reflects the state the next `claude` run will
   // read - resolved from the SAME resolver the runtime uses, never a stale blanket claim.
-  let claudeRouting: { shim: InstallShimResult; optedOut: boolean; rc?: WriteShellConfigResult } | undefined;
+  let claudeRouting:
+    | { shim: InstallShimResult; optedOut: boolean; rc?: WriteShellConfigResult; writeFailed?: boolean; unsupportedShell?: string }
+    | undefined;
   let claudeRoutingDryRun = false;
   for (const key of WORKFLOW_ORDER) {
     if (!enableKeys.includes(key)) continue;
     if (key === "claude-code") {
-      const settingsPath = options.user
-        ? path.join(homedir(), ".claude", "settings.json")
-        : path.join(process.cwd(), ".claude", "settings.json");
+      // INSTALL-ONCE: user/global by default so the connect survives new repos, worktrees and shells.
+      const settingsPath = claudeSettingsPathForScope(options.project ? "project" : "user");
       const result = await connectClaudeCodeHook({ settingsPath, ...(options.dryRun ? { dryRun: true } : {}) });
-      actionLines.push(...claudeInstallBlock(result, Boolean(options.user)));
+      // Report the scope ACTUALLY used. This used to pass `options.user`, which is undefined on a
+      // plain `init --connect claude-code` — so the flagship success line said "this project" while
+      // the install had correctly gone to ~/.claude/settings.json. It misreported the exact property
+      // this release fixes.
+      actionLines.push(...claudeInstallBlock(result, !options.project));
       // Per-turn VISIBLE surface: also configure the status line (the Stop hook records receipts, but its
       // stdout is invisible in Claude Code). Additive + single-slot-safe: a user's own status line is
       // never clobbered. A status-line failure never un-connects the hook (it is display-only). Honors
@@ -1642,6 +1785,28 @@ async function enableWorkflowSelection(
           /* fail-open: a shaping-hook install failure never breaks or un-connects the rest of the connect */
         }
       }
+      // MIGRATION (install-once): a user connected the OLD project-local way would now carry Compaction
+      // entries in BOTH scopes. Claude Code merges `hooks` ADDITIVELY — a project hook does not suppress
+      // a user hook — so Stop and UserPromptSubmit would fire TWICE per turn: double capture, double
+      // shaping. `statusLine` is a single slot where the highest-precedence definition wins, so the
+      // duplication would render as ONE line while two hooks ran behind it. Strip our own entries from
+      // THIS directory's project settings (never a scan of other projects, never a foreign entry).
+      if (!options.project) {
+        try {
+          const migrated = await migrateProjectScopeClaudeSettings({
+            ...(options.dryRun ? { dryRun: true } : {})
+          });
+          if (migrated.cleaned.length > 0) {
+            actionLines.push(
+              options.dryRun
+                ? `  Would migrate ${migrated.removedHooks} project-local Compaction hook entr${migrated.removedHooks === 1 ? "y" : "ies"} into the global install (preview - nothing written).`
+                : `  Migrated ${migrated.removedHooks} project-local Compaction hook entr${migrated.removedHooks === 1 ? "y" : "ies"} into the global install (one integration, no double shaping).`
+            );
+          }
+        } catch {
+          /* fail-open: a migration failure never un-connects the global install */
+        }
+      }
       if (result.status === "installed" || result.status === "already-present") connected.push("claude-code");
       if (result.status === "verify-failed" || result.status === "error") {
         failed.push("claude-code");
@@ -1659,17 +1824,25 @@ async function enableWorkflowSelection(
       } else {
         const shim = installToolShim("claude-code");
         const optedOut = options.writeShellConfig === false;
+        const unsupportedShell = shellConfigWriteIsSupported() ? undefined : (process.env.SHELL ?? "").trim();
         let rc: WriteShellConfigResult | undefined;
-        if (!optedOut && shim.status === "installed-not-on-path") {
+        let writeFailed = false;
+        if (!optedOut && unsupportedShell === undefined && shimInstallVerified(shim)) {
           try {
             rc = writeShellConfigPathLine();
           } catch {
-            rc = undefined; // fail-open: the manual one-line instruction is printed instead
+            writeFailed = true;
           }
         }
         // Capture the shim inputs; the routing block (with its resolver-driven posture line) is
         // built AFTER the connect/mode writes below, so the posture is not stale.
-        claudeRouting = { shim, optedOut, ...(rc ? { rc } : {}) };
+        claudeRouting = {
+          shim,
+          optedOut,
+          ...(rc ? { rc } : {}),
+          ...(writeFailed ? { writeFailed: true } : {}),
+          ...(unsupportedShell !== undefined ? { unsupportedShell } : {})
+        };
         if (shim.status === "verify-failed") process.exitCode = 1;
       }
     } else {
@@ -1699,18 +1872,18 @@ async function enableWorkflowSelection(
       // Detect and degrade honestly instead: no write, no activation claim, the manual PATH instruction.
       // NOT fish support - Compaction still edits zsh/bash only.
       const unsupportedShell = shellConfigWriteIsSupported() ? undefined : (process.env.SHELL ?? "").trim();
-      let wroteShellConfig: { rcPath: string; backupPath?: string; status: string } | undefined;
-      if (install && !shimOptedOut && unsupportedShell === undefined && install.status === "installed-not-on-path") {
+      let wroteShellConfig: WriteShellConfigResult | undefined;
+      let shellConfigWriteFailed = false;
+      if (install && !shimOptedOut && unsupportedShell === undefined && shimInstallVerified(install)) {
         try {
-          const rc = writeShellConfigPathLine();
-          wroteShellConfig = { rcPath: rc.rcPath, status: rc.status, ...(rc.backupPath ? { backupPath: rc.backupPath } : {}) };
+          wroteShellConfig = writeShellConfigPathLine();
         } catch {
-          wroteShellConfig = undefined; // fail-open: the manual one-line instruction is printed instead
+          shellConfigWriteFailed = true;
         }
       }
       actionLines.push(
         ...(install
-          ? shimConnectBlock(install, wroteShellConfig, shimOptedOut, unsupportedShell)
+          ? shimConnectBlock(install, wroteShellConfig, shimOptedOut, unsupportedShell, shellConfigWriteFailed)
           : shimDryRunBlock(shimTool)),
         ""
       );
@@ -1802,8 +1975,17 @@ async function enableWorkflowSelection(
       }
     }
     const posture = await resolveClaudeRoutingPosture();
-    const { shim, optedOut, rc } = claudeRouting;
-    actionLines.push("", ...claudeRoutingShimBlock(shim, posture, { optedOut, ...(rc ? { rc } : {}) }), "");
+    const { shim, optedOut, rc, writeFailed, unsupportedShell } = claudeRouting;
+    actionLines.push(
+      "",
+      ...claudeRoutingShimBlock(shim, posture, {
+        optedOut,
+        ...(rc ? { rc } : {}),
+        ...(writeFailed ? { writeFailed: true } : {}),
+        ...(unsupportedShell !== undefined ? { unsupportedShell } : {})
+      }),
+      ""
+    );
   }
   return { connected, failed, actionLines, codexHookNewlyInstalled };
 }
@@ -1821,7 +2003,14 @@ async function tuiEnable(
   // Checked AFTER the install, from the tool's own config, so the ready screen describes the shaping
   // effect that is actually wired rather than the one the flow intended to wire.
   const shapingHooksInstalled = await confirmedShapingHooks(connected);
-  return { connected, failed, shapingHooksInstalled, codexHookNewlyInstalled };
+  const codexShapingState = connected.includes("codex") ? await codexReadyShapingState() : undefined;
+  return {
+    connected,
+    failed,
+    shapingHooksInstalled,
+    codexHookNewlyInstalled,
+    ...(codexShapingState ? { codexShapingState } : {})
+  };
 }
 
 async function runConnectSelection(
@@ -1846,6 +2035,31 @@ async function runConnectSelection(
     // so its apply-routing posture line is resolved against the state the next `claude` run will read.
     countedReadyClaudeStatus =
       selection.countReadyKeys.includes("claude-code") && !selection.enableKeys.includes("claude-code");
+
+    // A counted-ready Codex shim is deliberately not reinstalled, but the hook axis still needs an
+    // honest read-only status. Hook bytes on disk are not enough: Codex may still be withholding its
+    // native per-hash trust, so never let the Ready summary imply the instruction is active unless
+    // Codex itself reports that state.
+    if (selection.countReadyKeys.includes("codex") && !selection.enableKeys.includes("codex")) {
+      if (!(await areSubscriptionHooksInstalled("codex"))) {
+        actionLines.push(
+          chalk.yellow("    Output shaping: not installed for codex (the hook config is not verified on disk)."),
+          chalk.dim("    The active PATH shim is unaffected. Install the hook:  compaction hooks install --tool codex"),
+          ""
+        );
+      } else {
+        const trust = await codexShapingHookTrust({ env: process.env, cwd: process.cwd() });
+        if (trust.state === "active") {
+          actionLines.push(chalk.green("    Output shaping: on for codex - Codex reports the configured hook active."), "");
+        } else {
+          actionLines.push(
+            chalk.dim("    Output shaping is configured for codex."),
+            chalk.dim("    Whether Codex is running it depends on its one-time hook approval:  compaction status"),
+            ""
+          );
+        }
+      }
+    }
   }
   // Ready summary set = verified-connected THIS run ∪ already-ready (counted, not re-enabled). De-duped;
   // `buildReadySummaryLines` renders in the stable order, so set order here does not matter.
@@ -1952,11 +2166,11 @@ function deferredAuthorizationLines(workflow: CarryableConsentWorkflow): string[
   return [
     "",
     chalk.yellow(`  Full optimization authorization for ${workflow}: confirmed, not stored yet.`),
-    chalk.dim(`    The ${meta.title} capture shim is installed, but this shell's PATH does not resolve it yet, and`),
+    chalk.dim(`    The ${meta.title} shim is installed, but this shell's PATH does not resolve it yet, and`),
     chalk.dim("    an authorization is only stored against a verified-active shim."),
     chalk.dim("    Compaction stores it by itself the first time it runs with that shim active - opening a new"),
     chalk.dim("    shell is enough. There is no command to run, and nothing is applied until it is stored."),
-    chalk.dim(`    Changed your mind?  ${`compaction init --disconnect ${meta.connectNum}`} (or set the mode back to Output only) drops it unstored.`)
+    chalk.dim(`    Changed your mind?  ${`compaction init --disconnect ${meta.connectName}`} (or set the mode back to Output only) drops it unstored.`)
   ];
 }
 
@@ -2045,7 +2259,7 @@ async function runAuthorizeAutoApply(rawWorkflow: string): Promise<void> {
   const workflow = rawWorkflow.trim().toLowerCase();
   if (workflow === "cursor") {
     console.error(
-      "Auto-apply cannot be authorized for Cursor: it has no Gateway routing path (vendor gap), so no request ever reaches the deterministic apply policy. Nothing was written."
+      "Auto-apply cannot be authorized for Cursor: Compaction has no verified Cursor Gateway route, so no request ever reaches the deterministic apply policy. Nothing was written."
     );
     process.exitCode = 1;
     return;
@@ -2134,13 +2348,13 @@ export function registerInitCommand(program: Command): void {
       "First-run onboarding: the connect-once install screen (detect supported AI tools + enable " +
         "Compaction once) in a real terminal (TUI), or the same connect-once model as a static screen " +
         "elsewhere. The default screen writes NOTHING (read-only local detection, no network, no " +
-        "credentials). `--connect 1` installs the consented Claude Code Stop hook (merge-not-replace) and " +
-        "verifies it; `--connect 2`/`3` install + verify a reversible Codex/Cursor PATH shim - connect-once always-on."
+        "credentials). All detected tools are preselected in the TUI; one explicit confirmation enables " +
+        "the selected set. Use the named --connect commands for non-interactive setup."
     )
     .option("--path <path>", "Focus one input path: claude-code | openai-agents | codex | import")
     .option(
       "--connect <choice>",
-      "Connect-once selection. Back-compat: 1|claude-code, 2|codex, 3|cursor, 4|all, 5|skip. Extended: `detected` (enable every found-but-not-ready workflow; already-ready ones are counted, not re-enabled), a comma-list e.g. `codex,claude-code,cursor` (enable exactly those), or `none` (enable nothing). `1`/`all`/named workflows install + VERIFY the consented Claude Code Stop hook plus a reversible `claude` transparent-routing PATH shim (RECORD-only, byte-safe, fail-open), and/or a reversible Codex/Cursor capture PATH shim plus that tool's own shaping hooks. EVERY workflow also sets up PATH by default (shell-rc line: announced, backed up, idempotent; opt out with --no-write-shell-config); never claims active without verifying."
+      "Connect once by name: claude-code | codex | cursor | all. `all` includes detected tools only. Named workflows install and verify their supported hook/shim bundle. Every workflow sets up PATH by default (announced, backed up, idempotent; opt out with --no-write-shell-config); readiness is never claimed without verification."
     )
     .option(
       "--mode <mode>",
@@ -2148,7 +2362,7 @@ export function registerInitCommand(program: Command): void {
     )
     .option(
       "--disconnect <choice>",
-      "Reversibly remove a PATH shim. 1|claude-code: remove the claude transparent-routing shim, remove the shell-rc PATH line connect wrote (when no other Compaction shim still needs it), and stop this project's routing gateway (the consented Stop hook remains - `compaction hooks uninstall` removes it). 2|codex, 3|cursor: remove the capture shim (restores any shell-rc backup, and disables any stored auto-apply authorization for that tool). The real binary is never touched."
+      "Reversibly disconnect by name: claude-code | codex | cursor. Claude Code and Codex remove their routing shim (and shared PATH line when unused); Cursor removes its capture shim; Codex/Cursor also remove native Compaction hooks. Stored auto-apply authorization for that tool is disabled. The real binary is never touched."
     )
     .option(
       "--authorize-auto-apply <workflow>",
@@ -2162,7 +2376,8 @@ export function registerInitCommand(program: Command): void {
       "--no-write-shell-config",
       "Do NOT touch your shell config - print the one PATH line to add yourself instead. Without this flag, connecting ANY workflow (Claude Code, Codex, Cursor) appends the shim PATH line to your shell rc (announced, backed up to .compaction.bak, idempotent, removed again by the matching --disconnect)."
     )
-    .option("--user", "With --connect: install the Claude Code hook into ~/.claude/settings.json (all your projects) instead of the project's .claude/settings.json.")
+    .option("--user", "Default. Install the Claude Code integration into ~/.claude/settings.json so it stays connected in every project.")
+    .option("--project", "Advanced: scope the Claude Code integration to this project's .claude/settings.json instead of your user settings.")
     .option("--dry-run", "With --connect: show what the Claude Code hook install would write, but write nothing.")
     .option(
       "--projects-dir <dir>",
@@ -2225,7 +2440,7 @@ export function registerInitCommand(program: Command): void {
         const detection = await computeConnectDetection(det);
         const readyRoutingInputs = await computeReadyRoutingInputs();
 
-        // --disconnect: reversibly remove a shim (1|claude-code routing shim, 2|codex, 3|cursor).
+        // --disconnect: reversibly remove a named workflow shim.
         if (options.disconnect !== undefined) {
           const choice = CONNECT_ALIASES[options.disconnect.trim().toLowerCase()];
           if (choice === "claude-code") {
@@ -2239,22 +2454,27 @@ export function registerInitCommand(program: Command): void {
             const gw = stopTransparentRoutingGateway(process.cwd(), "anthropic");
             // Remove ONLY the compaction status line we added (a user's own is left untouched). Same
             // settings scope the connect used (--user → ~/.claude, else project .claude). Fail-open.
-            const statusSettingsPath = options.user
-              ? path.join(homedir(), ".claude", "settings.json")
-              : path.join(process.cwd(), ".claude", "settings.json");
+            // SYMMETRY: connect may have written user scope (today's default) or project scope (an
+            // older install, or --project). Disconnect must clear BOTH, or a disconnect run from one
+            // directory silently strands a still-firing integration in the other scope.
+            const disconnectPaths = claudeSettingsReadPaths();
             let statusLineRemoved = false;
-            try {
-              statusLineRemoved = (await disconnectClaudeCodeStatusLine(statusSettingsPath)).removed;
-            } catch {
-              /* fail-open: the routing disconnect still stands */
+            for (const settingsFile of disconnectPaths) {
+              try {
+                if ((await disconnectClaudeCodeStatusLine(settingsFile)).removed) statusLineRemoved = true;
+              } catch {
+                /* fail-open: the routing disconnect still stands */
+              }
             }
             // Remove ONLY Compaction's before-call SHAPING hook (the subscription apply lever connect wired);
             // the Stop hook is deliberately left (measurement, removed via `hooks uninstall`). Fail-open.
             let shapingHookRemoved = false;
-            try {
-              shapingHookRemoved = (await disconnectClaudeCodeShapingHook(statusSettingsPath)).removed;
-            } catch {
-              /* fail-open: the routing disconnect still stands */
+            for (const settingsFile of disconnectPaths) {
+              try {
+                if ((await disconnectClaudeCodeShapingHook(settingsFile)).removed) shapingHookRemoved = true;
+              } catch {
+                /* fail-open: the routing disconnect still stands */
+              }
             }
             const lines = [
               `  ${chalk.bold("▸ Claude Code")} ${chalk.green("- routing disconnected")}`,
@@ -2263,13 +2483,15 @@ export function registerInitCommand(program: Command): void {
                 ? chalk.green(`    Removed the claude routing shim (${uninstalled.shimPath}). The real claude binary was never touched.`)
                 : chalk.dim(`    No claude routing shim was installed (${uninstalled.shimPath}); nothing to remove.`),
               gw.stopped
-                ? chalk.green(`    Stopped this project's routing gateway (pid ${gw.pid}).`)
+                ? chalk.green(
+                    `    Removed the routing slot and stopped the routing gateway (pid ${gw.pid}). Nothing revives it.`
+                  )
                 : chalk.dim(`    Routing gateway: ${gw.reason ?? "not running"}.`),
               statusLineRemoved
-                ? chalk.green(`    Removed the compaction status line from ${statusSettingsPath} (any status line of your own was left untouched).`)
+                ? chalk.green("    Removed the compaction status line from your Claude Code settings (any status line of your own was left untouched).")
                 : chalk.dim("    No compaction status line to remove (a status line of your own is never touched)."),
               shapingHookRemoved
-                ? chalk.green(`    Removed the before-call output-shaping hook from ${statusSettingsPath} (your prompts are no longer shaped; other hooks untouched).`)
+                ? chalk.green("    Removed the before-call output-shaping hook from your Claude Code settings (your prompts are no longer shaped; other hooks untouched).")
                 : chalk.dim("    No before-call output-shaping hook to remove (only Compaction's own is ever touched)."),
               chalk.dim("    The consented Stop hook (post-session measurement) is unchanged - remove it with:  compaction hooks uninstall"),
               chalk.dim("    Open a new shell so the PATH change takes effect.")
@@ -2297,7 +2519,7 @@ export function registerInitCommand(program: Command): void {
           }
           const shimTool: CaptureShimTool | undefined = choice === "codex" ? "codex" : choice === "cursor" ? "cursor" : undefined;
           if (!shimTool) {
-            console.error(`unknown --disconnect '${options.disconnect}'. Valid: 1|claude-code, 2|codex, 3|cursor`);
+            console.error(`unknown --disconnect '${options.disconnect}'. Valid: claude-code | codex | cursor`);
             process.exitCode = 1;
             return;
           }
@@ -2437,6 +2659,17 @@ export function registerInitCommand(program: Command): void {
           // Did THIS run write the Codex hook? The alt-screen ready page is wiped on exit and cannot
           // carry an action item, so the one-time trust continuation is re-printed to scrollback below.
           let codexTrustPending = false;
+          // Silent renew for a returning signed-in device BEFORE the plan screen renders, so
+          // "Community active" reflects a refreshed lease rather than expired authorization while
+          // onboarding still correctly reports that the user is signed in.
+          if (readStoredCredentials(process.env) !== undefined) {
+            try {
+              await ensureCommunityRuntime(process.env, () => {}, { leaseOnly: true });
+            } catch {
+              // Best-effort: the plan screen still distinguishes identity from authorization.
+            }
+          }
+          const { hasValidFullApplyLease } = await import("../../core/entitlement/lease-store.js");
           const result = await runOnboardingTui({
             version,
             detection,
@@ -2454,6 +2687,10 @@ export function registerInitCommand(program: Command): void {
               return enabled;
             },
             onPersistMode: async (modeKey, workflows) => {
+              // `workflows` is the TUI's final verified set: newly connected plus selected tools that
+              // were already ready. Community activation must evaluate that whole set rather than
+              // treating a read-only re-run as if no workflow were connected.
+              enabledWorkflows = workflows;
               const mode = fromModelOptimizationModeKey(modeKey);
               writeOptimizationMode(mode);
               wroteToDisk = true;
@@ -2487,9 +2724,10 @@ export function registerInitCommand(program: Command): void {
               openBrowser(url, process.env);
               return url;
             },
-            // A plain boolean. The stepper needs to know "already signed in?" to avoid dragging a
-            // returning user through a second browser round trip; it must never see credentials.
+            // Identity vs authorization: credentials prove signed-in; a verified lease proves Community.
+            // The stepper uses signedIn only to skip a second browser round trip; it must never see credentials.
             signedIn: readStoredCredentials(process.env) !== undefined,
+            communityAuthorized: hasValidFullApplyLease(process.env),
             // THE FIRST-WRITE DISCLOSURE. The review screen is the consent gate, so it must name every
             // file the enable touches - including the tool's own hooks config, which is what actually
             // attaches an instruction to what the model sees. Resolved HERE from the real installer
@@ -2567,7 +2805,7 @@ export function registerInitCommand(program: Command): void {
             console.log(
               chalk.dim(
                 "\nNo workflow was enabled, so nothing is being measured or shaped yet. Your saved preferences remain in " +
-                  `${preferencesPath()}; \`compaction init --disconnect 1|2|3\` reverses anything a workflow wrote. ` +
+                  `${preferencesPath()}; use \`compaction init --disconnect <tool-name>\` to reverse a workflow connection. ` +
                   "Run `compaction` anytime.\n"
               )
             );

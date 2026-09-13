@@ -85,6 +85,21 @@ describe("Codex CLI per-process routing config", () => {
     expect(command.join(" ")).not.toContain("chatgpt_base_url");
   });
 
+  it("creates the vendor-supported ephemeral ChatGPT-auth custom provider without an API key", () => {
+    const subscriptionBase = `${base}/__compaction/codex/${"C".repeat(43)}/backend-api/codex`;
+    const command = routedCommand(["codex", "exec", "hello"], subscriptionBase, "codex", true);
+    expect(command).toEqual([
+      "codex",
+      "-c", 'model_provider="compaction_subscription"',
+      "-c", 'model_providers.compaction_subscription.name="Compaction ChatGPT subscription"',
+      "-c", `model_providers.compaction_subscription.base_url=${JSON.stringify(subscriptionBase)}`,
+      "-c", 'model_providers.compaction_subscription.wire_api="responses"',
+      "-c", "model_providers.compaction_subscription.requires_openai_auth=true",
+      "exec", "hello"
+    ]);
+    expect(command.join(" ")).not.toContain("OPENAI_API_KEY");
+  });
+
   it("does not alter generic commands or the Claude route", () => {
     expect(routedCommand(["node", "app.js"], base, "codex")).toEqual(["node", "app.js"]);
     expect(routedCommand(["claude"], base, "claude-code")).toEqual(["claude"]);
@@ -114,7 +129,7 @@ describe("defaultUpstreamFor - provider-aware upstream default selects the right
 
 describe("Cursor stays BLOCKED - no fake routing is exposed (documented vendor gap)", () => {
   it("ROUTE_COMMANDS exposes codex + claude-code only, never a cursor route", () => {
-    expect(ROUTE_COMMANDS.codex).toBe('compaction gateway run --workflow codex -- codex exec --json "<task>"');
+    expect(ROUTE_COMMANDS.codex).toBe('compaction gateway run --provider openai --workflow codex --subscription -- codex exec "<task>"');
     expect(ROUTE_COMMANDS["claude-code"]).toBe("compaction gateway run --provider anthropic --workflow claude-code -- claude");
     // No cursor key, and no exposed route command string mentions cursor: Cursor stays local-estimate/
     // activity-only (no base-url injection, no cache-proof claim).

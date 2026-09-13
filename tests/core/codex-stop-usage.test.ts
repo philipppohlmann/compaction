@@ -33,7 +33,12 @@ import {
 import type { GatewayReceipt, GatewayReceiptTailWindow } from "../../src/core/gateway/receipt.js";
 import { activityTurnLinesFromJsonl, codexStopRunWindowsFromJsonl } from "../../src/core/activity-receipt-line.js";
 import { receiptTurnLinesFromJsonl } from "../../src/cli/commands/watch.js";
+import { buildActivityRows } from "../../src/core/activity-view.js";
 import { TEST_OUTPUT_POLICY_VERSION } from "../helpers/output-calibration-fixture.js";
+import {
+  calibrationStorePath,
+  loadCalibration
+} from "../../src/core/output-shaping-calibration-store.js";
 import {
   CODEX_SETTLEMENT_PENDING_SCHEMA,
   codexSettlementPending,
@@ -207,6 +212,46 @@ describe("Codex exact lifecycle settlement", () => {
     expect(readdirSync(shapingDirectory)).toEqual([]);
   });
 
+  it("keeps run one cold, activates only after its durable settle, and calibrates run two from exact empirical evidence", async () => {
+    const f = fixture();
+    const settle = async (turnId: string, sequence: number, at: string) => {
+      const raw = hookPayload(f.cwd, f.rollout, { turn_id: turnId });
+      writeFileSync(f.rollout, `${usageRecord(sequence, SESSION, turnId, usage(427, 72))}\n`);
+      const scope = beginCodexTurn(raw, f.env, () => new Date(at));
+      expect(scope).toBeDefined();
+      await recordShapingOutcome(scope!, "shape", f.env, () => new Date(Date.parse(at) + 1_000));
+      return settleCodexStop(raw, {
+        env: f.env,
+        now: () => new Date(Date.parse(at) + 18_000),
+        readReceipts: async () => ({ receipts: [], truncated: false })
+      });
+    };
+
+    expect(existsSync(calibrationStorePath(f.env))).toBe(false);
+    const first = await settle("turn-cold", 1, "2026-09-05T09:00:00.000Z");
+    expect(first?.line).toBe("compaction · observed input 427 · output N/A→72 (N/A%, est.) · basic shaping");
+    expect(first?.event.output_estimate_state).toBe("unseeded");
+    expect(first?.event.estimated_output_tokens_saved).toBeUndefined();
+    const calibration = await loadCalibration(f.env);
+    expect(calibration.records).toHaveLength(1);
+    expect(calibration.records[0]).toMatchObject({
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      regime: "default-shapeable",
+      confirmationIds: ["a1afd6e947d584507a1b0dd0a3f1f1ef825f2481b83ca7f55c3049baf05f2aa2"]
+    });
+    expect(JSON.stringify(calibration)).not.toMatch(/prompt|response|transcript|credential|SECRET/i);
+
+    const second = await settle("turn-calibrated", 2, "2026-09-05T09:01:00.000Z");
+    expect(second?.line).toBe("compaction · observed input 427 · output 96→72 (−25%, est.) · basic shaping");
+    expect(second?.event).toMatchObject({
+      output_after: 72,
+      estimated_output_tokens_saved: 24,
+      output_estimate_basis: "measured",
+      output_estimate_state: "calibrated"
+    });
+  });
+
   it("freezes one retry event before append and never recomputes it after sources change", async () => {
     const f = fixture();
     const raw = hookPayload(f.cwd, f.rollout);
@@ -269,7 +314,8 @@ describe("Codex exact lifecycle settlement", () => {
     const f = fixture();
     const raw = hookPayload(f.cwd, f.rollout);
     writeFileSync(f.rollout, `${usageRecord(1, SESSION, TURN, usage(80, 8))}\n`);
-    beginCodexTurn(raw, f.env, () => new Date("2026-09-04T07:39:00.000Z"));
+    const scope = beginCodexTurn(raw, f.env, () => new Date("2026-09-04T07:39:00.000Z"));
+    await recordShapingOutcome(scope!, "shape", f.env, () => new Date("2026-09-04T07:39:01.000Z"));
     const sessionCorrelation = codexSessionCorrelationId(SESSION, f.env)!;
     const turnCorrelation = codexTurnCorrelationId(SESSION, TURN, f.env)!;
     expect(await settleCodexStop(raw, {
@@ -280,7 +326,8 @@ describe("Codex exact lifecycle settlement", () => {
     })).toBeUndefined();
     expect(codexSettlementPending(sessionCorrelation, turnCorrelation, f.env)?.event.output_after).toBe(8);
     expect(existsSync(join(f.cwd, ".compaction", "activity", "activity.jsonl"))).toBe(false);
-    expect(existsSync(join(f.env.COMPACTION_CONFIG_DIR!, SHAPING_TURN_STATE_DIR))).toBe(false);
+    expect(existsSync(calibrationStorePath(f.env))).toBe(false);
+    expect(readdirSync(join(f.env.COMPACTION_CONFIG_DIR!, SHAPING_TURN_STATE_DIR))).toEqual([]);
   });
 
   it("a failed pending clear after durable append is retried by event-first replay", async () => {
@@ -444,6 +491,31 @@ describe("Codex exact lifecycle settlement", () => {
     expect(settled?.line).not.toContain("full apply");
   });
 
+  it("fails closed on malformed component provenance in the real Codex Stop settlement", async () => {
+    const f = fixture();
+    const raw = hookPayload(f.cwd, f.rollout);
+    writeFileSync(f.rollout, `${usageRecord(1, SESSION, TURN, usage(100, 10))}\n`);
+    beginCodexTurn(raw, f.env, () => new Date("2026-09-04T07:39:00.000Z"));
+    const correlation = codexSessionCorrelationId(SESSION, f.env)!;
+    const malformed = receipt({
+      session_correlation_id: correlation,
+      mode: "apply",
+      request_mutated: true,
+      estimated_input_tokens_before: 200,
+      estimated_input_tokens_after: 100,
+      applied_components: { 0: "lcm-compaction" } as unknown as GatewayReceipt["applied_components"],
+      tokens: { prompt_input: 100, output: 10 }
+    });
+    const settled = await settleCodexStop(raw, {
+      env: f.env,
+      now: () => new Date("2026-09-04T07:39:18.456Z"),
+      readReceipts: async () => ({ receipts: [malformed], truncated: false })
+    });
+    expect(settled?.line).toContain("input 100");
+    expect(settled?.line).not.toContain("→");
+    expect(settled?.line).not.toContain("full apply");
+  });
+
   it("labels full only from exact stored-policy gateway provenance and retains the input source", async () => {
     const f = fixture();
     const raw = hookPayload(f.cwd, f.rollout);
@@ -455,9 +527,10 @@ describe("Codex exact lifecycle settlement", () => {
       mode: "apply",
       request_mutated: true,
       approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
       estimated_input_tokens_before: 200,
       estimated_input_tokens_after: 100,
-      applied_components: ["deterministic-compaction"],
+      applied_components: ["lcm-compaction"],
       tokens: { prompt_input: 100, output: 10 }
     });
     const settled = await settleCodexStop(raw, {
@@ -467,7 +540,101 @@ describe("Codex exact lifecycle settlement", () => {
     });
     expect(settled?.event.apply_posture).toBe("full");
     expect(settled?.event.token_source?.input.source).toBe("local-estimate");
-    expect(settled?.line).toBe("compaction · input 200→100 (−50%) · output 10 · full apply");
+    expect(settled?.line).toBe("compaction · input 200→100 (−50%) · output 10 · +~0.28m · full apply");
+  });
+
+  it("keeps exact Full input authoritative when subscription receipts omit output usage", async () => {
+    const f = fixture();
+    const raw = hookPayload(f.cwd, f.rollout);
+    writeFileSync(f.rollout, "");
+    beginCodexTurn(raw, f.env, () => new Date("2026-09-04T07:39:00.000Z"));
+    const correlation = codexSessionCorrelationId(SESSION, f.env)!;
+    const stored = receipt({
+      session_correlation_id: correlation,
+      mode: "apply",
+      request_mutated: true,
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      estimated_input_tokens_before: 200,
+      estimated_input_tokens_after: 100,
+      applied_components: ["lcm-compaction"],
+      tokens: { prompt_input: 100 }
+    });
+    const settled = await settleCodexStop(raw, {
+      env: f.env,
+      now: () => new Date("2026-09-04T07:39:18.456Z"),
+      readReceipts: async () => ({ receipts: [stored], truncated: false }),
+      readTurnUsage: async () => undefined
+    });
+    expect(settled?.event.measurement_source).toBe("gateway-run");
+    expect(settled?.event.apply_posture).toBe("full");
+    expect(settled?.event.input_before).toBe(200);
+    expect(settled?.event.input_after).toBe(100);
+    expect(settled?.event.output_after).toBeUndefined();
+    expect(settled?.event.token_source?.output).toEqual({
+      source: "unavailable",
+      unavailable_reason: "no exact Gateway or attributable Codex rollout output usage"
+    });
+    expect(buildActivityRows([settled!.event])[0]).toMatchObject({
+      output_tokens: null,
+      output_source: "unavailable",
+      output_unavailable_reason: "no exact Gateway or attributable Codex rollout output usage"
+    });
+    expect(settled?.line).toBe("compaction · input 200→100 (−50%) · full apply");
+  });
+
+  it("labels rollout output separately when exact Full input receipts omit output usage", async () => {
+    const f = fixture();
+    const raw = hookPayload(f.cwd, f.rollout);
+    writeFileSync(f.rollout, "");
+    beginCodexTurn(raw, f.env, () => new Date("2026-09-04T07:39:00.000Z"));
+    const correlation = codexSessionCorrelationId(SESSION, f.env)!;
+    const stored = receipt({
+      session_correlation_id: correlation,
+      mode: "apply",
+      request_mutated: true,
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      estimated_input_tokens_before: 200,
+      estimated_input_tokens_after: 100,
+      applied_components: ["lcm-compaction"],
+      tokens: { prompt_input: 100 }
+    });
+    const settled = await settleCodexStop(raw, {
+      env: f.env,
+      now: () => new Date("2026-09-04T07:39:18.456Z"),
+      readReceipts: async () => ({ receipts: [stored], truncated: false }),
+      readTurnUsage: async () => usage(999, 40)
+    });
+    expect(settled?.event.measurement_source).toBe("gateway-run");
+    expect(settled?.event.evidence_level).toBe(
+      "exact correlated gateway input; provider-reported cumulative Codex turn output"
+    );
+    expect(settled?.event.token_source?.input.source).toBe("local-estimate");
+    expect(settled?.event.token_source?.output.source).toBe("provider-reported");
+    expect(settled?.event.output_after).toBe(40);
+    expect(settled?.event.apply_posture).toBe("full");
+  });
+
+  it("uses rollout for both axes when exact receipts have output but no authoritative input", async () => {
+    const f = fixture();
+    const raw = hookPayload(f.cwd, f.rollout);
+    writeFileSync(f.rollout, "");
+    beginCodexTurn(raw, f.env, () => new Date("2026-09-04T07:39:00.000Z"));
+    const correlation = codexSessionCorrelationId(SESSION, f.env)!;
+    const settled = await settleCodexStop(raw, {
+      env: f.env,
+      now: () => new Date("2026-09-04T07:39:18.456Z"),
+      readReceipts: async () => ({
+        receipts: [receipt({ session_correlation_id: correlation, tokens: { output: 10 } })],
+        truncated: false
+      }),
+      readTurnUsage: async () => usage(999, 40)
+    });
+    expect(settled?.event.measurement_source).toBe("codex-rollout");
+    expect(settled?.event.evidence_level).toBe("provider-reported cumulative Codex turn usage");
+    expect(settled?.event.input_before).toBe(999);
+    expect(settled?.event.output_after).toBe(40);
   });
 
   it("does not let an unrelated old request make a truncated exact-run gateway tail look complete", async () => {
@@ -501,6 +668,62 @@ describe("Codex exact lifecycle settlement", () => {
     });
     expect(settled?.event.measurement_source).toBe("codex-rollout");
     expect(settled?.line).toBe("compaction · input 1,000 · output 100");
+  });
+
+  it("accepts a truncated tail that contains append-order coverage before the run", async () => {
+    const f = fixture();
+    const raw = hookPayload(f.cwd, f.rollout);
+    writeFileSync(f.rollout, `${usageRecord(1, SESSION, TURN, usage(1_000, 100))}\n`);
+    beginCodexTurn(raw, f.env, () => new Date("2026-09-04T07:39:00.000Z"));
+    const correlation = codexSessionCorrelationId(SESSION, f.env)!;
+    const settled = await settleCodexStop(raw, {
+      env: f.env,
+      now: () => new Date("2026-09-04T07:39:18.456Z"),
+      readReceipts: async () => ({
+        receipts: [
+          receipt({
+            receipt_id: "pre-run-coverage",
+            session_correlation_id: "0".repeat(32),
+            request_started_at: "2026-09-04T07:38:58.000Z",
+            captured_at: "2026-09-04T07:38:59.000Z"
+          }),
+          receipt({
+            receipt_id: "exact-full",
+            session_correlation_id: correlation,
+            request_started_at: "2026-09-04T07:39:10.000Z",
+            captured_at: "2026-09-04T07:39:13.000Z",
+            mode: "apply",
+            request_mutated: true,
+            estimated_input_tokens_before: 200,
+            estimated_input_tokens_after: 100,
+            applied_components: ["lcm-compaction"],
+            approval_status: "auto-applied-by-policy",
+            authorization_id: "pref-1234567890abcdef12345678"
+          })
+        ],
+        truncated: true
+      })
+    });
+    expect(settled?.line).toContain("input 200→100");
+    expect(settled?.line).toContain("full apply");
+  });
+
+  it("asks the bounded receipt reader to cover the exact run start", async () => {
+    const f = fixture();
+    const raw = hookPayload(f.cwd, f.rollout);
+    writeFileSync(f.rollout, `${usageRecord(1, SESSION, TURN, usage(1_000, 100))}\n`);
+    const startedAt = "2026-09-04T07:39:00.000Z";
+    beginCodexTurn(raw, f.env, () => new Date(startedAt));
+    let requestedCoverFrom: string | undefined;
+    await settleCodexStop(raw, {
+      env: f.env,
+      now: () => new Date("2026-09-04T07:39:18.456Z"),
+      readReceipts: async (_cwd, coverFrom) => {
+        requestedCoverFrom = coverFrom;
+        return { receipts: [], truncated: false };
+      }
+    });
+    expect(requestedCoverFrom).toBe(startedAt);
   });
 
   it("fails closed without an open exact run or independently supported counts", async () => {

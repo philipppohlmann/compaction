@@ -82,7 +82,7 @@ function printStopResult(change: ShapingStateChange, env: NodeJS.ProcessEnv = pr
   }
   if (subscriptionNote) console.log(chalk.dim(subscriptionNote));
   console.log(chalk.dim(`  Persisted content-free run-state: ${change.path}`));
-  console.log(chalk.dim("  Turn it back on anytime:  compaction start   ·   Full uninstall (removes wiring):  compaction init --disconnect 1"));
+  console.log(chalk.dim("  Turn it back on anytime:  compaction start   ·   Full uninstall (removes wiring):  compaction init --disconnect claude-code"));
 }
 
 async function printStartResult(change: ShapingStateChange, env: NodeJS.ProcessEnv = process.env): Promise<void> {
@@ -130,7 +130,8 @@ export function registerStartCommand(program: Command): void {
     .description(
       "Turn Compaction back ON (persisted) after `compaction stop`: re-enables BOTH output shaping and Claude Code " +
         "apply routing from the next turn (apply routing still requires its full guard: API key + input-opt + stored " +
-        "authorization + connect). If COMPACTION_SHAPING_HOOKS is set to disable, that still overrides output shaping."
+        "authorization + connect). If COMPACTION_SHAPING_HOOKS is set to 0/false/off/no (case-insensitive), " +
+        "that still overrides output shaping."
     )
     .action(async () => {
       const change = startShaping();

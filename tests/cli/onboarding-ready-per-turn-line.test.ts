@@ -41,14 +41,20 @@ describe("onboarding Ready - per-turn receipt-line copy matches the canonical fo
     expect(READY_PER_TURN_EXAMPLE_HOOK_ONLY).not.toContain("shaping on");
   });
 
-  it("scopes the Gateway example to the Gateway route and states the Cursor session-level exception", () => {
+  it("scopes the static Gateway APPLY example to Claude Code, states Codex's evidence boundary, and the Cursor session-level exception", () => {
     const joined = READY_PER_TURN_LINES.join("\n");
     expect(joined).toContain(READY_PER_TURN_HEADER);
     expect(joined).toMatch(/Claude Code \(Gateway route\)/);
-    // Codex is NOT lumped onto the Gateway example: the reduction + cost clause do not exist without
-    // a Gateway route, and the flow that connects Codex installs hooks, not a route.
+    // Codex is NOT lumped onto the APPLY-style Gateway example: the reduction + cost clause are real
+    // only for an APPLY turn backed by settled evidence, which this static Codex block does not have.
     expect(joined).not.toMatch(/Claude Code \/ Codex \(Gateway route\)/);
-    expect(joined).toContain(`Codex (hooks, no Gateway route):  ${READY_PER_TURN_EXAMPLE_HOOK_ONLY}`);
+    expect(joined).toContain(
+      `Codex (hook, if your build displays it; settled evidence only when recorded):  ${READY_PER_TURN_EXAMPLE_HOOK_ONLY}`
+    );
+    // Codex DOES have a Gateway route now (every normal invocation, interactive included) - the copy
+    // states that plainly, without attaching a reduction/cost figure it cannot back.
+    expect(joined).toMatch(/every normal invocation also routes through the local Gateway/);
+    expect(joined).not.toMatch(/produces a receipt|receipt is produced|is measured \(a receipt/i);
     // Cursor: honest session-level exception, explicitly NOT a per-turn line.
     expect(joined).toMatch(/Cursor: no inline line/);
   });
@@ -74,15 +80,18 @@ describe("onboarding Ready - per-turn receipt-line copy matches the canonical fo
  */
 describe("onboarding Ready - per-turn block is tool-scoped to the enabled set", () => {
   /**
-   * WHAT THE CODEX PATH ACTUALLY PRODUCES. `compaction init` connects Codex with a capture shim plus
-   * the tool's native hooks — NOT a Gateway route. The Gateway example carries an input `−NN%` AND a
-   * `−$0.14 (list price)` cost clause, and neither exists on the setup this flow produces, so printing
-   * it attached a reduction and a dollar figure to something that produces neither.
+   * WHAT THE CODEX PATH ACTUALLY PRODUCES. `compaction init` connects Codex with a Gateway-routing
+   * PATH shim (`core/tool-shim.ts`, `kind: "gateway-route"`) plus the tool's native shaping hooks: EVERY
+   * normal invocation - interactive included - routes through the local Gateway unless Compaction
+   * detects the user's own route or an API key. Settled evidence is reported only when recorded. The APPLY-style Gateway example (an
+   * input `−NN%` AND a `−$0.14 (list price)` cost clause) is still never attached to Codex, because
+   * those figures are real only for an APPLY turn and this static screen has no settled request evidence.
    *
    * This pin is REWRITTEN, not loosened: the exact-string assertion still exists, it now pins the
-   * hook-only shape and the ABSENCE of the reduction/cost figures.
+   * hook-only inline-display shape, the Gateway-route statement, and the ABSENCE of an APPLY-style
+   * reduction/cost figure.
    */
-  it("enabling ONLY Codex prints the HOOK-ONLY line (no reduction, no dollar figure) - never the Gateway example", () => {
+  it("enabling ONLY Codex prints the hook-only inline example plus the Gateway-route statement - never the APPLY-style Gateway example", () => {
     const joined = readyPerTurnLinesForTools(["codex"], ["codex"]).join("\n");
     // The header follows the same UNPROVEN-rendering boundary this test's last assertion pins: a flat
     // "you'll see one line" above the "if your Codex build displays it" hedge below would contradict it.
@@ -90,21 +99,27 @@ describe("onboarding Ready - per-turn block is tool-scoped to the enabled set", 
     expect(joined).toContain("Per-turn receipt line - what this setup does and does not print:");
     // The hook-only example line, using the real formatter output (a count, nothing more).
     expect(joined).toContain(
-      `Codex (hook installed - if your Codex build displays it, one line per turn):  ${READY_PER_TURN_EXAMPLE_HOOK_ONLY}`
+      `Codex (hook installed - if your Codex build displays it, settled evidence only when recorded):  ${READY_PER_TURN_EXAMPLE_HOOK_ONLY}`
     );
-    // NEVER the Gateway example: no input reduction, no cost figure, on the Codex path this flow builds.
+    expect(joined).not.toMatch(/one line per turn|after each turn.*Codex/i);
+    // NEVER the APPLY-style Gateway example: no input reduction or cost figure without settled Codex
+    // request evidence.
     expect(joined).not.toContain(READY_PER_TURN_EXAMPLE_GATEWAY);
     expect(joined).not.toMatch(/\$\d/);
     expect(joined).not.toMatch(/−\d+%/);
-    // The Gateway route is named as the SEPARATE thing the user does not currently have.
-    expect(joined).toContain("it installs hooks, not a Gateway route");
+    // Codex DOES have a Gateway route (every normal invocation, interactive included) - stated plainly,
+    // with the override exception named.
+    expect(joined).toContain(
+      "Codex: every normal `codex` invocation - interactive included - routes through the local Gateway unless Compaction detects your own model-provider route or an OpenAI API key. Settled receipt evidence is shown only when recorded; nothing is inferred for a request without one."
+    );
     // RENDERING IS UNPROVEN: the copy must be conditional, never "you'll see a line after each turn".
     expect(joined).toContain("if your Codex build displays it");
     expect(joined).not.toMatch(/you'll see a line after each turn/i);
-    // AND `compaction watch` is NOT a blanket fallback. It reads Gateway receipts and shim-captured
-    // runs; an INTERACTIVE codex session produces neither, so promising it "either way" would move
-    // the empty-feed defect this whole change exists to fix one screen later.
-    expect(joined).toContain("`compaction watch` shows Gateway-routed Codex turns; interactive sessions are not measured.");
+    // `compaction watch` shows these Gateway-routed turns, interactive sessions included - the override
+    // exception living on the line above, not folded into a blanket "not measured" claim.
+    expect(joined).toContain("`compaction watch` shows settled Gateway evidence when recorded, including interactive Codex sessions.");
+    expect(joined).not.toContain("interactive sessions are not measured");
+    expect(joined).not.toContain("it installs hooks, not a Gateway route");
     expect(joined).not.toContain("Guaranteed either way");
     // NOT the Cursor session-level line, NOT the Claude Code hook-only line.
     expect(joined).not.toMatch(/Cursor: no inline line/);

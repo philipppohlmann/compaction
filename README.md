@@ -23,6 +23,24 @@ Compaction connects to **Claude Code, Codex, and Cursor** and optimizes eligible
 own machine. Output shaping starts with the first eligible turn. Community adds model-visible input
 compaction on supported routes.
 
+**Install once. Keep using Codex, Claude Code or Cursor normally.**
+
+**Compaction makes your context and subscription go further. Runs locally. No prompt or code
+telemetry.**
+
+This is a real Community acceptance run through a normal Codex ChatGPT-subscription session:
+
+```text
+$ codex
+
+↳ compaction · input 8,388,356→7,212,095 (−14%) · output 14,393→10,795 (−25%, est.) · +~3.08m · full apply
+```
+
+The input arrow is measured apply evidence. The output before-value is an empirically calibrated
+counterfactual, so it remains marked `est.`. `+~3.08m` is estimated equivalent active-agent time
+preserved at the observed workload consumption rate, not a claim about a provider's hidden quota or
+rate-limit formula.
+
 - **Output shaping from the first eligible turn.** Compaction attaches the shipped policy before
   generation, with no account required. A numerical output estimate appears only when applicable
   empirical calibration exists; otherwise the result reports `output N/A→ACTUAL (N/A%, est.)`.
@@ -49,9 +67,10 @@ curl -fsSL https://cli.compaction.dev/install | sh
 Then run `compaction` for guided onboarding. The installed binary is `compaction`; sanity-check with
 `compaction --version`.
 
-The hosted installer is served as `text/plain`, and its only network call is the `npm install` of the
-published package. No `sudo` by default (it installs into a user-writable prefix), no telemetry,
-macOS and Linux. It fails clearly instead of faking success.
+The hosted installer is served as `text/plain`. It verifies public npm packages and creates a
+user-writable managed launcher on macOS and Linux, without `sudo` or telemetry. Managed installs
+check public npm about daily and stage verified updates for a safe next session. An eligible account
+may also acquire the signed engine after accepting its exact EULA. Failures leave the active release selected.
 
 ```bash
 curl -fsSL https://cli.compaction.dev/install | less                 # read it first
@@ -66,23 +85,32 @@ npx @compaction/cli init         # no global install
 npx @compaction/cli --help       # no install at all
 ```
 
-Local-first and file-based, with **no prompt or code telemetry**. Without an account, the only
-network traffic is your own provider traffic: nothing contacts Compaction at all. With a free
+Use `compaction update --check`, `compaction update`, or `compaction update --rollback` to inspect,
+stage, or restore a verified pair. `--channel preview` selects npm's `next` tag; stable uses `latest`.
+Opt out with `compaction update --auto off` or `COMPACTION_AUTO_UPDATE=0`. Exact-version installs
+start pinned with automatic updates off. Direct npm/npx/source installs do not self-update; use their
+owning package manager. Installations predating this updater need one explicit upgrade or installer rerun.
+
+Local-first and file-based, with **no prompt or code telemetry**. Without an account, Compaction-service
+requests are absent; installation and update checks use public npm alongside your own provider traffic. With a free
 account, the client also exchanges content-free records with our service (see
 [Privacy](#privacy-and-security)).
 
 ## How it works
 
 1. **Install once.** See [Install](#install), then run `compaction`.
-2. **Connect your tools.** Guided onboarding detects Claude Code, Codex, and Cursor, shows exactly
-   what enabling each one does, and asks for your explicit authorization before anything is installed
-   or applied. You choose the optimization mode per tool, and everything is reversible:
+2. **Connect your tools.** Guided onboarding detects Claude Code, Codex, and Cursor and preselects
+   every detected supported tool. Detection is read-only: you can deselect any tool, and explicit
+   confirmation is the first write. Manual connections use names: `compaction init --connect claude-code`,
+   `--connect codex`, `--connect cursor`, or `--connect all`. Everything is reversible:
    `compaction init --disconnect claude-code|codex|cursor` removes a connection, and
    `compaction hooks uninstall --tool <tool>` removes only Compaction's own hooks.
 3. **Keep working exactly as before.** `claude`, `codex`, and Cursor run unchanged. Output shaping
    is active from the first eligible turn wherever the connected integration exposes a shaping seam.
    Live-history input compaction runs in the adaptive engine on the routed integrations that support
-   it (see [Supported tools](#supported-tools)).
+   it (see [Supported tools](#supported-tools)). Tool connection and plan entitlement are separate:
+   upgrading this account/device from Open to Community does not reconnect or reinstall an already
+   ready tool, while a tool you left unconnected remains untouched.
 4. **Instrumented calls write a content-free receipt.** Token and cache counts plus structural
    labels, never your prompt, your code, or the response. Local-only, gitignored. Gateway traffic,
    Claude Code, and Codex are instrumented; Cursor shapes before generation and its turns surface at
@@ -102,12 +130,12 @@ through your tool's own hook, the same as on a subscription. The Gateway's own s
 live-history input compaction both ride the adaptive engine's apply path, which Community installs.
 Your key rides straight through to your provider and is never read, stored, or logged.
 
-**Subscription (Claude/ChatGPT plan), through native tool hooks.** No API key needed. Compaction
-installs the tool's own hook and attaches the shipped shaping policy before eligible generations. On
-**Claude Code** a subscription session also reaches hybrid input compaction: `claude` runs through
-Compaction's transparent local route, and a verified Community
-entitlement, not an API key, is what activates the apply path. This is the route we have live-proven
-on a Claude Max plan.
+**Subscription (Claude/ChatGPT plan), through native tool integration.** No API key needed.
+Compaction installs the tool's hook and attaches the shipped shaping policy before eligible
+generations. On **Claude Code and Codex**, subscription sessions also reach hybrid input compaction:
+`claude` and `codex` run through Compaction's transparent local routes, and a verified Community
+entitlement, not an API key, activates the apply path. These routes have been live-proven on Claude
+Max and ChatGPT subscriptions.
 
 **Current behavior.** Output shaping is on by default once a tool is connected. Kill switches:
 `COMPACTION_SHAPING_HOOKS=0`, `compaction stop` (persisted, reversed by `compaction start`), or
@@ -244,7 +272,7 @@ describes a pass-through as an apply.
 | Tool | Route | Output shaping | Input optimization | Token counts |
 |---|---|---|---|---|
 | **Claude Code** | transparent local route (subscription or API key) | eligible per-prompt turns; planning/reasoning held | Community, on both routes, live-proven on a Claude Max subscription | provider-reported |
-| **Codex** | native hook (subscription) or gateway (API key) | eligible per-prompt turns; planning/reasoning held | Community, on the API-key gateway route | provider-reported |
+| **Codex** | transparent local route (ChatGPT subscription) or gateway (API key) | eligible per-prompt turns; planning/reasoning held | Community, on both routes, live-proven on a ChatGPT subscription | provider-reported |
 | **Cursor** | session-level instruction | session-level shaping; no per-turn selection | not available (the tool exposes no per-call route) | local estimate |
 
 Input optimization is metered against your Community allowance wherever it runs, on any supported
@@ -292,6 +320,10 @@ compaction mode full  # adaptive input optimization + output shaping
 ```bash
 compaction                                       # guided onboarding: detect tools, connect, authorize
 compaction init                                  # the same onboarding, explicitly
+compaction init --connect claude-code             # connect one detected tool by name
+compaction init --connect codex
+compaction init --connect cursor
+compaction init --connect all                     # connect every detected supported tool
 compaction status                                # connected tools, gateway health, receipts rollup, next commands
 compaction watch                                 # live per-turn receipt lines, any tool through the Gateway
 compaction watch --once                          # the last few lines, then exit
@@ -328,7 +360,7 @@ compaction context add <artifact>                # local memory from your own ca
 compaction api export --json                     # ONE content-free JSON doc; local-only, no upload
 ```
 
-`compaction --help` lists everything. Commands that need the adaptive engine say so plainly and exit
+`compaction --help` lists the primary commands. Commands that need the adaptive engine say so plainly and exit
 without doing anything when it is not installed. They never pretend to have optimized.
 
 ## Privacy and security
@@ -337,8 +369,10 @@ without doing anything when it is not installed. They never pretend to have opti
   and forwards it only to the provider you selected. Prompts, code, and responses are never uploaded
   to Compaction services. Receipts record token and cache counts and structural labels only, and stay
   on your machine (gitignored).
-- **Without an account, nothing contacts Compaction.** No telemetry, no check-in, no network call of
-  our own. The only traffic is your provider traffic going where it was already going.
+- **Without an account, nothing contacts Compaction services.** Managed installations make a public
+  npm update check at most once per 24 hours automatically (explicit checks are separate), and download
+  verified candidates. These requests contain no work content, account/device data, provider credentials,
+  receipts, or telemetry. Provider traffic still goes where it was already going.
 - **With a free account, four things talk to our service, all content free.** Activating a device,
   getting the entitlement that unlocks the fuller optimization, syncing usage counts, and looking up
   or downloading the engine release. What crosses is counts, identifiers, and status labels. There is
@@ -346,7 +380,7 @@ without doing anything when it is not installed. They never pretend to have opti
 - **Your key never leaves your machine.** On the gateway route your provider key rides straight
   through to your provider and is never read, stored, or logged.
 - **The gateway has exactly one destination: your provider.** Your traffic goes where it was already
-  going. The four account exchanges above are separate, explicit, and content-free; they never carry
+  going. The four account exchanges above are separate and content-free; they never carry
   a request.
 - **Nothing is destructive.** Every mutated request retains its original locally (restrictive
   permissions) for byte-exact recovery; hooks are merge-not-replace, idempotent, and removable with

@@ -140,7 +140,9 @@ describe("gateway status / stop lifecycle", () => {
   it("status with no gateway and no receipts → not running, 0 receipts", () => {
     const r = runIn(["gateway", "status"]);
     expect(r.code).toBe(0);
-    expect(r.stdout).toMatch(/gateway running:\s*no/i);
+    // The row names the lifecycle it reads: the PROJECT/dev pidfile in this cwd. The
+    // transparent-routing endpoint has its own lifecycle and its own block.
+    expect(r.stdout).toMatch(/project\/dev gateway:\s*not running/i);
     expect(r.stdout).toMatch(/requests observed:\s*0/i);
     expect(r.stdout).toMatch(/last request:\s*none observed yet/i);
   });

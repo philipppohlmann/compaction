@@ -1,10 +1,18 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeStatusLine } from "../../src/cli/commands/statusline.js";
+import { computeStatusLine, STATUS_LINE_PLACEHOLDER } from "../../src/cli/commands/statusline.js";
+// ONE definition of the rule, never a second copy. `init.ts` is the only import site that exists on
+// this branch's base; PR #993 moves the function to `src/cli/commands/full-apply-gate.ts` and keeps
+// `init.ts` re-exporting it, so this line keeps working across that merge and should then be pointed
+// at the new module. It is imported to ASSERT THE FIXTURE, not because the status line consults it -
+// the line's own predicate is receipt evidence, which is strictly stronger.
+import { pendingFullApplyGate } from "../../src/cli/commands/init.js";
+import { FULL_APPLY_PENDING_REASONS } from "../../src/cli/onboarding/model.js";
 import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
+import { sessionCorrelationId } from "../../src/core/gateway/session-correlation.js";
 
 /**
  * A NON-APPLY RECEIPT ON A FULL-TIER DEVICE MUST NOT RENDER `apply off` — AND MUST NOT RENDER
@@ -59,6 +67,8 @@ function applyFrame(): GatewayReceipt {
     estimated_input_tokens_before: 1_200,
     estimated_input_tokens_after: 900,
     token_source_before: "local-estimate",
+    approval_status: "auto-applied-by-policy",
+    authorization_id: "pref-1234567890abcdef12345678",
     applied_components: ["lcm-compaction"]
   });
 }
@@ -73,7 +83,8 @@ function interleavedRecordFrame(): GatewayReceipt {
   });
 }
 
-const STDIN = '{"cwd":"/some/proj","session_id":"11111111-2222-3333-4444-555555555555"}';
+const LEGACY_STDIN = '{"cwd":"/some/proj"}';
+const NEW_SESSION_STDIN = '{"cwd":"/some/proj","session_id":"11111111-2222-3333-4444-555555555555"}';
 
 describe("statusline posture on a full-tier device", () => {
   const dirs: string[] = [];
@@ -86,7 +97,7 @@ describe("statusline posture on a full-tier device", () => {
   }
 
   async function render(frame: GatewayReceipt, env: NodeJS.ProcessEnv): Promise<string> {
-    return (await computeStatusLine(STDIN, { readReceipt: async () => frame, env })) ?? "";
+    return (await computeStatusLine(LEGACY_STDIN, { readReceipt: async () => frame, env })) ?? "";
   }
 
   // --- Property assertions (the contract) -------------------------------------------------------
@@ -125,6 +136,36 @@ describe("statusline posture on a full-tier device", () => {
     expect(line).toContain("1,200→900");
   });
 
+  it("keeps a deterministic-only input reduction visible without calling it private Full", async () => {
+    const deterministic = { ...applyFrame(), applied_components: ["deterministic-compaction"] };
+    const line = await render(deterministic, communityDevice());
+    expect(line).toContain("1,200→900");
+    expect(line).not.toContain("full apply");
+  });
+
+  // --- The line may not announce a posture the gateway's own gate would refuse ------------------
+
+  it("is rendered on a device the full-apply gate REFUSES (the `compaction mode full` state)", async () => {
+    // `compaction mode full` writes `product_mode` only. The routing guard reads `optimization_mode`,
+    // which nothing on that path writes, so this device reads as full TIER while every routed turn
+    // stays record-only. `pendingFullApplyGate` is the predicate that answers the question the
+    // gateway will answer; this asserts the fixture really is in the refused state, so the assertion
+    // below is about the status line and not about a device that happens to pass.
+    expect(await pendingFullApplyGate(["claude-code"], communityDevice())).toBe(
+      FULL_APPLY_PENDING_REASONS.optimizationMode
+    );
+  });
+
+  it("announces no apply posture at all on a record turn from that device", async () => {
+    // The property, alone: whatever tier the device reports, `full apply` rides RECEIPT EVIDENCE of a
+    // real apply - never `product_mode`. A weaker predicate here would announce full apply to exactly
+    // the users the gate refuses.
+    const line = await render(interleavedRecordFrame(), communityDevice());
+    expect(line).not.toContain("full apply");
+    expect(line).not.toContain("apply off");
+    expect(line).not.toContain("basic shaping");
+  });
+
   // --- Literal-line pins (kept apart from the properties above so a pin failure cannot mask them) --
 
   it("pins the record frame's exact line", async () => {
@@ -135,5 +176,41 @@ describe("statusline posture on a full-tier device", () => {
   it("pins the apply frame's exact line", async () => {
     const line = await render(applyFrame(), communityDevice());
     expect(line).toBe("compaction · input 1,200→900 (−25%) · output 300 · full apply · id aaaaaaaa");
+  });
+
+  it("does not borrow a prior session's receipt before this session has a run boundary", async () => {
+    const env = communityDevice();
+    const foreignCorrelation = sessionCorrelationId("99999999-8888-7777-6666-555555555555", env)!;
+    const line = await computeStatusLine(NEW_SESSION_STDIN, {
+      readReceipt: async () => ({ ...applyFrame(), session_correlation_id: foreignCorrelation }),
+      env
+    });
+    expect(line).toBe(STATUS_LINE_PLACEHOLDER);
+    expect(line).not.toContain("aaaaaaaa");
+    expect(line).not.toContain("full apply");
+  });
+
+  it("does not borrow an uncorrelated legacy private-LCM receipt for named-session stdin", async () => {
+    const line = await computeStatusLine(NEW_SESSION_STDIN, {
+      readReceipt: async () => applyFrame(),
+      env: communityDevice()
+    });
+    expect(line).toBe(STATUS_LINE_PLACEHOLDER);
+    expect(line).not.toContain("aaaaaaaa");
+    expect(line).not.toContain("full apply");
+  });
+
+  it("fails closed when a named session cannot derive its keyed correlation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "statusline-unusable-config-"));
+    dirs.push(root);
+    const unusableConfigPath = join(root, "not-a-directory");
+    writeFileSync(unusableConfigPath, "regular file", "utf8");
+    const line = await computeStatusLine(NEW_SESSION_STDIN, {
+      readReceipt: async () => applyFrame(),
+      env: { COMPACTION_CONFIG_DIR: unusableConfigPath }
+    });
+    expect(line).toBe(STATUS_LINE_PLACEHOLDER);
+    expect(line).not.toContain("aaaaaaaa");
+    expect(line).not.toContain("full apply");
   });
 });

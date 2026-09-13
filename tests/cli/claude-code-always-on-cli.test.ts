@@ -56,7 +56,7 @@ describe("Claude Code always-on: connect-once → auto-measured subsequent sessi
     expect(stdout).toContain("measured automatically");
     expect(stdout).toContain("no prompt or response content is stored or uploaded");
     // The settings file really exists with the hook command (verify-after-install landed).
-    const settingsPath = join(dir, ".claude", "settings.json");
+    const settingsPath = join(process.env.HOME!, ".claude", "settings.json");
     expect(existsSync(settingsPath)).toBe(true);
   });
 

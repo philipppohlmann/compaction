@@ -56,12 +56,14 @@
  * `COMPACTION_SHAPING_HOOKS=0` kill-switch value set.
  */
 import type { GatewayReceipt } from "./receipt.js";
+import { estimateEquivalentActiveMinutes } from "../active-workload-value.js";
 import type { RunAggregate } from "./run-aggregate.js";
 import type { AllowancePauseScope } from "../onboarding-preferences.js";
 import type { AllowancePauseReason } from "../upgrade-cta.js";
 import { communityLimitClause, upgradeCta, validResetsOn } from "../upgrade-cta.js";
 import { applyInputCostReductionUsd } from "./api-cost-impact.js";
 import { allowancePausePeriodStatus } from "../entitlement/lease-store.js";
+import { POLICY_PREFERENCE_ID_PATTERN } from "../policy-preferences.js";
 
 /**
  * Prefix so the line is unmistakable in interleaved tool output — the one word every per-turn line
@@ -180,7 +182,7 @@ function compactTokens(n: number): string {
  *  - `observe`   → `apply off`      (Open, no model-visible mutation)
  *  - `basic`     → `basic shaping`  (Open, the one public deterministic output-shaping method)
  *  - `full`      → `full apply`     (Community private-engine adaptive apply; DEFINED now, emitted only
- *                                    from a real full-apply receipt — never on an Open line)
+ *                                    from a successful stored-policy private LCM receipt — never on an Open line)
  * The label is content-free (a fixed enum string, never a count or content).
  */
 export type ReceiptTier = "observe" | "basic" | "full";
@@ -364,6 +366,11 @@ export interface ReceiptLineFields {
    * since the saving moved onto the output clause (2026-08-03), an apply turn carries both.
    */
   costReductionUsd?: number;
+  /**
+   * Equivalent active agent minutes preserved, estimated only from this completed run's avoided
+   * tokens and its observed token-consumption rate. Never a provider quota/limit claim.
+   */
+  estimatedActiveMinutesSaved?: number;
   /**
    * Estimated OUTPUT tokens saved on THIS shaped turn. Turns the output clause into a before→after:
    * `output 652→512 (−21%, est.)`, where BEFORE = this count + the real output. Derived by the caller from
@@ -556,7 +563,7 @@ export function receiptCeiling(
     outputShapingContinues:
       receipt.output_shaping_state !== undefined
         ? receipt.output_shaping_state === "attached-this-pass" || receipt.output_shaping_state === "already-active"
-        : receipt.applied_components?.includes("output-shaping") === true,
+        : Array.isArray(receipt.applied_components) && receipt.applied_components.includes("output-shaping"),
     ctaEnv: env,
     ctaActionable: allowancePausePeriodStatus(pause, env) !== "stale"
   };
@@ -872,6 +879,25 @@ function applyReceiptEstimatedSaved(
 }
 
 /**
+ * Read one persisted provider token count without trusting the JSONL shape.
+ *
+ * `GatewayReceipt` is strict at write time, but replay/status surfaces read old or
+ * damaged JSON.  JavaScript property access on a string silently boxes it, while
+ * `null` throws; accepting either behaviour here can turn malformed storage into
+ * a visible provider-reported-looking count.  Every receipt renderer therefore
+ * uses this one fail-closed reader: only non-negative safe integers are displayable.
+ */
+function receiptTokenCount(
+  receipt: GatewayReceipt,
+  key: "prompt_input" | "output"
+): number | undefined {
+  const tokens = receipt.tokens;
+  if (tokens === null || typeof tokens !== "object" || Array.isArray(tokens)) return undefined;
+  const value = (tokens as Record<string, unknown>)[key];
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
  * Below this the two-decimal render would read `−$0.00`, so the clause is omitted entirely. Half a cent
  * is the smallest amount that rounds up to a displayable `−$0.01`.
  *
@@ -905,6 +931,13 @@ function valueClause(f: ReceiptLineFields): string | undefined {
   return undefined;
 }
 
+function activeMinutesClause(f: ReceiptLineFields): string | undefined {
+  const minutes = f.estimatedActiveMinutesSaved;
+  if (typeof minutes !== "number" || !Number.isFinite(minutes) || minutes <= 0) return undefined;
+  const display = Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(3).replace(/0+$/, "");
+  return `+~${display}m`;
+}
+
 /**
  * Render the canonical per-turn receipt line from content-free fields. Joins only the clauses that are
  * available with ` · `; omits any clause whose axis is unavailable. Never fabricates a field.
@@ -922,6 +955,8 @@ export function formatReceiptLine(f: ReceiptLineFields): string {
   if (output) parts.push(output);
   const value = valueClause(f);
   if (value) parts.push(value);
+  const activeMinutes = activeMinutesClause(f);
+  if (activeMinutes) parts.push(activeMinutes);
   const tier = tierClause(f);
   if (tier) parts.push(tier);
   // The countdown rides with the tier label it belongs to — it is a fact about the Community
@@ -945,11 +980,12 @@ export function formatReceiptLine(f: ReceiptLineFields): string {
  * estimates are present" is true of a turn that compacted nothing, and reading it as an input apply
  * would render a savings axis over a body that grew. The axis must describe a capability that actually ran.
  *
- * THE SIGNAL IS THE COMPONENT SET, not the arithmetic. `applied_components` is what the engine reports
- * it did, and `lcm-compaction` / `deterministic-compaction` are the components that touch input;
- * `output-shaping` alone never is. Reading components rather than `after < before` also PRESERVES A
- * TRUTHFUL ZERO: an input-compaction pass that legitimately found nothing to remove still ran, and its
- * `−0%` is a real measurement of a real apply — hiding it would be its own dishonesty.
+ * THE SIGNAL STARTS WITH THE COMPONENT SET. `applied_components` is what the engine reports it did,
+ * and `lcm-compaction` / `deterministic-compaction` are the components that touch input;
+ * `output-shaping` alone never is. A visible reduction axis additionally requires canonical count
+ * fields and a strict positive delta. A component that ran but found nothing remains recorded in the
+ * receipt, while the user-facing line keeps the independently valid plain count instead of drawing
+ * a `−0%` savings arrow.
  *
  * LEGACY RECEIPTS (no `applied_components` at all — the field is optional and predates the component
  * set) fall back to the only evidence they carry: a STRICTLY negative delta. That keeps a genuine
@@ -962,13 +998,26 @@ export function formatReceiptLine(f: ReceiptLineFields): string {
 export function receiptCompactedInput(receipt: GatewayReceipt): boolean {
   const components = receipt.applied_components;
   if (components !== undefined) {
-    return components.some(
-      (component) => component === "lcm-compaction" || component === "deterministic-compaction"
-    );
+    if (!Array.isArray(components)) return false;
+    if (
+      !components.some(
+        (component) => component === "lcm-compaction" || component === "deterministic-compaction"
+      )
+    ) {
+      return false;
+    }
   }
   const before = receipt.estimated_input_tokens_before;
   const after = receipt.estimated_input_tokens_after;
-  return before !== undefined && after !== undefined && after < before;
+  return (
+    typeof before === "number" &&
+    typeof after === "number" &&
+    Number.isSafeInteger(before) &&
+    Number.isSafeInteger(after) &&
+    before > 0 &&
+    after >= 0 &&
+    after < before
+  );
 }
 
 /**
@@ -985,9 +1034,49 @@ export function receiptCompactedInput(receipt: GatewayReceipt): boolean {
  */
 export function isRealApply(receipt: GatewayReceipt): boolean {
   return (
+    receipt.mode === "apply" &&
     receipt.request_mutated === true &&
     receipt.estimated_input_tokens_before !== undefined &&
     receipt.estimated_input_tokens_after !== undefined
+  );
+}
+
+/**
+ * Does this exact receipt prove the user-facing Community Full posture?
+ *
+ * Full is the PRIVATE input engine actually applying, not merely an apply-mode request mutation.
+ * Output shaping mutates requests too, and the public deterministic component may reduce input, but
+ * neither is Hybrid/LCM provenance. A failed upstream request also did not complete a usable provider
+ * turn. Keep this predicate separate from `receiptCompactedInput`, whose broader deterministic+LCM
+ * meaning remains correct for accounting.
+ */
+export function receiptProvesPrivateFullApply(receipt: GatewayReceipt): boolean {
+  const before = receipt.estimated_input_tokens_before;
+  const after = receipt.estimated_input_tokens_after;
+  const upstreamStatus = receipt.upstream_status;
+  return (
+    receipt.mode === "apply" &&
+    isRealApply(receipt) &&
+    typeof receipt.receipt_id === "string" &&
+    receipt.receipt_id.length > 0 &&
+    receipt.tokens !== null &&
+    typeof receipt.tokens === "object" &&
+    !Array.isArray(receipt.tokens) &&
+    receipt.approval_status === "auto-applied-by-policy" &&
+    typeof receipt.authorization_id === "string" &&
+    POLICY_PREFERENCE_ID_PATTERN.test(receipt.authorization_id) &&
+    Array.isArray(receipt.applied_components) &&
+    receipt.applied_components.includes("lcm-compaction") &&
+    typeof before === "number" &&
+    typeof after === "number" &&
+    Number.isSafeInteger(before) &&
+    Number.isSafeInteger(after) &&
+    before > 0 &&
+    after >= 0 &&
+    after < before &&
+    Number.isInteger(upstreamStatus) &&
+    upstreamStatus >= 200 &&
+    upstreamStatus < 300
   );
 }
 
@@ -1042,7 +1131,8 @@ export function receiptLineFromGatewayReceipt(
    */
   ceiling?: ReceiptLineCeiling
 ): string | undefined {
-  const t = receipt.tokens;
+  const promptInput = receiptTokenCount(receipt, "prompt_input");
+  const output = receiptTokenCount(receipt, "output");
   const fields: ReceiptLineFields = {
     // A GATEWAY RECEIPT: we saw this request, so `input paused` stays sayable even when the axis itself
     // carries no number (see `inputAxisOwned`).
@@ -1075,12 +1165,12 @@ export function receiptLineFromGatewayReceipt(
     // function — rendered the zero this one refused to. One rule, one place, both builders.
     const usd = applyInputCostReductionUsd(receipt);
     if (usd !== undefined) fields.costReductionUsd = usd;
-  } else if (t.prompt_input !== undefined) {
-    if (openTier) fields.observedInput = t.prompt_input;
-    else fields.inputTokens = t.prompt_input;
+  } else if (promptInput !== undefined) {
+    if (openTier) fields.observedInput = promptInput;
+    else fields.inputTokens = promptInput;
   }
 
-  if (t.output !== undefined) fields.outputTokens = t.output;
+  if (output !== undefined) fields.outputTokens = output;
   applyReceiptEstimatedSaved(fields, receipt, estimatedSaved);
   if (open === "observe" || open === "basic") fields.tier = open;
   if (allowanceResetsOn !== undefined) fields.allowanceResetsOn = allowanceResetsOn;
@@ -1099,29 +1189,26 @@ export function receiptLineFromGatewayReceipt(
 }
 
 /**
-/**
- * The line for a gateway receipt that is NOT a real apply — the turn's counts, with NO posture label.
+ * The label-free fallback for a receipt that does not prove private Full posture.
  *
  * CONTRACT. A non-apply receipt renders no tier label at all: never `apply off`, never `full apply`.
- * `full apply` stays reserved for a REAL apply receipt and is emitted only from
- * `communityFullApplyReceiptLine` (see the TIER LABELS rule in this file's header — the label rides a
- * real input before→after, never entitlement alone). `apply off` is the Open OBSERVE posture, the
+ * `full apply` stays reserved for a successful stored-policy private LCM input reduction and is emitted
+ * only from `communityFullApplyReceiptLine`. `apply off` is the Open OBSERVE posture, the
  * user's choice of no model-visible mutation; it is not a description of one record-mode call, and a
  * full-tier device must never emit it. Omitting the label is the honest middle: the line says what the
  * turn had and claims nothing about what the device is entitled to.
  *
- * `communityFullApplyReceiptLine` returns `undefined` on a receipt that mutated nothing. Record-mode
- * receipts can interleave with apply receipts inside one user task, so a hardcoded fallback posture
- * would let an auxiliary call take over the visible result. This builder withholds that unsupported
- * posture claim.
+ * Record-mode and other non-Full receipts can interleave with private applies inside one user task, so
+ * a hardcoded fallback posture would let an auxiliary call take over the visible result. This builder
+ * withholds that unsupported posture claim.
  *
  * A PER-RECEIPT FALLBACK, NOT THE POSTURE SURFACE. No single receipt can state the device's posture
  * across a whole task; that is a run-level statement, over every call between `UserPromptSubmit` and
  * `Stop`. This builder's only job is to stop one receipt from lying in the gaps between applies.
  *
- * NO APPLY AXIS, EVER. There is no before→after and no cost clause here by construction — this builder
- * is reached precisely when nothing was applied, and `inputTokens` (not `inputBefore`/`inputAfter`) is
- * the only input form it can set. It cannot fabricate a saving because it has no field to put one in.
+ * NO APPLY AXIS, EVER. This builder is used only when the caller wants a plain-count fallback;
+ * deterministic or otherwise valid non-Full input reductions must use `receiptLineFromGatewayReceipt`
+ * to retain their measured axis without a posture label.
  * `inputAxisOwned` stays true: the gateway saw the request, so `input paused` remains sayable, and the
  * ceiling / allowance / pause clauses ride the line exactly as on the other gateway builders.
  *
@@ -1137,15 +1224,16 @@ export function nonApplyReceiptLine(
   /** The allowance ceiling this turn hit, when it hit one. */
   ceiling?: ReceiptLineCeiling
 ): string | undefined {
-  const t = receipt.tokens;
+  const promptInput = receiptTokenCount(receipt, "prompt_input");
+  const output = receiptTokenCount(receipt, "output");
   const fields: ReceiptLineFields = {
     // A GATEWAY RECEIPT: we saw this request, so `input paused` stays sayable even with no number.
     // No `tier`: a non-apply receipt carries no posture label (see the contract above).
     inputAxisOwned: true,
     shortReceiptId: receipt.receipt_id.slice(0, 8)
   };
-  if (t.prompt_input !== undefined) fields.inputTokens = t.prompt_input;
-  if (t.output !== undefined) fields.outputTokens = t.output;
+  if (promptInput !== undefined) fields.inputTokens = promptInput;
+  if (output !== undefined) fields.outputTokens = output;
   applyReceiptEstimatedSaved(fields, receipt, estimatedSaved);
   if (allowanceResetsOn !== undefined) fields.allowanceResetsOn = allowanceResetsOn;
   applyCeiling(fields, ceiling);
@@ -1208,6 +1296,8 @@ export function runAggregateLine(params: {
    * off). Plain totals only: a rate over a partial run is a claim the evidence cannot carry.
    */
   incomplete?: boolean;
+  /** Exact completed hook-opened active-workload window; absent/open windows render no minutes. */
+  activeWindow?: { startedAt: string; endedAt: string };
 }): string | undefined {
   const { aggregate } = params;
   const fields: ReceiptLineFields = { inputAxisOwned: true };
@@ -1266,6 +1356,18 @@ export function runAggregateLine(params: {
     fields.allowanceRemainingTokens = aggregate.allowance.remaining_tokens;
     fields.allowancePeriodTotalTokens = aggregate.allowance.period_total_tokens;
   }
+  if (params.tier === "full" && rateAllowed && params.activeWindow !== undefined) {
+    fields.estimatedActiveMinutesSaved = estimateEquivalentActiveMinutes({
+      inputBefore: aggregate.input?.before,
+      inputAfter: aggregate.input?.after,
+      outputAfter: aggregate.output?.after,
+      ...(aggregate.output && aggregate.output.before > aggregate.output.after && params.outputBasis === "measured"
+        ? { estimatedOutputTokensAvoided: aggregate.output.before - aggregate.output.after }
+        : {}),
+      runStartedAt: params.activeWindow.startedAt,
+      runEndedAt: params.activeWindow.endedAt
+    });
+  }
   applyCeiling(fields, params.ceiling);
 
   if (
@@ -1280,14 +1382,13 @@ export function runAggregateLine(params: {
 }
 
 /**
- * The Community FULL-APPLY line builder — emitted ONLY on a real full-apply receipt.
+ * The Community FULL-APPLY line builder — emitted ONLY when this successful receipt proves a private
+ * Hybrid/LCM input application under stored policy authorization.
  *
  * Format: `compaction · input 41,210→21,876 (−47%) · output 286 · full apply · id ...` — the existing
- * apply before→after form + the `full apply` tier label. It requires a REAL apply before→after on the
- * receipt (`request_mutated === true` with both estimated input counts). Returns undefined when the
- * receipt is NOT a real full apply — so this can NEVER synthesize a `full apply` line from an Open or
- * record receipt. It is called once the private engine performs a real community full apply; until then
- * nothing calls it, so `full apply` is never emitted.
+ * apply before→after form + the `full apply` tier label. It requires `lcm-compaction`, a net measured
+ * input reduction, stored-policy authorization, request mutation, and a 2xx upstream result. Returns
+ * undefined for deterministic-only, shaping-only, failed, Open, and record receipts.
  */
 export function communityFullApplyReceiptLine(
   receipt: GatewayReceipt,
@@ -1301,14 +1402,12 @@ export function communityFullApplyReceiptLine(
    */
   ceiling?: ReceiptLineCeiling
 ): string | undefined {
-  if (!isRealApply(receipt)) return undefined;
-  const t = receipt.tokens;
-  // THE TIER IS THE DEVICE'S; THE AXIS IS THE TURN'S. `full apply` is an entitlement statement (see
-  // `perTurnLineFromReceipt`), so it rides every Community apply turn — but the input before→after
-  // describes what actually ran, and a Community turn that only shaped output compacted no input. Such a
-  // turn keeps its label, its output evidence and its plain provider-reported input count, and loses the
-  // savings axis it had no right to. A real input apply that measured `−0%` still renders: see
-  // `receiptCompactedInput`.
+  if (!receiptProvesPrivateFullApply(receipt)) return undefined;
+  const promptInput = receiptTokenCount(receipt, "prompt_input");
+  const output = receiptTokenCount(receipt, "output");
+  // THE LABEL AND AXIS COME FROM THIS EXACT RECEIPT. The predicate above has already established a
+  // successful private input apply with a strict net reduction. Entitlement or output shaping alone is
+  // deliberately insufficient.
   const compactedInput = receiptCompactedInput(receipt);
   const fields: ReceiptLineFields = {
     inputAxisOwned: true,
@@ -1317,8 +1416,8 @@ export function communityFullApplyReceiptLine(
           inputBefore: receipt.estimated_input_tokens_before,
           inputAfter: receipt.estimated_input_tokens_after
         }
-      : t.prompt_input !== undefined
-        ? { inputTokens: t.prompt_input }
+      : promptInput !== undefined
+        ? { inputTokens: promptInput }
         : {}),
     tier: "full",
     shortReceiptId: receipt.receipt_id.slice(0, 8)
@@ -1327,7 +1426,7 @@ export function communityFullApplyReceiptLine(
   // price, and pricing the shaper's growth would invert the sign of the one number a user reads as money.
   const usd = compactedInput ? applyInputCostReductionUsd(receipt) : undefined;
   if (usd !== undefined) fields.costReductionUsd = usd;
-  if (t.output !== undefined) fields.outputTokens = t.output;
+  if (output !== undefined) fields.outputTokens = output;
   applyReceiptEstimatedSaved(fields, receipt, estimatedSaved);
   applyCeiling(fields, ceiling);
   // READ FROM THE RECEIPT HERE, not passed in like `ceiling`. The countdown needs no environment and

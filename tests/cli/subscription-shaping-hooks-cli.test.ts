@@ -74,10 +74,23 @@ describe("hooks install --tool codex", () => {
     expect(cfg.hooks.UserPromptSubmit).toHaveLength(2);
   });
 
-  it("--dry-run writes nothing", async () => {
-    const { stdout } = await run(["hooks", "install", "--tool", "codex", "--dry-run"]);
+  it("--dry-run writes nothing and describes the Stop line only when settled evidence is recorded", async () => {
+    const settings = join(home, "custom-codex-hooks.json");
+    const { stdout } = await run(["hooks", "install", "--tool", "codex", "--dry-run", "--settings", settings]);
     expect(stdout).toContain("--dry-run");
+    expect(stdout).toContain("Stop line:       compaction hooks line codex  (settled evidence only when recorded; otherwise no message)");
+    expect(stdout).not.toMatch(/per-turn line:.*after each turn/);
     expect(await exists(codexConfig())).toBe(false);
+    expect(await exists(settings)).toBe(false);
+  });
+
+  it("the compiled line-command help makes the empty-evidence outcome explicit", async () => {
+    const { stdout } = await run(["hooks", "line", "--help"]);
+    const normalized = stdout.replace(/\s+/g, " ");
+    expect(normalized).toContain("returns settled content-free receipt evidence as `systemMessage` when recorded");
+    expect(normalized).toContain("otherwise returns no message");
+    expect(normalized).not.toContain("returns the content-free per-turn receipt line");
+    expect(normalized).not.toContain("this is how Codex gets the line");
   });
 
   it("uninstall removes only ours, backs up, preserves the other tool's hook", async () => {

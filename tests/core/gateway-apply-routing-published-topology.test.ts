@@ -24,7 +24,7 @@ import { provisionValidLease } from "../helpers/lease-fixture.js";
  *
  * These tests therefore SIMULATE THE NPM TOPOLOGY rather than the repo's: the input-compaction seam
  * is mocked absent (and made to throw if apply routing touches it at all), so a regression back to a
- * packaged-module probe fails here instead of at a founder journey. The capability that actually
+ * packaged-module probe fails here instead of in an installed product run. The capability that actually
  * matters is the engine, because the live apply path is the engine IPC seam.
  */
 
@@ -77,7 +77,7 @@ afterEach(() => {
 
 describe("guard 0 on the published-package topology (apply-policy.js absent)", () => {
   /**
-   * THE RELEASE BLOCKER, as a test. Every condition the founder journey established on the real
+   * THE RELEASE CASE, as a test. Every condition established on the real
    * device: no `apply-policy.js` (npm), an engine that resolves, a valid signed Community lease, mode
    * full, claude-code connected and authorized — and no API key, because a Claude Max subscription
    * user never sets one. This is exactly the `gateway ensure` call the `claude` shim makes.

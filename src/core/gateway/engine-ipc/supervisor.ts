@@ -33,6 +33,15 @@ import { fileURLToPath } from "node:url";
 import { configDir } from "../../api-client/persisted-config.js";
 import { verifyInstalledArtifact, type EngineTrustSource, type InstalledArtifactFailure } from "../../engine-install/verify.js";
 import type { EngineArtifactKind, EngineReleaseManifest } from "../../engine-install/manifest.js";
+import { canonicalManifestBytes, manifestMatchesHost } from "../../engine-install/manifest.js";
+import { engineEulaAccepted } from "../../legal/engine-eula.js";
+import {
+  compatibleFull,
+  engineInputCompactionSupport,
+  type EngineInputCompactionSupport,
+  type ReleaseCompatibility
+} from "../../update/compatibility.js";
+import { ACTIVE_USAGE_METER_VERSION } from "../../usage/usage-event.js";
 import {
   ENGINE_IPC_PROTOCOL_VERSION,
   EngineIpcFrameError,
@@ -107,6 +116,8 @@ export interface EngineRequestInput {
 }
 
 export interface EngineSupervisorOptions {
+  /** Verified session pair pin; null deliberately disables every ambient engine fallback. */
+  verifiedInstalledArtifact?: VerifiedInstalledArtifactPin | null;
   /**
    * Absolute path to the engine entry script. Test/dev override. When omitted the supervisor
    * resolves the signed install under `<configDir>/engine` (VERIFIED before every run), else the
@@ -120,6 +131,12 @@ export interface EngineSupervisorOptions {
   nodeExecPath?: string;
   /** Environment for path resolution (`COMPACTION_ENGINE_PATH`, `COMPACTION_CONFIG_DIR`). Tests. */
   env?: NodeJS.ProcessEnv;
+}
+
+export interface VerifiedInstalledArtifactPin {
+  artifactPath: string;
+  manifest: EngineReleaseManifest;
+  compatibility: ReleaseCompatibility;
 }
 
 /**
@@ -157,9 +174,55 @@ export interface ResolvedEngine {
    * an unverified install never runs and never falls through to the dev build (a tampered install
    * must not be silently substituted). The supervisor degrades `engine-unverified`.
    */
-  unverifiedReason?: InstalledArtifactFailure | "pointer-escape";
+  unverifiedReason?: InstalledArtifactFailure | "pointer-escape" | "release-incompatible";
   /** For a VERIFIED signed install: which trust root verified it + its manifest. */
   installed?: { trust: EngineTrustSource; manifest: EngineReleaseManifest };
+  /**
+   * WHAT THIS PAIR DECLARES ABOUT INPUT COMPACTION, resolved HERE rather than discovered per request.
+   *
+   * A signed manifest is the only thing that can state the engine's meter unit before it runs, and
+   * this is the one place a manifest is read. Carrying the answer on the resolution makes the pair's
+   * declared capability visible to every caller — the gateway, which must not ask for input work it
+   * cannot meter, and `status`, which must be able to say the capability is off.
+   *
+   * `unknown` for every unsigned source (option/env/dev build): see `engineInputCompactionSupport`.
+   */
+  inputCompaction: EngineInputCompactionSupport;
+}
+
+/**
+ * The client's own side of the input-compaction contract. One name for the active unit — the same
+ * constant the journal writer stamps and the consumption reader filters on — so the pairing check
+ * cannot drift from the debit it is predicting.
+ */
+const CLIENT_METER_CONTRACT = { meterVersion: ACTIVE_USAGE_METER_VERSION } as const;
+
+/** No engine resolved, so nothing declared anything: not a claim about any artifact. */
+const NO_ENGINE_DECLARATION: EngineInputCompactionSupport = { support: "unknown" };
+
+/** A session pin always verifies the same production artifact, independent of current. */
+export function resolveVerifiedInstalledArtifact(pin: VerifiedInstalledArtifactPin, env: NodeJS.ProcessEnv = process.env): ResolvedEngine {
+  const refused = (unverifiedReason: ResolvedEngine["unverifiedReason"]): ResolvedEngine =>
+    ({ path: null, source: "installed", artifactKind: "node-script", unverifiedReason,
+      inputCompaction: NO_ENGINE_DECLARATION });
+  try {
+    const root = realpathSync(path.join(configDir(env), "engine"));
+    const target = realpathSync(pin.artifactPath);
+    if (!path.isAbsolute(pin.artifactPath) || !target.startsWith(root + path.sep)) return refused("pointer-escape");
+    const verified = verifyInstalledArtifact(target, env);
+    if (!verified.verified) return refused(verified.reason);
+    if (!canonicalManifestBytes(verified.manifest).equals(canonicalManifestBytes(pin.manifest)) ||
+        !manifestMatchesHost(verified.manifest) || verified.manifest.schema_version !== 2 ||
+        !engineEulaAccepted(env, verified.manifest.eula_version) ||
+        !compatibleFull(pin.compatibility, verified, verified.manifest.eula_version)) return refused("release-incompatible");
+    return { path: target, source: "installed", artifactKind: verified.manifest.artifact_kind,
+      installed: { trust: verified.trust, manifest: verified.manifest },
+      // `compatibleFull` above already required the declared unit to match, so this can only be
+      // `supported` here. Computed rather than asserted so the two can never drift apart silently.
+      inputCompaction: engineInputCompactionSupport(CLIENT_METER_CONTRACT, verified.manifest) };
+  } catch {
+    return refused("artifact-unreadable");
+  }
 }
 
 /**
@@ -188,21 +251,31 @@ function resolveInstalledEngine(env: NodeJS.ProcessEnv): ResolvedEngine | null {
     const realRoot = realpathSync(engineRoot);
     const realTarget = realpathSync(target);
     if (!realTarget.startsWith(realRoot + path.sep)) {
-      return { path: null, source: "installed", artifactKind: "node-script", unverifiedReason: "pointer-escape" };
+      return { path: null, source: "installed", artifactKind: "node-script", unverifiedReason: "pointer-escape",
+        inputCompaction: NO_ENGINE_DECLARATION };
     }
     target = realTarget;
   } catch {
-    return { path: null, source: "installed", artifactKind: "node-script", unverifiedReason: "pointer-escape" };
+    return { path: null, source: "installed", artifactKind: "node-script", unverifiedReason: "pointer-escape",
+      inputCompaction: NO_ENGINE_DECLARATION };
   }
   const verification = verifyInstalledArtifact(target, env);
   if (!verification.verified) {
-    return { path: null, source: "installed", artifactKind: "node-script", unverifiedReason: verification.reason };
+    return { path: null, source: "installed", artifactKind: "node-script", unverifiedReason: verification.reason,
+      inputCompaction: NO_ENGINE_DECLARATION };
   }
   return {
     path: target,
     source: "installed",
     artifactKind: verification.manifest.artifact_kind,
-    installed: { trust: verification.trust, manifest: verification.manifest }
+    installed: { trust: verification.trust, manifest: verification.manifest },
+    // THE AMBIENT PATH'S HALF OF THE COMPATIBILITY CONTRACT. This resolution deliberately still
+    // ADMITS an artifact whose declared meter unit this client cannot place: refusing it outright
+    // would withdraw the engine's output shaping — the Open/base capability, which costs no input
+    // allowance and is unaffected by the input meter — for a Community input-metering reason. That is
+    // the same over-refusal `server.ts` avoids when the allowance is exhausted. What the artifact
+    // may be USED for is narrowed instead, by the callers that read this field.
+    inputCompaction: engineInputCompactionSupport(CLIENT_METER_CONTRACT, verification.manifest)
   };
 }
 
@@ -239,21 +312,29 @@ function resolveDevEnginePath(): string | null {
  */
 export function resolveEngine(options: EngineSupervisorOptions = {}): ResolvedEngine {
   const env = options.env ?? process.env;
+  if (options.verifiedInstalledArtifact === null) {
+    return { path: null, source: "none", artifactKind: "node-script", inputCompaction: NO_ENGINE_DECLARATION };
+  }
+  if (options.verifiedInstalledArtifact !== undefined) return resolveVerifiedInstalledArtifact(options.verifiedInstalledArtifact, env);
   if (options.enginePath) {
     const exists = existsSync(options.enginePath);
-    return { path: exists ? options.enginePath : null, source: exists ? "option" : "none", artifactKind: "node-script" };
+    return { path: exists ? options.enginePath : null, source: exists ? "option" : "none", artifactKind: "node-script",
+      inputCompaction: NO_ENGINE_DECLARATION };
   }
   // An explicit env override is authoritative: if it names a non-existent path the engine is
   // EXPLICITLY absent (no silent dev fallback). Only when the override is unset do we fall through.
   const fromEnv = resolveEnginePathFromEnv(env);
   if (fromEnv.set) {
-    return { path: fromEnv.path, source: fromEnv.path === null ? "none" : "env", artifactKind: "node-script" };
+    return { path: fromEnv.path, source: fromEnv.path === null ? "none" : "env", artifactKind: "node-script",
+      inputCompaction: NO_ENGINE_DECLARATION };
   }
   const installed = resolveInstalledEngine(env);
   if (installed) return installed;
   const dev = resolveDevEnginePath();
-  if (dev !== null) return { path: dev, source: "dev-build", artifactKind: "node-script" };
-  return { path: null, source: "none", artifactKind: "node-script" };
+  if (dev !== null) {
+    return { path: dev, source: "dev-build", artifactKind: "node-script", inputCompaction: NO_ENGINE_DECLARATION };
+  }
+  return { path: null, source: "none", artifactKind: "node-script", inputCompaction: NO_ENGINE_DECLARATION };
 }
 
 /** Back-compat path-only view of `resolveEngine` (null = absent OR unverified). */
@@ -284,6 +365,8 @@ export class EngineSupervisor {
   private artifactKind: EngineArtifactKind;
   /** Degrade reason when no engine runs: `engine-unverified` iff a signed install failed verify. */
   private absentReason: Extract<EngineDegradeReason, "engine-absent" | "engine-unverified">;
+  /** Mutable for the same reason as `enginePath`: refreshed from the manifest re-read on each spawn. */
+  private inputCompaction: EngineInputCompactionSupport;
   /** Where the engine resolved from at construction (drives the per-spawn re-verify). */
   private readonly source: EngineResolutionSource;
   private readonly resolveEnv: NodeJS.ProcessEnv;
@@ -291,23 +374,39 @@ export class EngineSupervisor {
   private readonly spawnTimeoutMs: number;
   private readonly maxRestarts: number;
   private readonly nodeExecPath: string;
+  private readonly verifiedPin?: VerifiedInstalledArtifactPin;
 
   constructor(options: EngineSupervisorOptions = {}) {
     const resolved = resolveEngine(options);
     this.enginePath = resolved.path;
     this.artifactKind = resolved.artifactKind;
     this.absentReason = resolved.unverifiedReason === undefined ? "engine-absent" : "engine-unverified";
+    this.inputCompaction = resolved.inputCompaction;
     this.source = resolved.source;
     this.resolveEnv = options.env ?? process.env;
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_ENGINE_REQUEST_TIMEOUT_MS;
     this.spawnTimeoutMs = options.spawnTimeoutMs ?? DEFAULT_ENGINE_SPAWN_TIMEOUT_MS;
     this.maxRestarts = options.maxRestarts ?? MAX_ENGINE_RESTARTS;
     this.nodeExecPath = options.nodeExecPath ?? process.execPath;
+    // Copy caller-owned metadata so a later mutation cannot redirect a running session's restart.
+    this.verifiedPin = options.verifiedInstalledArtifact ? structuredClone(options.verifiedInstalledArtifact) : undefined;
   }
 
   /** Whether an engine path resolved at all (absent → every request degrades `engine-absent`). */
   get engineResolved(): boolean {
     return this.enginePath !== null;
+  }
+
+  /**
+   * What the CURRENTLY RESOLVED pair declares about input compaction (see `ResolvedEngine`).
+   *
+   * Read by the gateway to decide whether to ASK for input compaction at all. An engine that
+   * declares a unit this client cannot place will have every input-compacted body refused at the
+   * meter guard, after the engine has already spent the work — including the LCM model round trip —
+   * so requesting it is pure latency for a result that is guaranteed to be discarded.
+   */
+  get inputCompactionSupport(): EngineInputCompactionSupport {
+    return this.inputCompaction;
   }
 
   /**
@@ -324,19 +423,26 @@ export class EngineSupervisor {
     // a removed install degrades `engine-absent`. Explicit dev/test overrides (option/env) and
     // the dev build are unsigned by design and are not re-verified.
     if (this.source === "installed") {
-      const fresh = resolveInstalledEngine(this.resolveEnv);
+      const fresh = this.verifiedPin ? resolveVerifiedInstalledArtifact(this.verifiedPin, this.resolveEnv)
+        : resolveInstalledEngine(this.resolveEnv);
       if (fresh === null) {
         this.enginePath = null;
         this.absentReason = "engine-absent";
+        this.inputCompaction = NO_ENGINE_DECLARATION;
         return null;
       }
       if (fresh.path === null) {
         this.enginePath = null;
         this.absentReason = "engine-unverified";
+        this.inputCompaction = NO_ENGINE_DECLARATION;
         return null;
       }
       this.enginePath = fresh.path;
       this.artifactKind = fresh.artifactKind;
+      // The manifest is re-read as part of verify-before-run, so the declared unit is refreshed from
+      // the SAME read that authorised this spawn — an install swapped under a long-lived gateway
+      // cannot leave a stale capability claim behind.
+      this.inputCompaction = fresh.inputCompaction;
     }
     if (this.enginePath === null) return null;
     if (this.restarts > this.maxRestarts) return null;

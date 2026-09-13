@@ -68,10 +68,12 @@ describe("compaction init - connect-once install onboarding", () => {
     // `found` must never claim active; only `ready` means active-for-recording.
     expect(stdout).not.toContain("connected (shim active)");
 
-    // Enable-once menu + the exact --connect instruction.
+    // Enable-once menu + named commands (no numeric connection UI).
     expect(stdout).toContain("Enable Compaction for:");
-    for (const l of ["[1] Claude Code", "[2] Codex", "[3] Cursor", "[4] All supported", "[5] Skip"]) expect(stdout).toContain(l);
-    expect(stdout).toContain("compaction init --connect 1");
+    for (const name of ["claude-code", "codex", "cursor", "all"]) {
+      expect(stdout).toContain(`compaction init --connect ${name}`);
+    }
+    expect(stdout).not.toMatch(/compaction init --connect [1-5]\b/);
 
     // Gateway = infra + manual route, NOT a peer workflow card.
     expect(stdout).toContain("Gateway: local byte-safe routing layer for compatible OpenAI-style traffic");
@@ -80,7 +82,7 @@ describe("compaction init - connect-once install onboarding", () => {
     expect(stdout).not.toContain("Gateway setup");
 
     // After-connect framing + manual tools line.
-    expect(stdout).toContain("After connect: supported runs are measured automatically");
+    expect(stdout).toContain("After connect: supported runs route or capture automatically; only recorded evidence is reported.");
     expect(stdout).toContain("Manual tools: capture · import · analyze · spend · feedback --redact");
 
     // Optimization mode (Page 3) - the two honest modes + exact commands, mode 1 recommended/default.
@@ -105,7 +107,12 @@ describe("compaction init - connect-once install onboarding", () => {
   });
 
   it("empty (not-detected) case: same connect-once model, Claude Code shown 'not found'", async () => {
-    const { stdout } = await exec("node", [CLI, "init", "--projects-dir", "/tmp/none-here-nonexistent"]);
+    const root = await mkdtemp(path.join(os.tmpdir(), "init-empty-"));
+    tmpRoots.push(root);
+    const { stdout } = await exec(process.execPath, [CLI, "init", "--projects-dir", "/tmp/none-here-nonexistent"], {
+      cwd: root,
+      env: { HOME: root, PATH: "/usr/bin:/bin", NO_COLOR: "1" }
+    });
     expect(stdout).toContain("C O M P A C T I O N");
     expect(stdout).toContain(`v${pkgVersion}`);
     expect(stdout).toContain("Found on this machine:");
@@ -143,8 +150,8 @@ describe("compaction init - connect-once install onboarding", () => {
     // receipt feed `watch`, the subscription output-shaping control trio `stop` + `start` +
     // `savings`, the mainstream hosted-upgrade pair `upgrade` + `status`, the Community
     // account trio `login` + `logout` + `devices`, and the signed-engine delivery command
-    // `engine` (status/install/update — honest no-release-distributed copy).
-    for (const cmd of ["init", "capture", "import", "analyze", "context", "spend", "summary", "aggregate", "feedback", "activity", "policies", "watch", "stop", "start", "savings", "upgrade", "status", "login", "logout", "devices", "engine"]) {
+    // `engine`, plus account-free public release checking through `update`.
+    for (const cmd of ["init", "capture", "import", "analyze", "context", "spend", "summary", "aggregate", "feedback", "activity", "policies", "watch", "stop", "start", "savings", "upgrade", "status", "login", "logout", "devices", "engine", "update"]) {
       expect(commandsSection).toMatch(new RegExp(`^\\s*${cmd}\\b`, "m"));
     }
 
@@ -153,7 +160,7 @@ describe("compaction init - connect-once install onboarding", () => {
       expect(commandsSection).not.toMatch(new RegExp(`^\\s*${eng}\\b`, "m"));
     }
 
-    // Exactly 22 featured commands (the loop above plus `mode` + `engine`); `help` is excluded below.
+    // The complete public command set; `help` is excluded below.
     const listed = commandsSection
       .split("\n")
       .filter((l) => /^\s{2}\S/.test(l))
@@ -183,9 +190,19 @@ describe("compaction init - connect-once install onboarding", () => {
         "logout",
         "devices",
         "engine",
-        "usage"
+        "usage",
+        "update"
       ])
     );
-    expect(featured.length).toBe(23);
+    expect(featured.length).toBe(24);
+  });
+
+  it("init help presents named connection commands and keeps numeric aliases undocumented", async () => {
+    const { stdout } = await exec(process.execPath, [CLI, "init", "--help"], { env: { ...process.env, NO_COLOR: "1" } });
+    const unwrapped = stdout.replace(/\n\s+/g, " ");
+    expect(unwrapped).toContain("claude-code | codex | cursor | all");
+    expect(unwrapped).toContain("`all` includes detected tools only");
+    expect(unwrapped).toContain("disconnect by name: claude-code | codex | cursor");
+    expect(stdout).not.toMatch(/1\|claude-code|2\|codex|3\|cursor|4\|all|5\|skip/);
   });
 });

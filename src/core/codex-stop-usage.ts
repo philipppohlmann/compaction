@@ -19,6 +19,7 @@ import {
   type ShapingTurnScope
 } from "./output-shaping-turn-state.js";
 import {
+  activateSharedOutputCalibration,
   estimatePerTurnOutputSaved,
   loadOutputCalibrationResolver,
   type OutputCalibrationResolver
@@ -40,7 +41,7 @@ import {
   codexTurnCorrelationId,
   validCodexIdentity
 } from "./gateway/session-correlation.js";
-import { isReceiptLineEnabled } from "./gateway/receipt-line.js";
+import { isRealApply, isReceiptLineEnabled, receiptCompactedInput } from "./gateway/receipt-line.js";
 import {
   settledRunApplyPosture,
   settledRunOutputEstimate,
@@ -214,34 +215,29 @@ function incompleteWindow(
   exactReceipts: readonly GatewayReceipt[]
 ): boolean {
   if (!window.truncated) return false;
-  // Only an exact correlated run candidate may prove that a truncated tail reaches the run start.
-  // A request from another session may have started hours earlier but completed/appended after this
-  // run began; its request_started_at proves nothing about exact-run receipts cut off by the byte tail.
-  const firstExactStart = exactReceipts.reduce<string | undefined>((earliest, receipt) => {
-    const at = receipt.request_started_at ?? receipt.captured_at;
+  // The ledger is append ordered. Reaching any receipt CAPTURED before the run began proves the
+  // bounded tail covers the complete run even when older, irrelevant ledger bytes remain unread.
+  // `request_started_at` cannot prove this: an unrelated old request may finish during this run.
+  const oldestCapturedAt = window.receipts.reduce<string | undefined>((earliest, receipt) => {
+    const at = receipt.captured_at;
     return typeof at === "string" && (earliest === undefined || at < earliest) ? at : earliest;
   }, undefined);
-  if (firstExactStart === undefined) return true;
-  const firstExactMs = Date.parse(firstExactStart);
+  if (oldestCapturedAt === undefined || exactReceipts.length === 0) return true;
+  const oldestCapturedMs = Date.parse(oldestCapturedAt);
   const runStartedMs = Date.parse(run.started_at);
-  return !Number.isFinite(firstExactMs) || !Number.isFinite(runStartedMs) || firstExactMs > runStartedMs;
+  return !Number.isFinite(oldestCapturedMs) || !Number.isFinite(runStartedMs) || oldestCapturedMs > runStartedMs;
 }
 
 function receiptHasCompatibleInputPair(receipt: GatewayReceipt): boolean {
-  const before = receipt.estimated_input_tokens_before;
-  const after = receipt.estimated_input_tokens_after;
-  const claimsCompaction = receipt.applied_components?.some(
-    (component) => component === "lcm-compaction" || component === "deterministic-compaction"
-  ) === true;
-  return (
-    typeof before === "number" &&
-    typeof after === "number" &&
-    !(claimsCompaction && before === after)
-  );
+  return isRealApply(receipt) && receiptCompactedInput(receipt);
 }
 
 function receiptHasInputEvidence(receipt: GatewayReceipt): boolean {
-  return receiptHasCompatibleInputPair(receipt) || typeof receipt.tokens?.prompt_input === "number";
+  const promptInput = receipt.tokens?.prompt_input;
+  return (
+    receiptHasCompatibleInputPair(receipt) ||
+    (typeof promptInput === "number" && Number.isSafeInteger(promptInput) && promptInput >= 0)
+  );
 }
 
 /** The one renderer used by Codex Stop and `watch` for a persisted settled event. */
@@ -256,7 +252,7 @@ export interface SettleCodexStopDeps {
   appendEvent?: typeof appendActivityEvent;
   readEvents?: typeof readActivityEvents;
   clearPending?: typeof clearCodexSettlementPending;
-  readReceipts?: (cwd: string) => Promise<GatewayReceiptTailWindow>;
+  readReceipts?: (cwd: string, coverFrom?: string) => Promise<GatewayReceiptTailWindow>;
   readTurnUsage?: typeof readCodexTurnUsage;
   calibrationResolver?: OutputCalibrationResolver;
 }
@@ -269,12 +265,16 @@ export interface SettledCodexStop {
 function exactReceiptQuery(receipts: GatewayReceipt[]): ReturnType<typeof outputCalibrationQuery> {
   const queries = receipts
     .filter((receipt) => receipt.output_shaping_state === "attached-this-pass" || receipt.output_shaping_state === "already-active")
-    .map((receipt) => outputCalibrationQuery({
-      policyVersion: receipt.output_shaping_policy_version,
-      provider: receipt.provider,
-      model: receipt.model,
-      regime: receipt.output_shaping_regime
-    }));
+    .map((receipt) =>
+      receipt.token_source === "provider-reported" && typeof receipt.tokens?.output === "number"
+        ? outputCalibrationQuery({
+            policyVersion: receipt.output_shaping_policy_version,
+            provider: receipt.provider,
+            model: receipt.model,
+            regime: receipt.output_shaping_regime
+          })
+        : undefined
+    );
   if (queries.length === 0 || queries.some((query) => query === undefined)) return undefined;
   const first = JSON.stringify(queries[0]);
   return queries.every((query) => JSON.stringify(query) === first) ? queries[0] : undefined;
@@ -318,10 +318,22 @@ export async function settleCodexStop(
     await invalidateShapingTurnRecord(scope, env);
     return { event, ...(isReceiptLineEnabled(env) ? { line: settledStopLineFromActivityEvent(event) } : {}) };
   };
-  const persistFrozen = async (event: ActivityEvent): Promise<SettledCodexStop | undefined> => {
+  const persistFrozen = async (
+    event: ActivityEvent,
+    activationQuery?: ReturnType<typeof outputCalibrationQuery>
+  ): Promise<SettledCodexStop | undefined> => {
     try {
       const append = await appendEvent(event, directory);
-      if (append.appended) return settledFromDurable(event);
+      if (append.appended) {
+        if (activationQuery) {
+          try {
+            await activateSharedOutputCalibration(activationQuery, env);
+          } catch {
+            // The settled event is authoritative; optional local calibration remains fail-open.
+          }
+        }
+        return settledFromDurable(event);
+      }
       const raced = await durableEvent();
       return raced.readable && raced.event ? settledFromDurable(raced.event) : undefined;
     } catch {
@@ -352,7 +364,7 @@ export async function settleCodexStop(
   }
   // Read exact provenance before closing. A concurrent replay that observes the closed run cannot
   // delete the only copy before this first writer has frozen it into the pending event.
-  const shapingOutcome = await lastTurnShapingOutcome(scope, env);
+  const shapingOutcome = await lastTurnShapingOutcome(scope, env, () => new Date(stoppedAt));
   let run: UserRun | undefined;
   try {
     run = (deps.endRun ?? endUserRun)(sessionCorrelation, stoppedAt, env, turnCorrelation);
@@ -376,29 +388,30 @@ export async function settleCodexStop(
   }
 
   try {
-    const readReceipts = deps.readReceipts ?? ((cwd: string) => readGatewayReceiptTailWindow(cwd));
-    const window = await readReceipts(payload.cwd);
+    const readReceipts = deps.readReceipts ?? ((cwd: string, coverFrom?: string) => readGatewayReceiptTailWindow(cwd, undefined, coverFrom));
+    const window = await readReceipts(payload.cwd, run.started_at);
     const exactReceipts = window.receipts.filter((receipt) => receiptBelongsToRun(receipt, run));
     const resolver = deps.calibrationResolver ?? await loadOutputCalibrationResolver(env);
     const aggregate = exactReceipts.length > 0 && !incompleteWindow(window, run, exactReceipts)
       ? aggregateRun(exactReceipts, { outputCalibrationResolver: resolver })
       : undefined;
-    const gatewayUsable =
+    const gatewayInputUsable =
       aggregate?.input !== undefined &&
-      aggregate.output !== undefined &&
       exactReceipts.every(receiptHasInputEvidence);
-    const rolloutUsage = gatewayUsable
+    const gatewayOutputUsable = gatewayInputUsable && aggregate?.output !== undefined;
+    const rolloutUsage = gatewayInputUsable && gatewayOutputUsable
       ? undefined
       : await (deps.readTurnUsage ?? readCodexTurnUsage)(
           payload.transcriptPath,
           payload.sessionId,
           payload.turnId
         );
-    if (!gatewayUsable && !rolloutUsage) return undefined;
+    if (!gatewayInputUsable && !rolloutUsage) return undefined;
 
-    const outputAfter = gatewayUsable ? aggregate.output?.after : rolloutUsage?.output_tokens;
-    const inputBefore = gatewayUsable ? aggregate.input?.before : rolloutUsage?.input_tokens;
-    const inputAfter = gatewayUsable ? aggregate.input?.after : undefined;
+    const outputAfter = gatewayOutputUsable ? aggregate.output?.after : rolloutUsage?.output_tokens;
+    const rolloutOutputUsed = !gatewayOutputUsable && typeof rolloutUsage?.output_tokens === "number";
+    const inputBefore = gatewayInputUsable ? aggregate.input?.before : rolloutUsage?.input_tokens;
+    const inputAfter = gatewayInputUsable ? aggregate.input?.after : undefined;
     const hookShaped = shapingOutcome === "shape" || shapingOutcome === "shape-basic";
     const gatewayShaped = (aggregate?.shapedCallCount ?? 0) > 0;
     const shapingActive = hookShaped || gatewayShaped;
@@ -441,15 +454,22 @@ export async function settleCodexStop(
       ...(inputReduced ? { input_after: inputAfter } : {}),
       ...(typeof outputAfter === "number" ? { output_after: outputAfter } : {}),
       token_source: {
-        input: { source: gatewayUsable && gatewayInputUsesEstimate ? "local-estimate" : "provider-reported" },
-        output: { source: "provider-reported" }
+        input: { source: gatewayInputUsable && gatewayInputUsesEstimate ? "local-estimate" : "provider-reported" },
+        output: typeof outputAfter === "number"
+          ? { source: "provider-reported" }
+          : {
+              source: "unavailable",
+              unavailable_reason: "no exact Gateway or attributable Codex rollout output usage"
+            }
       },
       ...(shapingActive && (query?.policyVersion ?? hookPolicy)
         ? { policy_used: query?.policyVersion ?? hookPolicy }
         : {}),
       claim_scope: "run-scoped",
-      evidence_level: gatewayUsable
-        ? "exact correlated gateway run"
+      evidence_level: gatewayInputUsable
+        ? rolloutOutputUsed
+          ? "exact correlated gateway input; provider-reported cumulative Codex turn output"
+          : "exact correlated gateway run"
         : "provider-reported cumulative Codex turn usage",
       approval_status: "not-required",
       recovery: { original_retained: false },
@@ -457,7 +477,7 @@ export async function settleCodexStop(
       activity_kind: "codex-stop",
       recorded_at: stoppedAt,
       run_started_at: run.started_at,
-      measurement_source: gatewayUsable ? "gateway-run" : "codex-rollout",
+      measurement_source: gatewayInputUsable ? "gateway-run" : "codex-rollout",
       ...(shapingActive ? { output_shaping_state: "active" } : {}),
       ...(estimate?.calibrated === true && estimate.tokensSaved && estimate.basis === "measured"
         ? {
@@ -480,7 +500,7 @@ export async function settleCodexStop(
     // The immutable pending event now carries all shaping provenance needed for retry.
     await invalidateShapingTurnRecord(scope, env);
     if (!existing.readable) return undefined;
-    return persistFrozen(frozen.event);
+    return persistFrozen(frozen.event, query);
   } catch {
     return undefined;
   } finally {

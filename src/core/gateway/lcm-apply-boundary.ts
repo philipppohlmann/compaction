@@ -10,17 +10,10 @@
  * candidate-source TYPES the engine slice implements. Read it as a second, still-wired rail, not as
  * the thing that keeps LCM apply off.
  *
- * Class qualification is the first gate. Before anything else (before any engine import, generation,
- * or retention) a class must qualify by EITHER of two independent rails:
- *  - the qualified-class registry (`lcm-qualified-classes.ts`), whose activation whitelist is empty,
- *    so it qualifies nothing; adding an entry requires an evidence-backed promotion plus a reviewed
- *    activation change in that file; or
- *  - the hybrid activation (`hybrid-apply-activation.ts`), which qualifies ANY non-global class while
- *    `COMPACTION_HYBRID_APPLY=1|true`. Dormant by default, opt-in only, and it does NOT consult the
- *    registry.
- * So `shadow-only` is the default outcome, not a structural one: an operator env var reaches gates
- * 2-7 without touching the registry. Those gates are the per-request safety net and are unchanged by
- * either rail.
+ * Class qualification is the first gate. Before any engine import, generation, or retention, a class
+ * must qualify through the private policy or the independent Hybrid activation. Hybrid applies to a
+ * non-global class while `COMPACTION_HYBRID_APPLY=1|true`; it does not depend on the private policy.
+ * `shadow-only` remains the default outcome, while either rail uses the same per-request safety gates.
  *
  * For a qualified class, the boundary enforces the same fail-closed gate discipline as
  * the deterministic engine (`apply-eligibility.ts`): active narrow stored authorization, exact scope
@@ -48,9 +41,8 @@ import {
 } from "../lcm-evidence-contract.js";
 import { REJECTED_GLOBAL_TOOL_VALUES, type PolicyPreference } from "../policy-preferences.js";
 import { AUTO_APPLY_TOOL_ENDPOINT_FAMILIES } from "./apply-eligibility.js";
-import { PRIVATE_ENGINE_TREE, isModuleTreeAbsentError } from "../module-absence.js";
+import { PRIVATE_ENGINE_TREE, isModuleAbsentError, isModuleTreeAbsentError } from "../module-absence.js";
 import { DEDUPE_POLICY } from "./request-shape.js";
-import { isClassQualifiedForLcmApply } from "./lcm-qualified-classes.js";
 import { isHybridApplyActivated } from "./hybrid-apply-activation.js";
 
 /** Bounded generation budget: a candidate still pending after this is abandoned fail-open. */
@@ -142,6 +134,11 @@ export interface GatewayLcmApplyCandidateOutcome {
 }
 export type GatewayLcmApplyCandidateSource = (endpoint: string, bodyText: string) => Promise<GatewayLcmApplyCandidateOutcome>;
 
+/** Public contract for the optional private class-qualification module. */
+export interface LcmClassQualifierContract {
+  isClassQualifiedForLcmApply(workflowClass: string, cwd?: string): boolean;
+}
+
 export interface LcmApplyBoundaryParams {
   endpoint: string;
   /** The original request body text. Read by the engine only; never logged or recorded here. */
@@ -162,9 +159,8 @@ export interface LcmApplyBoundaryParams {
   /** Engine seam override (tests). Default: lazy dynamic import of the engine source. */
   candidateSource?: GatewayLcmApplyCandidateSource;
   /**
-   * Test-only qualification stub, used to exercise the qualified-class gates that the real registry
-   * keeps unreachable. Production callers must omit this: the default is the real
-   * `isClassQualifiedForLcmApply`, which is false for every class today.
+   * Test-only qualification stub used to exercise the qualified path. Production callers omit this
+   * so the private qualification policy is used when present.
    */
   syntheticQualificationForTests?: (workflowClass: string, cwd: string) => boolean;
 }
@@ -211,10 +207,25 @@ function endpointMatchesTool(endpoint: string, tool: string): boolean {
   return suffixes.some((suffix) => path.endsWith(suffix));
 }
 
+/** The optional private qualifier, loaded lazily so its absence cannot brick the public CLI. */
+const LCM_QUALIFIER_SPECIFIER = "./lcm-qualified-classes.js";
+
+async function loadLcmClassQualifier(): Promise<LcmClassQualifierContract["isClassQualifiedForLcmApply"] | undefined> {
+  try {
+    const mod = (await import(LCM_QUALIFIER_SPECIFIER)) as Partial<LcmClassQualifierContract>;
+    if (typeof mod.isClassQualifiedForLcmApply !== "function") {
+      throw new TypeError("LCM class-qualification module does not satisfy its public contract");
+    }
+    return mod.isClassQualifiedForLcmApply;
+  } catch (error) {
+    if (!isModuleAbsentError(error, { specifier: LCM_QUALIFIER_SPECIFIER, importerUrl: import.meta.url })) throw error;
+    return undefined;
+  }
+}
+
 /**
  * Lazily load the engine's default apply-candidate source via dynamic `import()` only. This call is
- * the single place this module touches the engine, and it is reached only past gate 1 — so never
- * from the registry rail while its whitelist is empty, but reachable on the hybrid rail.
+ * the single place this module touches the engine, and it is reached only past gate 1.
  */
 const ENGINE_APPLY_CANDIDATE_SOURCE_MODULE = "../../engine/lcm/gateway-apply-candidate-source.js";
 
@@ -297,16 +308,17 @@ async function evaluateBoundary(params: LcmApplyBoundaryParams): Promise<LcmAppl
   const cwd = params.cwd ?? process.cwd();
   const workflowClass = params.workflowClass?.trim() ?? "";
 
-  // Gate 1, class qualification, first. A class qualifies via either the research-grade promotion
-  // registry (fortress; dormant by construction) or the explicit hybrid activation (any
-  // non-global class while activated). Gates 2-7 below are the unchanged per-request safety net.
-  // A test stub, when provided, is the sole qualifier (keeps fortress tests deterministic).
-  const qualifiedByRegistry = (params.syntheticQualificationForTests ?? isClassQualifiedForLcmApply)(workflowClass, cwd);
+  // Gate 1, class qualification, first. A class qualifies through either the private policy or the
+  // explicit Hybrid activation. A test stub, when provided, is the sole qualifier.
+  const privateQualifier =
+    params.syntheticQualificationForTests === undefined ? await loadLcmClassQualifier() : undefined;
+  const qualifiedByPrivatePolicy =
+    params.syntheticQualificationForTests?.(workflowClass, cwd) ?? privateQualifier?.(workflowClass, cwd) ?? false;
   const qualifiedByHybrid =
     params.syntheticQualificationForTests === undefined &&
     isHybridApplyActivated() &&
     !REJECTED_GLOBAL_TOOL_VALUES.includes(workflowClass.toLowerCase());
-  if (workflowClass === "" || !(qualifiedByRegistry || qualifiedByHybrid)) {
+  if (workflowClass === "" || !(qualifiedByPrivatePolicy || qualifiedByHybrid)) {
     return shadowOnly(params.workflowClass);
   }
   const gateResults = allFailGates();

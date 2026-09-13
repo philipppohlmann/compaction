@@ -65,15 +65,18 @@ interface MountOpts {
   /** `null` = mount WITHOUT a waitlist handoff (Pro must then not be offered). */
   onOpenWaitlist?: OnboardingAppProps["onOpenWaitlist"] | null;
   signedIn?: boolean;
+  communityAuthorized?: boolean;
   hookDisclosure?: OnboardingAppProps["hookDisclosure"];
   readyStatusFor?: OnboardingAppProps["readyStatusFor"];
   readyMetric?: OnboardingAppProps["readyMetric"];
+  readyRouting?: OnboardingAppProps["readyRouting"];
   onDone?: (r: OnboardingResult) => void;
 }
 function mount(opts: MountOpts = {}) {
   const props: OnboardingAppProps = {
     version: "9.9.9",
     detection: opts.detection ?? foundDetection,
+    ...(opts.readyRouting ? { readyRouting: opts.readyRouting } : {}),
     readyMetric: opts.readyMetric ?? NO_DATA_METRIC,
     readyStatusFor: opts.readyStatusFor ?? (async () => HEALTHY_STATUS),
     onEnable: opts.onEnable ?? (async () => ({ connected: ["claude-code"], failed: [] })),
@@ -94,12 +97,25 @@ function mount(opts: MountOpts = {}) {
       ? {}
       : { onOpenWaitlist: opts.onOpenWaitlist ?? (async () => "https://example.test/waitlist?plan=pro") }),
     signedIn: opts.signedIn ?? false,
+    communityAuthorized: opts.communityAuthorized ?? false,
     ...(opts.hookDisclosure ? { hookDisclosure: opts.hookDisclosure } : {}),
     onDone: opts.onDone ?? (() => {})
   };
   const inst = render(React.createElement(App, props));
   mounted.push(inst);
   return inst;
+}
+
+/** Page-1 multi-select helper: all found tools begin selected; keep exactly one, then continue. */
+async function selectOnly(a: ReturnType<typeof mount>, target: ReadyToolKey): Promise<void> {
+  const order: ReadyToolKey[] = ["claude-code", "codex", "cursor"];
+  for (const [index, key] of order.entries()) {
+    if (key !== target) a.stdin.write(" ");
+    if (index < order.length - 1) a.stdin.write("\u001b[B");
+    await settle(20);
+  }
+  a.stdin.write("\r");
+  await settle();
 }
 
 describe("OnboardingTui <App> - production flow wired to the real backend", () => {
@@ -114,16 +130,142 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     expect(frame).toContain("D E V");
     // The version line uses the real injected version, not a hardcoded one.
     expect(frame).toContain("v9.9.9 compaction: context optimization for AI agents.");
-    expect(frame).toContain("Choose the workflow you want to connect.");
-    expect(frame).toContain("Discovery is read-only. Enabling a workflow is the first write.");
+    expect(frame).toContain("Choose the workflows you want to connect.");
+    expect(frame).toContain("All detected tools are selected by default");
     expect(frame).toContain("Claude Code");
     expect(frame).toContain("Codex CLI");
     expect(frame).toContain("Cursor");
+    expect(frame.match(/\[x\]/g)).toHaveLength(3);
+    expect(frame).toContain("Space select/deselect");
+    expect(frame).not.toMatch(/\b1\. Claude Code|1\/2\/3 · Enter continue/);
     // Rendering discovery/target writes nothing.
     expect(onEnable).not.toHaveBeenCalled();
     // No overclaim on the first screen.
     expect(frame).not.toMatch(/-?\d+%/);
     expect(frame).not.toMatch(/billing-confirmed|cost saved|\$/i);
+  });
+
+  it("preselects every detected tool and enables the selected found set only after explicit confirmation", async () => {
+    const onEnable = vi.fn(async (keys: ReadyToolKey[]): Promise<EnableResult> => ({ connected: keys, failed: [] }));
+    const a = mount({ onEnable, onCommunityAuth: null });
+    await settle();
+    a.stdin.write("\r"); // selected set → mode
+    await settle();
+    a.stdin.write("\r"); // mode → plan
+    await settle();
+    a.stdin.write("\r"); // plan → review
+    await settle();
+    expect(onEnable).not.toHaveBeenCalled();
+    expect(a.lastFrame() ?? "").toContain("Enable Compaction for the selected tools?");
+    a.stdin.write("\r"); // explicit confirmation = first write
+    await settle();
+    expect(onEnable).toHaveBeenCalledTimes(1);
+    expect(onEnable).toHaveBeenCalledWith(["claude-code", "codex", "cursor"]);
+    const ready = a.lastFrame() ?? "";
+    for (const tool of ["Claude Code", "Codex", "Cursor"]) expect(ready).toContain(`✓ ${tool}`);
+  });
+
+  it("counts selected ready tools without reinstalling and discloses preference writes before confirmation", async () => {
+    const onEnable = vi.fn(async (): Promise<EnableResult> => ({ connected: [], failed: [] }));
+    const onPersistMode = vi.fn(async (): Promise<void> => {});
+    const onPersistPlan = vi.fn(async (): Promise<"basic"> => "basic");
+    const a = mount({
+      detection: { claude: { detected: true, sessionCount: 1, hookReady: true }, codex: "active", cursor: "active" },
+      onEnable,
+      onPersistMode,
+      onPersistPlan,
+      onCommunityAuth: null
+    });
+    await settle();
+    for (const key of ["\r", "\r", "\r"]) {
+      a.stdin.write(key);
+      await settle();
+    }
+    expect(onEnable).not.toHaveBeenCalled();
+    expect(onPersistMode).not.toHaveBeenCalled();
+    expect(onPersistPlan).not.toHaveBeenCalled();
+    const review = plain(a.lastFrame());
+    expect(review).toContain("Confirm settings for the selected ready tools?");
+    expect(review).toContain('remember "Output only" as the device-wide preference for future runs');
+    expect(review).toContain("set your mode to basic shaping");
+    expect(review).toContain("No launcher or hook bundle will be reinstalled");
+    a.stdin.write("\r");
+    await settle();
+    expect(onEnable).not.toHaveBeenCalled();
+    expect(onPersistMode).toHaveBeenCalledWith("cache-optimize", ["claude-code", "codex", "cursor"]);
+    expect(onPersistPlan).toHaveBeenCalledWith("open");
+    const ready = a.lastFrame() ?? "";
+    for (const tool of ["Claude Code", "Codex", "Cursor"]) expect(ready).toContain(`✓ ${tool}`);
+  });
+
+  it("ready-only Full + Cursor discloses the device-wide preference and Cursor's Output-only effective mode", async () => {
+    const onEnable = vi.fn(async (): Promise<EnableResult> => ({ connected: [], failed: [] }));
+    const onPersistMode = vi.fn(async (): Promise<void> => {});
+    const a = mount({
+      detection: { claude: { detected: false, sessionCount: 0 }, codex: "active", cursor: "active" },
+      onEnable,
+      onPersistMode,
+      onCommunityAuth: null
+    });
+    await settle();
+    a.stdin.write("\r"); // selected ready Codex + Cursor → mode
+    await settle();
+    a.stdin.write("2"); // Full
+    await settle(40);
+    a.stdin.write("\r"); // → plan
+    await settle();
+    a.stdin.write("\r"); // → review
+    await settle();
+    const review = plain(a.lastFrame());
+    expect(review).toContain('remember "Full optimization" as the device-wide preference for future runs');
+    expect(review).toContain('Full optimization applies only where supported; Cursor remains "Output only"');
+    expect(onEnable).not.toHaveBeenCalled();
+    expect(onPersistMode).not.toHaveBeenCalled();
+    a.stdin.write("\r");
+    await settle();
+    expect(onEnable).not.toHaveBeenCalled();
+    expect(onPersistMode).toHaveBeenCalledWith("cache-context-optimize", ["codex", "cursor"]);
+  });
+
+  it("respects deselection: a detected found tool is neither enabled nor listed ready", async () => {
+    const onEnable = vi.fn(async (keys: ReadyToolKey[]): Promise<EnableResult> => ({ connected: keys, failed: [] }));
+    const a = mount({ onEnable, onCommunityAuth: null });
+    await settle();
+    a.stdin.write("\u001b[B"); // Codex row
+    await settle(20);
+    a.stdin.write(" "); // deselect Codex
+    a.stdin.write("\r");
+    await settle();
+    for (const key of ["\r", "\r", "\r"]) {
+      a.stdin.write(key);
+      await settle();
+    }
+    expect(onEnable).toHaveBeenCalledWith(["claude-code", "cursor"]);
+    const ready = a.lastFrame() ?? "";
+    expect(ready).toContain("✓ Claude Code");
+    expect(ready).toContain("✓ Cursor");
+    expect(ready).not.toContain("✓ Codex");
+    expect(ready).toContain("Codex CLI");
+    expect(plain(ready)).toContain("remain untouched until you connect them by name");
+  });
+
+  it("an empty selection stays read-only and cannot advance to confirmation", async () => {
+    const onEnable = vi.fn(async (): Promise<EnableResult> => ({ connected: [], failed: [] }));
+    const onPersistMode = vi.fn(async (): Promise<void> => {});
+    const onPersistPlan = vi.fn(async (): Promise<"basic"> => "basic");
+    const a = mount({ onEnable, onPersistMode, onPersistPlan });
+    await settle();
+    for (let index = 0; index < 3; index += 1) {
+      a.stdin.write(" ");
+      if (index < 2) a.stdin.write("\u001b[B");
+      await settle(20);
+    }
+    a.stdin.write("\r");
+    await settle();
+    expect(a.lastFrame() ?? "").toContain("Choose the workflows you want to connect.");
+    expect(onEnable).not.toHaveBeenCalled();
+    expect(onPersistMode).not.toHaveBeenCalled();
+    expect(onPersistPlan).not.toHaveBeenCalled();
   });
 
   it("Claude path: target → mode → review → (real onEnable + onPersistMode) → ready; onEnable called ONCE", async () => {
@@ -133,9 +275,8 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     const a = mount({ onEnable, onPersistMode, onDone: (r) => (done = r) });
     await settle();
 
-    // Target: Claude Code is row 1; Enter → mode screen.
-    a.stdin.write("\r");
-    await settle();
+    // Keep only Claude Code selected, then continue to the mode screen.
+    await selectOnly(a, "claude-code");
     expect(a.lastFrame() ?? "").toContain("Choose how Compaction should optimize Claude Code.");
     expect(onEnable).not.toHaveBeenCalled(); // navigating target/mode wrote nothing
 
@@ -189,8 +330,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
   it("METRICS HONESTY: at first install the ready screen shows the unavailable-until-measured state, never a fake number", async () => {
     const a = mount({ readyMetric: NO_DATA_METRIC });
     await settle();
-    a.stdin.write("\r"); // target → mode
-    await settle();
+    await selectOnly(a, "claude-code");
     a.stdin.write("\r"); // mode → plan
     await settle();
     a.stdin.write("\r"); // plan (Open, default) → review
@@ -239,6 +379,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
       onEnable: async (): Promise<EnableResult> => ({ connected: ["codex"], failed: [], shapingHooksInstalled })
     });
     await settle();
+    await selectOnly(a, "codex");
     for (const key of ["\r", "\r", "\r", "\r"]) {
       a.stdin.write(key);
       await settle();
@@ -262,12 +403,42 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     expect(ready).not.toContain("attached before generation");
   });
 
+  it("fresh Codex hooks configured on disk remain distinct from native-active across both Ready sections", async () => {
+    const a = mount({
+      readyRouting: {
+        matrix: [],
+        providerCaps: [],
+        routeCommands: { codex: "compaction gateway run -- codex" },
+        codexShapingState: "not-installed"
+      },
+      onEnable: async (): Promise<EnableResult> => ({
+        connected: ["codex"],
+        failed: [],
+        shapingHooksInstalled: [],
+        codexShapingState: "configured"
+      })
+    });
+    await settle();
+    await selectOnly(a, "codex");
+    for (const key of ["\r", "\r", "\r", "\r"]) {
+      a.stdin.write(key);
+      await settle();
+    }
+    const ready = plain(a.lastFrame());
+    expect(ready).toContain("output shaping is configured for Codex");
+    expect(ready).toContain("hooks are configured on disk");
+    expect(ready).toContain("depends on its one-time hook approval");
+    expect(ready).toContain("do not need reinstalling");
+    expect(ready).not.toContain("NOT confirmed on disk");
+    expect(ready).not.toContain("Install or retry them");
+    expect(ready).not.toContain("a concise-response instruction is attached before generation");
+  });
+
   it("Full optimization maps to the existing cache-context-optimize key (input side gated on an API key)", async () => {
     const onPersistMode = vi.fn(async (_m: OptimizationModeKey): Promise<void> => {});
     const a = mount({ onPersistMode });
     await settle();
-    a.stdin.write("\r"); // target → mode
-    await settle();
+    await selectOnly(a, "claude-code");
     a.stdin.write("2"); // choose "Full optimization"
     await settle(40);
     a.stdin.write("\r"); // → plan
@@ -290,9 +461,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     const onEnable = vi.fn(async (): Promise<EnableResult> => ({ connected: [], failed: [] }));
     const a = mount({ onEnable });
     await settle();
-    // Move to Cursor (row 3) and select it.
-    a.stdin.write("3");
-    await settle();
+    await selectOnly(a, "cursor");
     const limited = a.lastFrame() ?? "";
     expect(limited).toContain("Cursor");
     expect(limited).toContain("session-level instruction");
@@ -307,8 +476,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
   it("Cursor path: limited → plan (mode picker SKIPPED: Cursor has one mode, so a picker would be a fake choice)", async () => {
     const a = mount();
     await settle();
-    a.stdin.write("3"); // Cursor
-    await settle();
+    await selectOnly(a, "cursor");
     a.stdin.write("\r"); // continue
     await settle();
     const next = a.lastFrame() ?? "";
@@ -319,8 +487,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
   it("Cursor path: back from plan returns to `limited` (the forward step stays reachable, not one-way)", async () => {
     const a = mount();
     await settle();
-    a.stdin.write("3"); // Cursor
-    await settle();
+    await selectOnly(a, "cursor");
     a.stdin.write("\r"); // limited → plan
     await settle();
     a.stdin.write(""); // Esc → back
@@ -330,7 +497,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     // And back again reaches the workflow list, so nothing is stranded.
     a.stdin.write("");
     await settle();
-    expect(a.lastFrame() ?? "").toContain("Choose the workflow you want to connect.");
+    expect(a.lastFrame() ?? "").toContain("Choose the workflows you want to connect.");
   });
 
   it("Cursor path: completes through review → enable → ready (a supported target can finish setup)", async () => {
@@ -338,8 +505,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     let done: OnboardingResult | null = null;
     const a = mount({ onEnable, onDone: (r) => (done = r), onCommunityAuth: null });
     await settle();
-    a.stdin.write("3"); // Cursor
-    await settle();
+    await selectOnly(a, "cursor");
     a.stdin.write("\r"); // limited → plan
     await settle();
     a.stdin.write("\r"); // plan (Open) → review
@@ -361,8 +527,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
   it("Codex limited screen names the API-key path for full optimization (subscription = output shaping only)", async () => {
     const a = mount();
     await settle();
-    a.stdin.write("2"); // Codex
-    await settle();
+    await selectOnly(a, "codex");
     const limited = a.lastFrame() ?? "";
     expect(limited).toContain("Codex CLI");
     expect(limited).toContain("ChatGPT plan or an OpenAI API key");
@@ -381,8 +546,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     const onEnable = vi.fn(async (_keys: ReadyToolKey[]): Promise<EnableResult> => ({ connected: ["codex"], failed: [] }));
     const a = mount({ onEnable, onCommunityAuth: null });
     await settle();
-    a.stdin.write("2"); // Codex
-    await settle();
+    await selectOnly(a, "codex");
     a.stdin.write("\r"); // limited → mode
     await settle();
     const mode = a.lastFrame() ?? "";
@@ -421,14 +585,13 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
               backupPath: "/tmp/fake-home/.codex/hooks.json.compaction.bak",
               entries: [
                 { event: "UserPromptSubmit", command: "compaction hooks shape codex", effect: "attaches a concise-response instruction to what the model sees, before generation" },
-                { event: "Stop", command: "compaction hooks line codex", effect: "returns the content-free per-turn receipt line as `systemMessage` after each turn" }
+                { event: "Stop", command: "compaction hooks line codex", effect: "returns settled content-free receipt evidence as `systemMessage` when recorded" }
               ]
             }
           : undefined
     });
     await settle();
-    a.stdin.write("2"); // Codex
-    await settle();
+    await selectOnly(a, "codex");
     a.stdin.write("\r"); // → mode
     await settle();
     a.stdin.write("\r"); // → plan
@@ -447,8 +610,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
   it("review says NO hook config will be written when shaping is switched off (no disclosure injected)", async () => {
     const a = mount(); // no hookDisclosure → init.ts would inject none when `compaction stop` is set
     await settle();
-    a.stdin.write("3"); // Cursor
-    await settle();
+    await selectOnly(a, "cursor");
     a.stdin.write("\r"); // → plan
     await settle();
     a.stdin.write("\r"); // → review
@@ -458,26 +620,48 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     expect(review).not.toContain("hooks.json");
   });
 
-  it("Cursor review states the mode as THE default, not a choice the user made (there is no picker)", async () => {
+  it("Cursor review states its effective supported mode without inventing a choice", async () => {
     const a = mount();
     await settle();
-    a.stdin.write("3"); // Cursor
-    await settle();
+    await selectOnly(a, "cursor");
     a.stdin.write("\r"); // → plan
     await settle();
     a.stdin.write("\r"); // → review
     await settle();
     const review = a.lastFrame() ?? "";
-    expect(review).toContain("the only mode available for Cursor");
+    expect(review).toContain('effective mode for Cursor: "Output only"');
+    expect(review).not.toContain("the only mode available for Cursor");
     expect(review).not.toContain("remember \"Output only\" as your default");
+  });
+
+  it("mixed Full + Cursor keeps the shared preference but renders Cursor's effective mode as Output only", async () => {
+    const onPersistMode = vi.fn(async (): Promise<void> => {});
+    const onEnable = vi.fn(async (keys: ReadyToolKey[]): Promise<EnableResult> => ({ connected: keys, failed: [] }));
+    const a = mount({ onEnable, onPersistMode, onCommunityAuth: null });
+    await settle();
+    a.stdin.write("\r"); // all detected selected → mode
+    await settle();
+    a.stdin.write("2"); // shared Full preference
+    await settle(40);
+    a.stdin.write("\r"); // → plan
+    await settle();
+    a.stdin.write("\r"); // → review
+    await settle();
+    const review = plain(a.lastFrame());
+    expect(review).toContain('effective mode for Cursor: "Output only"');
+    expect(review).toContain('device-wide "Full optimization" preference is remembered for future runs');
+    expect(review).toContain("applies only where supported");
+    expect(review).not.toContain('use "Full optimization" as the default for future runs (the only mode available for Cursor)');
+    a.stdin.write("\r");
+    await settle();
+    expect(onPersistMode).toHaveBeenCalledWith("cache-context-optimize", ["claude-code", "codex", "cursor"]);
   });
 
   it("ready names the OTHER detected workflows so automatic shaping is never read as covering them", async () => {
     const onEnable = vi.fn(async (): Promise<EnableResult> => ({ connected: ["cursor"], failed: [] }));
     const a = mount({ onEnable, onCommunityAuth: null });
     await settle();
-    a.stdin.write("3"); // Cursor
-    await settle();
+    await selectOnly(a, "cursor");
     a.stdin.write("\r"); // → plan
     await settle();
     a.stdin.write("\r"); // → review
@@ -488,7 +672,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     expect(ready).toContain("Also detected, not configured:");
     expect(ready).toContain("Claude Code");
     expect(ready).toContain("Codex CLI");
-    expect(ready).toContain("re-run `compaction` to configure another");
+    expect(plain(ready)).toContain("remain untouched until you connect them by name");
   });
 
   /**
@@ -506,8 +690,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
       detection: { claude: { detected: true, sessionCount: 3, hookReady: true }, codex: "found", cursor: "found" }
     });
     await settle();
-    a.stdin.write("3"); // Cursor
-    await settle();
+    await selectOnly(a, "cursor");
     a.stdin.write("\r"); // → plan
     await settle();
     a.stdin.write("\r"); // → review
@@ -532,8 +715,7 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     const onEnable = vi.fn(async (): Promise<EnableResult> => ({ connected: ["cursor"], failed: [] }));
     const a = mount({ onEnable, onPersistMode, onCommunityAuth: null });
     await settle();
-    a.stdin.write("2"); // Codex
-    await settle();
+    await selectOnly(a, "codex");
     a.stdin.write("\r"); // limited → mode
     await settle();
     a.stdin.write("2"); // choose "Full optimization"
@@ -542,14 +724,21 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     await settle();
     a.stdin.write("\u001B"); // Esc → back to the target list
     await settle();
-    a.stdin.write("3"); // Cursor (no mode picker)
+    // Selection is Codex-only and the cursor is on Cursor: add Cursor, remove Codex.
+    a.stdin.write(" ");
+    await settle(20);
+    a.stdin.write("\u001b[A");
+    await settle(20);
+    a.stdin.write(" ");
+    await settle(20);
+    a.stdin.write("\r");
     await settle();
     a.stdin.write("\r"); // limited → plan
     await settle();
     a.stdin.write("\r"); // plan → review
     await settle();
     const review = a.lastFrame() ?? "";
-    expect(review).toContain('use "Output only" as the default');
+    expect(review).toContain('effective mode for Cursor: "Output only"');
     expect(review).not.toContain("Full optimization");
     a.stdin.write("\r"); // enable
     await settle();
@@ -577,10 +766,13 @@ describe("OnboardingTui <App> - production flow wired to the real backend", () =
     };
     const a = mount({ detection });
     await settle();
-    // Try to pick Cursor (row 3), it is not-found, so selection is a no-op (stays on target).
-    a.stdin.write("3");
+    // Move to Cursor and try to select it; not-found is disabled, so the toggle is a no-op.
+    a.stdin.write("\u001b[B");
+    a.stdin.write("\u001b[B");
+    a.stdin.write(" ");
     await settle();
-    expect(a.lastFrame() ?? "").toContain("Choose the workflow you want to connect.");
+    expect(a.lastFrame() ?? "").toContain("Choose the workflows you want to connect.");
+    expect(a.lastFrame() ?? "").toContain("[-] Cursor");
     expect(a.lastFrame() ?? "").toContain("not found");
   });
 
@@ -1289,11 +1481,22 @@ describe("OnboardingTui <App> - plan choice (the 'authorize' step) and Community
     expect(onOpenWaitlist).not.toHaveBeenCalled();
   });
 
-  it("a device that is already signed in is labeled, so a returning user is not sent through the browser again", async () => {
-    const a = await toPlan({ signedIn: true });
+  it("a device that is already signed in is labeled as signed in — not as Community active without a lease", async () => {
+    const a = await toPlan({ signedIn: true, communityAuthorized: false });
     a.stdin.write("2"); // highlight Community
     await settle(40);
-    expect(a.lastFrame() ?? "").toContain("already signed in");
+    const frame = a.lastFrame() ?? "";
+    // Label on the Community row (identity only — no valid lease).
+    expect(frame).toMatch(/Community\s+·\s+free account, 1 device\s+·\s+signed in/);
+    expect(frame).not.toMatch(/Community\s+·\s+free account, 1 device\s+·\s+Community active/);
+  });
+
+  it("a device with a valid Community lease is labeled Community active", async () => {
+    const a = await toPlan({ signedIn: true, communityAuthorized: true });
+    a.stdin.write("2"); // highlight Community
+    await settle(40);
+    const frame = a.lastFrame() ?? "";
+    expect(frame).toMatch(/Community\s+·\s+free account, 1 device\s+·\s+Community active/);
   });
 
   it("the Engine agreement is its own screen on the Community path, and ONLY `a` accepts it", async () => {

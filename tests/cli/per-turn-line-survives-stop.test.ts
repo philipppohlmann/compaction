@@ -9,6 +9,7 @@ import { writeProductMode } from "../../src/core/onboarding-preferences.js";
 import { createUsageMetadata } from "../../src/core/usage-metadata.js";
 import { buildGatewayReceipt, type GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import type { OpenAiUsageBreakdown } from "../../src/core/gateway/openai-usage.js";
+import { sessionCorrelationId } from "../../src/core/gateway/session-correlation.js";
 
 /**
  * THE STATUS LINE MUST NOT LOSE A FINISHED TURN'S EVIDENCE.
@@ -34,7 +35,7 @@ const OTHER_SESSION = "99999999-8888-4777-8666-555544443333";
 const NOW = () => "2026-08-26T17:54:53.240Z";
 
 /** A record-mode receipt: forwarded byte-for-byte, so it carries NO shaping evidence of its own. */
-function recordModeReceipt(): GatewayReceipt {
+function recordModeReceipt(sessionId?: string, env?: NodeJS.ProcessEnv): GatewayReceipt {
   const usage: OpenAiUsageBreakdown = {
     present: true,
     promptInputTokens: 259_985,
@@ -43,7 +44,7 @@ function recordModeReceipt(): GatewayReceipt {
     outputTokens: 1_512,
     model: "claude-opus-5"
   };
-  return buildGatewayReceipt({
+  const built = buildGatewayReceipt({
     provider: "anthropic",
     endpoint: "/v1/messages",
     mode: "record",
@@ -52,6 +53,9 @@ function recordModeReceipt(): GatewayReceipt {
     id: () => "b19dd99b-0c78-4ceb-8ec5-8551ad33eb08",
     now: NOW
   });
+  return sessionId !== undefined && env !== undefined
+    ? { ...built, session_correlation_id: sessionCorrelationId(sessionId, env)! }
+    : built;
 }
 
 /** A `basic`-mode config dir: the product mode the regression was reported on. */
@@ -88,7 +92,7 @@ async function runStopHook(sessionId: string, cwd: string, env: NodeJS.ProcessEn
       hostedConfigured: () => false,
       readStdin: async () => stopPayload(sessionId),
       normalize: async () => ({ usage, messageCount: 5, fingerprint: `fp-${sessionId}` }),
-      readLatestGatewayReceipt: async () => recordModeReceipt(),
+      readLatestGatewayReceipt: async () => recordModeReceipt(sessionId, env),
       printReceiptLine: () => {},
       env
     }
@@ -99,7 +103,7 @@ describe("the per-turn status line across a top-level turn's Stop", () => {
   it("keeps the reduction and the label on the render AFTER Stop", async () => {
     const env = await basicModeEnv();
     const cwd = await mkdtemp(path.join(tmpdir(), "per-turn-cwd-"));
-    const deps = { env, cwd, readReceipt: async () => recordModeReceipt() };
+    const deps = { env, cwd, readReceipt: async () => recordModeReceipt(SESSION, env) };
     await recordShapingOutcome({ tool: "claude-code", sessionId: SESSION }, "shape", env);
 
     const during = await computeStatusLine(statusStdin(SESSION, cwd), deps);
@@ -119,7 +123,7 @@ describe("the per-turn status line across a top-level turn's Stop", () => {
   it("a subagent finishing cannot end the parent turn's evidence", async () => {
     const env = await basicModeEnv();
     const cwd = await mkdtemp(path.join(tmpdir(), "per-turn-sub-"));
-    const deps = { env, cwd, readReceipt: async () => recordModeReceipt() };
+    const deps = { env, cwd, readReceipt: async () => recordModeReceipt(SESSION, env) };
     await recordShapingOutcome({ tool: "claude-code", sessionId: SESSION }, "shape", env);
     const during = await computeStatusLine(statusStdin(SESSION, cwd), deps);
 
@@ -146,7 +150,7 @@ describe("the per-turn status line across a top-level turn's Stop", () => {
   it("one session's Stop leaves a concurrent session's turn alone", async () => {
     const env = await basicModeEnv();
     const cwd = await mkdtemp(path.join(tmpdir(), "per-turn-conc-"));
-    const deps = { env, cwd, readReceipt: async () => recordModeReceipt() };
+    const deps = { env, cwd, readReceipt: async () => recordModeReceipt(OTHER_SESSION, env) };
     await recordShapingOutcome({ tool: "claude-code", sessionId: SESSION }, "shape", env);
     await recordShapingOutcome({ tool: "claude-code", sessionId: OTHER_SESSION }, "shape", env);
 
@@ -158,7 +162,7 @@ describe("the per-turn status line across a top-level turn's Stop", () => {
   it("a turn the gate HELD still draws no arrow, before or after Stop", async () => {
     const env = await basicModeEnv();
     const cwd = await mkdtemp(path.join(tmpdir(), "per-turn-held-"));
-    const deps = { env, cwd, readReceipt: async () => recordModeReceipt() };
+    const deps = { env, cwd, readReceipt: async () => recordModeReceipt(SESSION, env) };
     await recordShapingOutcome({ tool: "claude-code", sessionId: SESSION }, "hold-planning", env);
 
     const during = await computeStatusLine(statusStdin(SESSION, cwd), deps);

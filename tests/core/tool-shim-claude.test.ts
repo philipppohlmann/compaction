@@ -92,7 +92,7 @@ describe("claude routing shim script generation", () => {
     expect(block).not.toContain('ANTHROPIC_BASE_URL="$__base" exec "$__fallback"');
     // Only when nothing resolves does it error honestly.
     expect(block).toContain("no other claude is on PATH");
-    expect(block).toContain("re-run 'compaction init --connect 1'");
+    expect(block).toContain("re-run 'compaction init --connect claude-code'");
     expect(block).toContain("exit 127");
   });
 

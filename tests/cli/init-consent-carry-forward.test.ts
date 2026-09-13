@@ -204,7 +204,7 @@ describe("Finding 1 - the Cache + context consent is carried to activation, neve
     expect(stdout).toContain("There is no command to run");
     // The withdrawal is the ONLY command this block offers - a set-up command here would be the hidden
     // second step the enable screen exists to avoid.
-    expect(stdout).toContain("compaction init --disconnect 2");
+    expect(stdout).toContain("compaction init --disconnect codex");
   });
 });
 

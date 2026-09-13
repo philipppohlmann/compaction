@@ -14,10 +14,11 @@
  *   written leaves the previous install current, verifying, and runnable.
  */
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { writeStoredCredentials } from "../../../src/core/auth/credentials.js";
 import { generateDevSigningKeyPair, signManifest, type DevSigningKeyPair } from "../../../src/core/engine-install/dev-signing.js";
 import {
@@ -34,6 +35,12 @@ import {
 import { canonicalManifestBytes, type EngineReleaseManifest } from "../../../src/core/engine-install/manifest.js";
 import { verifyInstalledArtifact } from "../../../src/core/engine-install/verify.js";
 import { resolveEngine } from "../../../src/core/gateway/engine-ipc/supervisor.js";
+import { recordEngineEulaAcceptance } from "../../../src/core/legal/engine-eula.js";
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return { ...actual, renameSync: vi.fn(actual.renameSync) };
+});
 
 const API_URL = "http://127.0.0.1:9";
 
@@ -45,10 +52,12 @@ beforeEach(() => {
   env = { COMPACTION_CONFIG_DIR: configDir };
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   rmSync(configDir, { recursive: true, force: true });
 });
 
 function login(): void {
+  recordEngineEulaAcceptance(env);
   // Throwaway keypair generated per run — never a literal PEM in source (the committed-secret
   // scanner would rightly flag one, fake or not).
   const throwaway = generateDevSigningKeyPair();
@@ -386,8 +395,8 @@ describe("installEngineRelease", () => {
 
   it("an install that fails AFTER the artifact is written leaves the previous install current and runnable", async () => {
     // The interruption the finding describes: a write fails once the new artifact bytes are already
-    // on disk. Simulated with a real filesystem fault — a leftover DIRECTORY at the pointer's
-    // temp path makes the final pointer write fail. In-place installs left `current` naming a
+    // on disk. Inject a failure at the pointer rename (its temporary path is unique per call).
+    // In-place installs left `current` naming a
     // half-replaced release (previous install no longer verifies ⇒ supervisor `engine-unverified`);
     // with stage-then-promote the previous install is untouched, still verifies, and still runs.
     login();
@@ -397,8 +406,7 @@ describe("installEngineRelease", () => {
     const dev = makeRelease(pair, devArtifact, { version: "3.0.0", channel: "dev" });
     const first = await installEngineRelease({ channel: "dev", env, ops: fakeOps(dev.descriptor, devArtifact) });
 
-    // Block the pointer write (write-then-rename): `<installRoot>/current.tmp` is a directory.
-    mkdirSync(`${enginePointerPath(env)}.tmp`, { recursive: true });
+    vi.mocked(fs.renameSync).mockImplementationOnce(() => { throw new Error("injected pointer publication failure"); });
 
     const stableArtifact = Buffer.from("stable engine");
     const stable = makeRelease(pair, stableArtifact, { version: "3.0.0", channel: "stable" });

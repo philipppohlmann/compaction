@@ -33,8 +33,15 @@
 
 import { engineAvailability } from "../engine-availability.js";
 import { engineEulaAccepted } from "../legal/engine-eula.js";
-import { readLeaseVerdict } from "./lease-store.js";
-import type { ConfigDirEnv } from "../config-dir.js";
+import { compactionConfigDir, type ConfigDirEnv } from "../config-dir.js";
+import { leaseNeedsRenewal, readLeaseVerdict, verifySignedLease } from "./lease-store.js";
+
+/**
+ * Bound for request-time lease recovery on the gateway apply path. A hung entitlement service must
+ * not stall provider traffic for the network stack's full timeout — the current request fails open
+ * to record-only, and the next request can retry.
+ */
+export const REQUEST_TIME_LEASE_RENEW_MS = 2_500;
 
 /** What the device's entitlement lease looks like after the attempt. */
 export type CommunityLeaseState =
@@ -68,9 +75,32 @@ export interface CommunityRuntimeOutcome {
   networkUsed: boolean;
 }
 
-/** The lease verdicts a fresh acquisition can plausibly repair. `lease-valid` is not one of them. */
-function leaseNeedsAcquisition(label: string): boolean {
-  return label !== "lease-valid";
+/**
+ * Server answers that mean Community authorization is GONE for this device — not a blip.
+ * Only these may clear a stored lease. Transient network/HTTP failures must leave existing state
+ * alone: deleting a still-usable lease on a 503 is how a signed-in Community device silently became
+ * Plan: Open / "needs activation" during normal use.
+ */
+function isAuthoritativeLeaseDenial(code: string | undefined): boolean {
+  return code === "not_entitled" || code === "unauthorized" || code === "device_inactive";
+}
+
+/**
+ * Lease-repair in-flight map (config dir → promise). Shared by lease-only callers AND the lease
+ * half of a full repair, so concurrent renews coalesce without making a lease-only caller wait for
+ * an engine download that a full repair may still be running.
+ */
+const inflightLeaseRepairs = new Map<string, Promise<LeaseRepairOutcome>>();
+
+/** Full-repair in-flight map — never returned to a lease-only caller. */
+const inflightFullRepairs = new Map<string, Promise<CommunityRuntimeOutcome>>();
+
+/** Lease half of a repair — enough for request-time recovery without an engine step. */
+interface LeaseRepairOutcome {
+  account: "present" | "absent";
+  lease: CommunityLeaseState;
+  reason?: string;
+  networkUsed: boolean;
 }
 
 /**
@@ -86,146 +116,292 @@ function leaseNeedsAcquisition(label: string): boolean {
  * multi-megabyte engine download running to completion behind a screen that had already moved on.
  * `opts.signal` is now checked between steps AND threaded into every network call underneath, so an
  * abort ends the transfer. A cancelled attempt reports the `cancelled` reason — a user's decision,
- * never dressed up as an unreachable service — and leaves the device exactly as entitled as it was,
- * with ONE deliberate exception: if usage was already handed over to the service and the renewal
- * that reflects it then does not land, the stale lease is removed rather than left promising an
- * allowance the service has already debited (see the note at the lease step).
+ * never dressed up as an unreachable service — and leaves the device exactly as entitled as it was.
+ *
+ * Authoritative server denials (`not_entitled` / `unauthorized` / `device_inactive`) still clear the
+ * lease. Transient renew failures never do: Community activation is persistent from the user's
+ * point of view, and a brief outage must not force them through browser activation again.
+ *
+ * `opts.leaseOnly` skips the engine step — used by request-time recovery so a missing/expired lease
+ * can be repaired without starting a multi-megabyte download on the apply path. Lease-only callers
+ * coalesce on the lease repair only; they never await a concurrent full repair's engine half.
  */
 export async function ensureCommunityRuntime(
   env: ConfigDirEnv = process.env,
   onProgress: (step: "lease" | "engine") => void = () => {},
-  opts: { signal?: AbortSignal } = {}
+  opts: { signal?: AbortSignal; engineIntent?: "automatic" | "explicit"; leaseOnly?: boolean } = {}
 ): Promise<CommunityRuntimeOutcome> {
+  if (opts.leaseOnly) {
+    const leaseOutcome = await ensureCommunityLease(env, onProgress, opts.signal);
+    return {
+      account: leaseOutcome.account,
+      lease: leaseOutcome.lease,
+      engine: "unavailable",
+      ...(leaseOutcome.reason === undefined ? {} : { reason: leaseOutcome.reason }),
+      networkUsed: leaseOutcome.networkUsed
+    };
+  }
+
+  const dirKey = compactionConfigDir(env);
+  const existingFull = inflightFullRepairs.get(dirKey);
+  if (existingFull) return existingFull;
+
+  const run = runFullCommunityRepair(env, onProgress, opts).finally(() => {
+    if (inflightFullRepairs.get(dirKey) === run) inflightFullRepairs.delete(dirKey);
+  });
+  inflightFullRepairs.set(dirKey, run);
+  return run;
+}
+
+async function ensureCommunityLease(
+  env: ConfigDirEnv,
+  onProgress: (step: "lease" | "engine") => void,
+  signal?: AbortSignal
+): Promise<LeaseRepairOutcome> {
+  const dirKey = compactionConfigDir(env);
+  const existing = inflightLeaseRepairs.get(dirKey);
+  if (existing) {
+    // CALLER-LOCAL BOUND. Returning `existing` alone would make a request-time AbortSignal a no-op
+    // whenever gateway start / status already began a hung repair without that signal — the gateway
+    // would stay blocked past REQUEST_TIME_LEASE_RENEW_MS. Race the shared work against THIS caller's
+    // abort; do not cancel the shared repair (other callers may still need it).
+    return signal ? awaitSharedLeaseRepair(existing, signal, env) : existing;
+  }
+
+  const run = runLeaseRepair(env, onProgress, signal).finally(() => {
+    if (inflightLeaseRepairs.get(dirKey) === run) inflightLeaseRepairs.delete(dirKey);
+  });
+  inflightLeaseRepairs.set(dirKey, run);
+  return run;
+}
+
+/**
+ * Wait for a shared lease repair, but let THIS caller leave early when its AbortSignal fires.
+ * The shared promise keeps running — abort here is a wait bound, not a cancellation of others' work.
+ */
+function awaitSharedLeaseRepair(
+  existing: Promise<LeaseRepairOutcome>,
+  signal: AbortSignal,
+  env: ConfigDirEnv
+): Promise<LeaseRepairOutcome> {
+  const abortedOutcome = (): LeaseRepairOutcome => {
+    const stillValid = readLeaseVerdict(env).label === "lease-valid";
+    return {
+      account: "present",
+      lease: stillValid ? "valid" : "unavailable",
+      reason: "cancelled",
+      networkUsed: true
+    };
+  };
+  if (signal.aborted) return Promise.resolve(abortedOutcome());
+
+  return new Promise<LeaseRepairOutcome>((resolve) => {
+    let settled = false;
+    const finish = (outcome: LeaseRepairOutcome): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(outcome);
+    };
+    const onAbort = (): void => finish(abortedOutcome());
+    signal.addEventListener("abort", onAbort, { once: true });
+    existing.then(
+      (outcome) => finish(outcome),
+      () => finish(abortedOutcome())
+    );
+  });
+}
+
+async function runFullCommunityRepair(
+  env: ConfigDirEnv,
+  onProgress: (step: "lease" | "engine") => void,
+  opts: { signal?: AbortSignal; engineIntent?: "automatic" | "explicit" }
+): Promise<CommunityRuntimeOutcome> {
+  const leaseOutcome = await ensureCommunityLease(env, onProgress, opts.signal);
+  if (leaseOutcome.account === "absent") {
+    return {
+      account: "absent",
+      lease: "unavailable",
+      engine: "unavailable",
+      reason: leaseOutcome.reason ?? "no-account",
+      networkUsed: leaseOutcome.networkUsed
+    };
+  }
+  return runEngineRepair(env, onProgress, opts, leaseOutcome);
+}
+
+async function runLeaseRepair(
+  env: ConfigDirEnv,
+  onProgress: (step: "lease" | "engine") => void,
+  signal?: AbortSignal
+): Promise<LeaseRepairOutcome> {
   let networkUsed = false;
-  const signal = opts.signal;
   const cancelled = (): boolean => signal?.aborted === true;
 
-  // The credentials read is dynamic for the import-graph reason above, and it is the ONLY thing that
-  // happens on a device with no account.
   const { readStoredCredentials } = await import("../auth/credentials.js");
   const credentials = readStoredCredentials(env as NodeJS.ProcessEnv);
   if (!credentials) {
-    return { account: "absent", lease: "unavailable", engine: "unavailable", reason: "no-account", networkUsed };
+    return { account: "absent", lease: "unavailable", reason: "no-account", networkUsed };
   }
-  // Cancelled before any network work started: report it as such rather than beginning work the
-  // caller has already told us it no longer wants.
   if (cancelled()) {
-    return { account: "present", lease: "unavailable", engine: "unavailable", reason: "cancelled", networkUsed };
+    const stillValid = readLeaseVerdict(env).label === "lease-valid";
+    return {
+      account: "present",
+      lease: stillValid ? "valid" : "unavailable",
+      reason: "cancelled",
+      networkUsed
+    };
   }
 
-  // ---- Usage reconciliation ----------------------------------------------------------------------
-  //
-  // WHY THIS IS HERE AND NOT IN THE APPLY PATH. The allowance is SERVER-AUTHORITATIVE: a lease carries
-  // `allowance_tokens` already reduced by every debit the service has recorded, and the client adds
-  // only its own UNRECONCILED journal entries on top (`readPeriodConsumption`). Those two halves stay
-  // disjoint, so nothing is ever counted twice — but only if the local half is periodically handed
-  // over. Until it is, the service keeps reissuing the FULL allowance and the ceiling never arrives,
-  // which is how a device could burn through its period and still be told it had 2M left.
-  //
-  // Reconciliation used to be reachable only from `compaction usage reconcile` and `compaction lease`.
-  // Both are implementation vocabulary the journey says a user never has to learn, so in practice the
-  // handover never happened. Doing it here puts it on the paths that already run by themselves.
-  //
-  // IT STILL NEVER GATES THE WORKFLOW, and it is still not a per-turn fetch (offline policy (a)):
-  // this runs once per surface invocation, not once per request, and it never enters
-  // `resolveStoredAuthorizationApply`. A failure is swallowed whole — a device that cannot reach the
-  // service keeps working on exactly the entitlement it already holds.
-  //
-  // BOUNDED AND IDEMPOTENT BY CONSTRUCTION: `reconcileStoredUsage` returns `nothing-to-reconcile`
-  // without touching the network when the watermark is already current, which is the overwhelmingly
-  // common case, and the server deduplicates by `event_id` so a re-send of an already-recorded entry
-  // is counted as `duplicate`, never debited again.
-  //
-  // WHAT COUNTS AS A HANDOVER IS THE WATERMARK MOVING, not the value this call returns. An upload
-  // that commits some chunks and then fails — a dropped connection, an Esc mid-batch — records the
-  // watermark for the entries the service DID accept and only then rethrows, so the partial commit
-  // arrives here as an exception with no result at all. The watermark is the thing that actually
-  // moved, and it is the thing that just made the local half of the ceiling smaller, so it is what
-  // this reads: before, and again after.
-  const watermarkFingerprint = async (): Promise<string> => {
-    try {
-      const { readReconciliationWatermark } = await import("../usage/reconciliation-watermark.js");
-      return JSON.stringify(await readReconciliationWatermark(env));
-    } catch {
-      return ""; // unreadable reads the same both times, so it reports no movement rather than false movement
-    }
-  };
-  const watermarkBefore = await watermarkFingerprint();
+  let usageReconciled = false;
+  let commitReconciliationWatermark: (() => Promise<void>) | undefined;
   try {
-    const { reconcileStoredUsage } = await import("../auth/usage-reconcile-client.js");
-    const result = await reconcileStoredUsage(credentials.api_url, env as ConfigDirEnv & NodeJS.ProcessEnv, new Date(), {
-      ...(signal === undefined ? {} : { signal })
-    });
-    if (result.reconciled) networkUsed = true;
+    const client = await import("../auth/usage-reconcile-client.js");
+    try {
+      const result = await client.reconcileStoredUsage(
+        credentials.api_url,
+        env as ConfigDirEnv & NodeJS.ProcessEnv,
+        new Date(),
+        {
+          ...(signal === undefined ? {} : { signal }),
+          // A reconcile and the replacement lease are one accounting handover. Until a verified
+          // replacement lands, keep these entries in the local half of the ceiling so a transient
+          // lease failure cannot replenish headroom. Explicit reconcile callers keep the default
+          // immediate-watermark behavior.
+          deferWatermark: true
+        }
+      );
+      if (result.reconciled) {
+        usageReconciled = true;
+        networkUsed = true;
+        commitReconciliationWatermark = () =>
+          client.recordReconciliationWatermark(result.summary, env);
+      }
+    } catch (error) {
+      // A partial upload may already have committed server-side. Treat it as a handover that needs
+      // a replacement lease, but leave its watermark deferred so the stale lease remains paired
+      // with the conservative local tally until that replacement verifies.
+      if (error instanceof client.UsageReconcileClientError && error.partial) {
+        usageReconciled = true;
+        networkUsed = true;
+        const partial = error.partial;
+        commitReconciliationWatermark = () =>
+          client.recordReconciliationWatermark(partial, env);
+      }
+    }
   } catch {
-    // Best-effort, deliberately silent. The next invocation retries from the same watermark; a
-    // partially-committed upload already recorded its own watermark before throwing, so the entries
-    // the service DID accept are not charged locally a second time.
+    // Best-effort.
   }
-  const usageReconciled = (await watermarkFingerprint()) !== watermarkBefore;
-  if (usageReconciled) networkUsed = true;
 
-  // ---- Lease ------------------------------------------------------------------------------------
   let lease: CommunityLeaseState;
   let reason: string | undefined;
 
-  // A lease that is merely VALID is not necessarily CURRENT. When usage was just handed over, the
-  // lease on disk still carries the pre-reconciliation allowance, and keeping it would let the
-  // runtime spend an allowance the service has already debited. Re-acquiring is what makes the
-  // server's number the one this device actually enforces — and is what lets the ceiling be observed
-  // by the process that is running right now, since every request re-reads the verdict from disk.
-  if (!usageReconciled && !leaseNeedsAcquisition(readLeaseVerdict(env).label)) {
+  if (!usageReconciled && !leaseNeedsRenewal(env)) {
     lease = "valid";
   } else {
     onProgress("lease");
     networkUsed = true;
+    // Snapshot BEFORE acquire: a near-expiry device must keep this authorization if the candidate
+    // does not verify — writing first made renew itself the silent Open downgrade.
+    const hadValidLease = readLeaseVerdict(env).label === "lease-valid";
     try {
       const { acquireLease, writeStoredLease, LeaseClientError } = await import("../auth/lease-client.js");
+      let acquired;
       try {
-        writeStoredLease(
-          await acquireLease(credentials.api_url, credentials.device_token, {
-            ...(signal === undefined ? {} : { signal })
-          }),
-          env
-        );
+        acquired = await acquireLease(credentials.api_url, credentials.device_token, {
+          ...(signal === undefined ? {} : { signal })
+        });
       } catch (error) {
         throw error instanceof LeaseClientError ? error : new Error(String(error));
       }
-      // RE-READ, do not assume. The service issued it; this build's pinned root decides whether it
-      // counts, and a lease that does not verify must not be reported as one that does.
-      lease = readLeaseVerdict(env).label === "lease-valid" ? "renewed" : "unavailable";
-      if (lease === "unavailable") reason = "lease-unverifiable";
+      // VERIFY BEFORE REPLACE. An unverifiable candidate must not overwrite a still-valid lease
+      // (signing-root rollout, wrong-device/period payload, etc.).
+      if (verifySignedLease(acquired, env).label === "lease-valid") {
+        writeStoredLease(acquired, env);
+        lease = "renewed";
+      } else {
+        reason = "lease-unverifiable";
+        lease = hadValidLease || readLeaseVerdict(env).label === "lease-valid" ? "valid" : "unavailable";
+      }
     } catch (error) {
-      lease = "unavailable";
       reason = typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : "lease-unavailable";
+      if (readLeaseVerdict(env).label === "lease-valid") {
+        lease = "valid";
+      } else {
+        lease = "unavailable";
+      }
     }
 
-    // A HANDOVER WITHOUT A RENEWAL LEAVES THE STALE LEASE UNUSABLE, ON PURPOSE.
-    //
-    // The two halves of the ceiling are disjoint only while each token sits in exactly one of them.
-    // Handing usage over moves it out of the local half — `readPeriodConsumption` stops counting
-    // everything behind the watermark — and into the server's, which the device only sees when a
-    // NEW lease arrives carrying the reduced allowance. If the renewal then does not land, those
-    // tokens are counted nowhere: the lease on disk still promises the pre-handover allowance, and
-    // the journal no longer argues with it. Worse, it does not heal by itself — the next invocation
-    // finds nothing left to reconcile and a lease that still verifies, takes the cheap path, and
-    // leaves the device spending an allowance the service already debited until that lease expires.
-    //
-    // So the lease stops being authoritative. Removing it is not a downgrade dressed up as safety:
-    // it is the same fail-closed direction every other unverifiable authorization takes here, it
-    // costs only full apply until the next surface invocation repairs it automatically, and it is
-    // the only outcome in which no token is spent twice or spent for free.
-    if (lease !== "renewed" && usageReconciled) {
+    if (lease !== "renewed" && isAuthoritativeLeaseDenial(reason)) {
       try {
         const { deleteStoredLease } = await import("../auth/lease-client.js");
         deleteStoredLease(env);
       } catch {
-        // Best-effort: a lease we cannot remove is still gated by the verdict read on every request.
+        // Best-effort.
       }
+      lease = "unavailable";
+    }
+
+    if (lease === "renewed" && commitReconciliationWatermark) {
+      // If this best-effort write fails, the client conservatively counts the entries locally on
+      // top of the new server-net lease until a later reconcile. That may understate headroom; it
+      // can never grant unearned headroom.
+      await commitReconciliationWatermark();
     }
   }
 
-  // ---- Engine -----------------------------------------------------------------------------------
+  return {
+    account: "present",
+    lease,
+    ...(reason === undefined ? {} : { reason }),
+    networkUsed
+  };
+}
+
+async function runEngineRepair(
+  env: ConfigDirEnv,
+  onProgress: (step: "lease" | "engine") => void,
+  opts: { signal?: AbortSignal; engineIntent?: "automatic" | "explicit" },
+  leaseOutcome: LeaseRepairOutcome
+): Promise<CommunityRuntimeOutcome> {
+  let networkUsed = leaseOutcome.networkUsed;
+  let reason = leaseOutcome.reason;
+  const lease = leaseOutcome.lease;
+  const signal = opts.signal;
+  const cancelled = (): boolean => signal?.aborted === true;
+
+  // Managed repairs only stage a coherent pair. The current session retains its selected pair;
+  // a successful download is not evidence that this running session can use the new engine.
+  const { loadExecutingManagedInstallation } = await import("../update/ownership.js");
+  let managed: ReturnType<typeof loadExecutingManagedInstallation>;
+  try {
+    managed = loadExecutingManagedInstallation(env as NodeJS.ProcessEnv);
+  } catch {
+    return { account: "present", lease, engine: "unavailable", reason: reason ?? "managed-state-invalid", networkUsed };
+  }
+  if (managed) {
+    if (cancelled()) return { account: "present", lease, engine: "unavailable", reason: reason ?? "cancelled", networkUsed };
+    if ((await engineAvailability(env as NodeJS.ProcessEnv)) === "present") {
+      return { account: "present", lease, engine: "present", ...(reason ? { reason } : {}), networkUsed };
+    }
+    try {
+      const { stageManagedEngine } = await import("../update/engine-pair.js");
+      const candidate = await stageManagedEngine(managed.root, {
+        env: env as NodeJS.ProcessEnv,
+        signal,
+        intent: opts.engineIntent ?? "automatic",
+        onNetwork: () => {
+          networkUsed = true;
+          onProgress("engine");
+        }
+      });
+      reason ??= candidate.reason ?? (candidate.staged ? "engine-staged-next-session" : "engine-unavailable");
+    } catch {
+      reason ??= "engine-update-deferred";
+    }
+    return { account: "present", lease, engine: "unavailable", reason, networkUsed };
+  }
+
   // Attempted even when the lease step failed. The two are independent: an engine on disk is not an
   // authorization to use it (the lease gate is enforced elsewhere, every request), and leaving the
   // engine missing would just mean a second round trip once the lease is repaired.
@@ -234,23 +410,12 @@ export async function ensureCommunityRuntime(
   if (availability === "present") {
     engine = "present";
   } else if (cancelled()) {
-    // Do NOT start a multi-megabyte download the caller has already abandoned. The engine is simply
-    // still missing, for the honest reason that the attempt was stopped.
     engine = "unavailable";
     reason ??= "cancelled";
   } else if (availability === "unavailable") {
-    // No release root is pinned in this build, so no release could be verified even if one existed.
     engine = "unavailable";
     reason ??= "no-release-root";
   } else if (!engineEulaAccepted(env)) {
-    // THE ACQUISITION IS THE LICENSED ACT, so the licence gate sits exactly here and nowhere earlier.
-    // A user on the Open path never reaches this line and is never asked for anything.
-    //
-    // FAIL CLOSED, AND SAY SO. Every caller of this function is a repair path — the onboarding
-    // stepper, `mode full`, a gateway start — and most of them have no terminal to ask in. Downloading
-    // a separately licensed artifact on a device that has not accepted its terms would be the wrong
-    // way to resolve that, so the engine is simply reported missing with a reason the surfaces can
-    // turn into the one command that fixes it. Nothing is downloaded, and no consent is inferred.
     engine = "unavailable";
     reason ??= "eula-not-accepted";
   } else {
@@ -263,8 +428,6 @@ export async function ensureCommunityRuntime(
         env: env as NodeJS.ProcessEnv,
         ...(signal === undefined ? {} : { signal })
       });
-      // Same rule as the lease: ask the resolver, do not trust the return. An install that cannot be
-      // verified at run time never runs, and must not be reported as an engine that is there.
       engine = (await engineAvailability(env as NodeJS.ProcessEnv)) === "present" ? "installed" : "unavailable";
       if (engine === "unavailable") reason ??= "engine-unverifiable";
     } catch (error) {
@@ -294,6 +457,9 @@ export async function ensureCommunityRuntime(
  * answer that changes without a new client — so they no longer share a sentence.
  */
 export function engineBlockedReason(outcome: CommunityRuntimeOutcome): string {
+  if (outcome.reason === "engine-staged-next-session") {
+    return "a compatible engine is staged for a safe next session; this session keeps its current pair";
+  }
   if (outcome.reason === "no-release-root") {
     return "this build pins no engine release root, so no release can be verified on it";
   }

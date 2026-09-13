@@ -8,12 +8,10 @@ import { captureCursorCommand, captureCursorExport, type CursorCaptureResult } f
 import { gateCursorLiveRun } from "../cursor-live-preflight.js";
 import { readCursorExportFile } from "../cursor-export-read.js";
 import { buildRunFlowTokenReport, formatRunFlowTokenReport } from "../../core/run-flow-report.js";
-import { recordCaptureContentFree, captureTokenSource } from "../../core/capture-record.js";
+import { recordCaptureContentFree, writeCaptureUsageSidecar } from "../../core/capture-record.js";
 import { attachOutputShapingToCommand } from "../../core/output-shaping-attach.js";
 import { OUTPUT_SHAPING_HONESTY_NOTE } from "../../core/output-shaping.js";
-import { buildCaptureUsageSidecar } from "../../core/output-shaping-ab.js";
-import { resolveApiConfig, type ToolName } from "../../core/api-client/index.js";
-import type { UsageMetadata } from "../../core/usage-metadata.js";
+import { resolveApiConfig } from "../../core/api-client/index.js";
 import { hostedConfigured } from "./optimize-hosted.js";
 import { describeTokenMetadata } from "../../core/usage-metadata.js";
 import { captureClaudeCodeCommand, captureClaudeCodeFromHook, captureClaudeCodeFromPromptHook, captureClaudeCodeShapeFromPromptHook, discoverClaudeCodeCommand } from "./capture-claude-code.js";
@@ -122,34 +120,6 @@ function applyOutputShapingFlag(
     policyNames: att.applied.map((a) => a.policy_name),
     ...(att.policyVersion !== undefined ? { policyVersion: att.policyVersion } : {})
   };
-}
-
-/**
- * Write a content-free `capture-usage.json` sidecar next to the capture artifact (operator-side evidence).
- * It carries provider-reported token counts + honest source + (treatment) output-shaping policy names so a
- * later `compaction output-shaping-ab add` can link this run into an A/B arm. NO content is written.
- */
-async function writeCaptureUsageSidecar(
-  outDir: string,
-  tool: ToolName,
-  usage: UsageMetadata,
-  policyNames: string[],
-  policyVersion?: string
-): Promise<string> {
-  const sidecar = buildCaptureUsageSidecar({
-    tool,
-    ...(usage.provider ? { provider: usage.provider } : {}),
-    ...(usage.model ? { model: usage.model } : {}),
-    ...(typeof usage.input_tokens === "number" ? { inputTokens: usage.input_tokens } : {}),
-    ...(typeof usage.output_tokens === "number" ? { outputTokens: usage.output_tokens } : {}),
-    providerReported: usage.provider_reported_tokens === true,
-    tokenSource: captureTokenSource(usage),
-    tokenMetadataStatus: usage.provider_reported_tokens === true ? "present" : "missing",
-    ...(policyNames.length > 0 && policyVersion ? { policyNames, policyVersion } : {})
-  });
-  const sidecarPath = path.join(outDir, "capture-usage.json");
-  await writeFile(sidecarPath, JSON.stringify(sidecar, null, 2), "utf8");
-  return sidecarPath;
 }
 
 interface ClaudeCodeCaptureOptions {

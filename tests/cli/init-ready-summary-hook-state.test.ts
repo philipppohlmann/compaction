@@ -78,14 +78,16 @@ afterEach(() => {
 });
 
 describe("readySummaryBlock resolves the shaping-hook axis itself", () => {
-  it("PRE-INSTALL inputs + hooks now on disk ⇒ the summary states the shaping effect, never 'NOT active'", async () => {
+  it("PRE-INSTALL inputs + hooks now on disk ⇒ configured stays distinct from native-active", async () => {
     writeInstalledCodexHooks();
     const text = (await readySummaryBlock(["codex"], undefined, preInstallRoutingInputs())).join("\n");
     expect(text).toContain("Codex → ✓ Enabled");
     expect(text, "the durable summary re-printed the machine as it was BEFORE the enable").not.toContain(
       "output shaping is NOT active for Codex"
     );
-    expect(text).toContain("a concise-response instruction is attached before generation");
+    expect(text).toContain("output shaping is configured for Codex");
+    expect(text).toContain("depends on its one-time hook approval");
+    expect(text).not.toContain("a concise-response instruction is attached before generation");
   });
 
   it("no hooks on disk ⇒ the same inputs render the honest NOT-active line (it understates, both ways)", async () => {

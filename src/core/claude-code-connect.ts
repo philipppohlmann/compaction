@@ -1,7 +1,7 @@
 /**
  * Connect-once installer for the Claude Code Stop hook (PUBLIC CLI/SDK code, engine-free).
  *
- * `compaction init --connect 1` uses this to ACTUALLY install the consented Stop hook (reusing the
+ * `compaction init --connect claude-code` uses this to ACTUALLY install the consented Stop hook (reusing the
  * same pure `installStopHook` merge that `compaction hooks install` uses) and then VERIFY the write
  * landed by RE-READING the settings file and confirming Compaction's hook entry is present. The
  * connect flow may only claim "connected" when `verified` is true, a failed or unverified install
@@ -12,7 +12,9 @@
  * a malformed settings file is refused (left untouched), not clobbered. Local file I/O only, no
  * network, no new dependency.
  */
+import { realpathSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import {
   CLAUDE_CODE_HOOK_COMMAND,
@@ -24,8 +26,10 @@ import {
   installShapingHook,
   installStatusLine,
   installStopHook,
+  uninstallBeforeCallHook,
   uninstallShapingHook,
   uninstallStatusLine,
+  uninstallStopHook,
   type ClaudeSettings
 } from "./claude-code-hooks.js";
 
@@ -51,6 +55,172 @@ export interface ConnectClaudeCodeResult {
   error?: string;
   /** Present on `dry-run`: the settings that WOULD be written (nothing was written). */
   wouldWrite?: ClaudeSettings;
+}
+
+/* ----------------------------- Project-scope migration (no double firing) ----------------------------- */
+
+/**
+ * Remove Compaction's OWN entries from this directory's PROJECT settings after a user-scope install.
+ *
+ * WHY THIS IS REQUIRED, not cosmetic. Claude Code merges `hooks` ADDITIVELY: every matching entry
+ * from every settings file runs, and a project-scope hook does NOT suppress a user-scope one. So a
+ * user who was connected the old (project-local) way and then connects the new (user) way would run
+ * Compaction's Stop and UserPromptSubmit hooks TWICE per turn — double capture and double shaping.
+ * `statusLine`, by contrast, is a single slot where the highest-precedence definition wins, so the
+ * duplication would be INVISIBLE: one status line rendered, two hooks firing behind it.
+ *
+ * Scope discipline: this touches ONLY the directory it is given — never a scan of the user's other
+ * projects — and removes ONLY entries whose command matches Compaction's exactly. A user's own
+ * status line and every foreign hook are left exactly as they are.
+ */
+/**
+ * Canonical identity for a settings path that may not exist yet.
+ *
+ * `path.resolve` is purely LEXICAL. On macOS `/tmp` is a symlink to `/private/tmp`, so the user path
+ * and the project path can name the SAME FILE and still compare unequal — which is how the
+ * home-equals-cwd guard below silently failed and the migration erased the install it had just
+ * written. Realpath the nearest EXISTING ancestor and re-append the not-yet-created tail, the same
+ * discipline the release key minter uses for its containment check.
+ */
+function canonicalPath(target: string): string {
+  let current = path.resolve(target);
+  const tail: string[] = [];
+  for (let hops = 0; hops < 32; hops += 1) {
+    try {
+      return path.join(realpathSync(current), ...tail);
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(target); // reached the root; nothing to canonicalize
+      tail.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+  return path.resolve(target);
+}
+
+export interface ProjectScopeMigration {
+  /** Files actually rewritten. */
+  cleaned: string[];
+  /** Compaction hook entries removed across those files. */
+  removedHooks: number;
+  /** True when a Compaction-owned project status line was removed. */
+  removedStatusLine: boolean;
+}
+
+export async function migrateProjectScopeClaudeSettings(
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; dryRun?: boolean } = {}
+): Promise<ProjectScopeMigration> {
+  const result: ProjectScopeMigration = { cleaned: [], removedHooks: 0, removedStatusLine: false };
+  // NEVER strip the user-scope file. When the working directory IS the home directory, the "project"
+  // path resolves to the very file the global install just wrote, and cleaning it would erase the
+  // integration the connect had only just established. Compare resolved paths, not the scope label.
+  const userFile = canonicalPath(claudeSettingsPathForScope("user", options));
+  for (const file of claudeProjectSettingsPaths(options.cwd, options.env)) {
+    if (canonicalPath(file) === userFile) continue;
+    let current: { settings: ClaudeSettings; existed: boolean };
+    try {
+      current = await readSettings(file);
+    } catch {
+      continue; // unreadable → leave it alone, exactly as the installers do
+    }
+    if (!current.existed) continue;
+    let settings = current.settings;
+    let removed = 0;
+    let statusLineRemoved = false;
+    try {
+      for (const strip of [uninstallStopHook, uninstallBeforeCallHook, uninstallShapingHook]) {
+        const out = strip(settings);
+        settings = out.settings;
+        removed += out.removedCount;
+      }
+      const sl = uninstallStatusLine(settings);
+      settings = sl.settings;
+      statusLineRemoved = sl.changed;
+    } catch {
+      continue; // malformed → refuse to rewrite rather than clobber
+    }
+    if (removed === 0 && !statusLineRemoved) continue;
+    if (!options.dryRun) await writeSettings(file, settings);
+    result.cleaned.push(file);
+    result.removedHooks += removed;
+    result.removedStatusLine = result.removedStatusLine || statusLineRemoved;
+  }
+  return result;
+}
+
+/* --------------------------------- Settings scope (INSTALL-ONCE) --------------------------------- */
+
+/**
+ * WHERE Claude Code settings live, as ONE decision.
+ *
+ * Compaction is an INSTALL-ONCE product: after a connect, a detected tool stays connected across
+ * future sessions, repositories and working directories until the user explicitly disconnects it.
+ * Claude Code is the only integration that ever violated that. Routing (`~/.compaction/shims`) and
+ * the Codex/Cursor hooks (`~/.codex/hooks.json`) were already user-global; only the Claude
+ * `statusLine`/hooks defaulted to `process.cwd()/.claude/settings.json`, so a new repository, a new
+ * worktree or any arbitrary directory silently had NO integration and `status` reported
+ * `not connected`. The default is therefore USER scope, and project scope is an explicit opt-in.
+ *
+ * Four independent path resolutions used to exist (two in `init.ts`, one in `hooks.ts`, one in
+ * `readiness.ts`) and they disagreed about home resolution. This is the single source of truth.
+ */
+export type ClaudeSettingsScope = "user" | "project" | "project-local";
+
+/** Install-once: user/global is the normal scope. */
+export const DEFAULT_CLAUDE_SETTINGS_SCOPE: ClaudeSettingsScope = "user";
+
+/**
+ * Home for settings resolution. Prefers `env.HOME` and falls back to `homedir()` — the SAME
+ * semantics `core/tool-shim.ts` and the readiness probes already use, so a test with a fake HOME
+ * and the real runtime can never resolve different files.
+ */
+export function claudeSettingsHome(env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnv = (env.HOME ?? "").trim();
+  return fromEnv !== "" ? fromEnv : homedir();
+}
+
+/** The exact settings file a given scope writes to. */
+export function claudeSettingsPathForScope(
+  scope: ClaudeSettingsScope = DEFAULT_CLAUDE_SETTINGS_SCOPE,
+  options: { cwd?: string; env?: NodeJS.ProcessEnv } = {}
+): string {
+  const cwd = options.cwd ?? process.cwd();
+  switch (scope) {
+    case "project":
+      return path.join(cwd, ".claude", "settings.json");
+    case "project-local":
+      return path.join(cwd, ".claude", "settings.local.json");
+    case "user":
+    default:
+      return path.join(claudeSettingsHome(options.env), ".claude", "settings.json");
+  }
+}
+
+/**
+ * Every settings file Claude Code actually reads, in PRECEDENCE ORDER (highest first):
+ * project-local, project, then user. Readiness answers "is Compaction wired anywhere Claude will
+ * see it" across all three, which is why a user-scope install reads as connected from any directory.
+ */
+export function claudeSettingsReadPaths(
+  cwd: string = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env
+): readonly string[] {
+  return [
+    claudeSettingsPathForScope("project-local", { cwd, env }),
+    claudeSettingsPathForScope("project", { cwd, env }),
+    claudeSettingsPathForScope("user", { cwd, env })
+  ];
+}
+
+/** The project-scope files a user-scope install must clean so hooks cannot fire twice (see below). */
+export function claudeProjectSettingsPaths(
+  cwd: string = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env
+): readonly string[] {
+  return [
+    claudeSettingsPathForScope("project", { cwd, env }),
+    claudeSettingsPathForScope("project-local", { cwd, env })
+  ];
 }
 
 async function readSettings(file: string): Promise<{ settings: ClaudeSettings; existed: boolean }> {

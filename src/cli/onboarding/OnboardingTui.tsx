@@ -18,11 +18,16 @@ import {
   onboardingAuthFailureLines,
   onboardingLimitedLines,
   onboardingReviewContent,
+  onboardingPlanReviewLine,
   onboardingUncoveredWorkflowsLine,
   onboardingModeToOptimizationKey,
   findOnboardingTool,
   orderedOnboardingDiscovery,
   deriveDiscovery,
+  initialSelection,
+  toggleSelection,
+  workflowsToEnable,
+  selectedReadyWorkflows,
   buildReadySummaryLines,
   deriveReadyRouting,
   defaultOptimizationMode,
@@ -55,9 +60,9 @@ import { WelcomeHeader, FRAME_MAX, useTerminalSize } from "./WelcomeHeader.js";
 
 /**
  * Production interactive onboarding for `compaction init` (Ink/React). It walks a real user
- * through the reframed flow, pick a detected workflow (target) → choose how Compaction optimizes
- * Claude Code (mode) or see the honest limited state for Codex/Cursor → review the exact real
- * effects → run the REAL installers → an honest ready screen with a REAL measured metric (or the
+ * through the reframed flow, select the detected workflows to connect → choose how Compaction
+ * optimizes them → review the exact real effects → run the REAL installers → an honest ready
+ * screen with a REAL measured metric (or the
  * "unavailable until measured" state).
  *
  * ARCHITECTURE (what keeps this testable + honest):
@@ -132,19 +137,21 @@ function stateColor(state: WorkflowDiscovery["state"]): string {
 }
 
 // ---------------------------------------------------------------------------
-// Target, pick a detected workflow (read-only; writes nothing). Rows come from
+// Target, select detected workflows (read-only; writes nothing). Rows come from
 // the shared discovery model so state (found/ready/not-found) is honest and a
 // not-found workflow can never be selected.
 // ---------------------------------------------------------------------------
 function TargetScreen({
   version,
   discovery,
+  selection,
   cursor,
   maxWidth,
   compact
 }: {
   version: string;
   discovery: WorkflowDiscovery[];
+  selection: ReadonlySet<ReadyToolKey>;
   cursor: number;
   maxWidth: number;
   compact: boolean;
@@ -163,12 +170,13 @@ function TargetScreen({
           const selectable = w.state !== "not-found";
           const stateWord = w.state === "ready" ? "ready" : w.state === "found" ? "detected" : "not found";
           const title = tool?.title ?? w.title;
+          const marker = selectable ? (selection.has(w.key) ? "[x]" : "[ ]") : "[-]";
           return (
             <Box key={w.key} flexDirection="column">
               <Box>
                 <Text color={active ? ACCENT : DIM}>{active ? "› " : "  "}</Text>
                 <Text color={active ? ACCENT : selectable ? "white" : DIM} bold={active}>
-                  {`${i + 1}. ${title}`}
+                  {`${marker} ${title}`}
                 </Text>
                 <Text color={stateColor(w.state)}>{`  · ${stateWord}`}</Text>
                 {tool ? <Text color={DIM}>{`  · ${tool.availabilityTag}`}</Text> : null}
@@ -179,7 +187,7 @@ function TargetScreen({
         })}
       </Box>
       <Box marginTop={1}>
-        <Text color={DIM}>{"↑/↓ move · 1/2/3 · Enter continue · q quit"}</Text>
+        <Text color={DIM}>{"↑/↓ move · Space select/deselect · Enter continue · q quit"}</Text>
       </Box>
     </Box>
   );
@@ -221,12 +229,14 @@ function LimitedScreen({
 // ---------------------------------------------------------------------------
 function ModeScreen({
   target,
+  selectedCount,
   modeIndex,
   modes,
   unavailable
 }: {
   /** The workflow being configured — the header and the auth sub-line are per-tool, never Claude's. */
   target: ReadyToolKey;
+  selectedCount: number;
   modeIndex: number;
   modes: OnboardingModeOption[];
   /** Modes this build cannot deliver — shown as a reason line so they are not silently missing. */
@@ -234,9 +244,16 @@ function ModeScreen({
 }): React.ReactElement {
   return (
     <Box flexDirection="column" paddingLeft={1} paddingTop={1}>
-      <Text color="white" bold>{onboardingModeHeader(target)}</Text>
+      <Text color="white" bold>
+        {selectedCount > 1 ? "Choose how Compaction should optimize the selected tools." : onboardingModeHeader(target)}
+      </Text>
       <Box marginTop={1} flexDirection="column">
-        {onboardingModeSublines(target).map((l) => (
+        {(selectedCount > 1
+          ? [
+              "Your existing tool accounts remain how each tool authenticates.",
+              "Compaction applies this default only where the selected workflow supports it."
+            ]
+          : onboardingModeSublines(target)).map((l) => (
           <Text key={l} color={DIM}>{l}</Text>
         ))}
       </Box>
@@ -296,10 +313,13 @@ function WaitlistScreen({ url }: { url: string }): React.ReactElement {
 function PlanScreen({
   planIndex,
   signedIn,
+  communityAuthorized,
   plans = ONBOARDING_PLAN_OPTIONS
 }: {
   planIndex: number;
   signedIn: boolean;
+  /** Valid Community lease on this device — distinct from mere identity (credentials present). */
+  communityAuthorized: boolean;
   plans?: readonly (typeof ONBOARDING_PLAN_OPTIONS)[number][];
 }): React.ReactElement {
   return (
@@ -320,7 +340,11 @@ function PlanScreen({
                 <Text color={active ? "white" : DIM} bold={active}>{`${i + 1}. ${p.title}`}</Text>
                 <Text color={DIM}>{`  · ${p.summary}`}</Text>
                 {p.recommended ? <Text color="green">{"  (recommended)"}</Text> : null}
-                {p.key === "community" && signedIn ? <Text color="green">{"  · already signed in"}</Text> : null}
+                {p.key === "community" && communityAuthorized ? (
+                  <Text color="green">{"  · Community active"}</Text>
+                ) : p.key === "community" && signedIn ? (
+                  <Text color="green">{"  · signed in"}</Text>
+                ) : null}
               </Box>
               {active
                 ? p.effects.map((e, j) => (
@@ -440,47 +464,76 @@ function LicenseScreen({ url }: { url: string }): React.ReactElement {
 }
 
 function ReviewScreen({
-  target,
+  targets,
+  alreadyReady,
   modeKey,
   plan,
   hooks,
   busy
 }: {
-  target: ReadyToolKey;
+  targets: ReadyToolKey[];
+  alreadyReady: ReadyToolKey[];
   modeKey: "full" | "output";
   plan: OnboardingPlanKey;
   /** The hook config this enable will write (Codex/Cursor), or undefined when none will be written. */
-  hooks?: OnboardingHookDisclosure;
+  hooks: Partial<Record<ReadyToolKey, OnboardingHookDisclosure>>;
   busy: boolean;
 }): React.ReactElement {
   // The chosen plan AND every file this enable writes come from the ONE shared model, so the screen
   // cannot describe a smaller write than the one that follows. Region-splitting is structural (headline
   // / effects / boundaries) rather than index-based, so adding an effect can never silently push a
   // boundary line into the effects list.
-  const content = onboardingReviewContent(target, modeKey, { plan, ...(hooks ? { hooks } : {}) });
+  const content = targets.map((target, index) => ({
+    target,
+    content: onboardingReviewContent(target, modeKey, {
+      ...(index === 0 ? { plan } : {}),
+      ...(hooks[target] ? { hooks: hooks[target] } : {})
+    })
+  }));
+  const readyOnly = targets.length === 0 && alreadyReady.length > 0;
+  const modeTitle = ONBOARDING_MODE_OPTIONS.find((mode) => mode.key === modeKey)?.title ?? "Output only";
   if (busy) {
     return (
       <Box flexDirection="column" paddingLeft={1} paddingTop={1}>
-        <Text color="white" bold>Setting up {findOnboardingTool(target)?.title ?? target}</Text>
+        <Text color="white" bold>Setting up selected tools</Text>
         <Box marginTop={1}><Text color={ACCENT}>Installing the reversible launcher, configuring PATH, verifying…</Text></Box>
       </Box>
     );
   }
   return (
     <Box flexDirection="column" paddingLeft={1} paddingTop={1}>
-      <Text color="white" bold>{content.headline}</Text>
-      <Box marginTop={1} flexDirection="column">
-        {content.bullets.map((l, i) => (
-          <Text key={i} color="white">{l}</Text>
-        ))}
-      </Box>
-      <Box marginTop={1} flexDirection="column">
-        {content.notes.map((l, i) => (
-          <Text key={i} color={DIM}>{l}</Text>
-        ))}
-      </Box>
-      <Box marginTop={1}><Text color={ACCENT}>› Enable Compaction</Text></Box>
-      <Box marginTop={1}><Text color={DIM}>Enter enable · ←/Esc back · q quit</Text></Box>
+      <Text color="white" bold>
+        {readyOnly
+          ? "Confirm settings for the selected ready tools?"
+          : targets.length === 1
+            ? content[0]?.content.headline
+            : "Enable Compaction for the selected tools?"}
+      </Text>
+      {alreadyReady.length > 0 ? (
+        <Box marginTop={1} flexDirection="column">
+          <Text color="green">Already ready (kept as-is; no reinstall):</Text>
+          {alreadyReady.map((key) => <Text key={key} color={DIM}>{`  • ${findOnboardingTool(key)?.title ?? key}`}</Text>)}
+        </Box>
+      ) : null}
+      {readyOnly ? (
+        <Box marginTop={1} flexDirection="column">
+          <Text color="white">{`  • remember "${modeTitle}" as the device-wide preference for future runs`}</Text>
+          {modeKey === "full" && alreadyReady.includes("cursor") ? (
+            <Text color="white">  • Full optimization applies only where supported; Cursor remains "Output only"</Text>
+          ) : null}
+          <Text color="white">{onboardingPlanReviewLine(plan)}</Text>
+          <Text color={DIM}>No launcher or hook bundle will be reinstalled.</Text>
+        </Box>
+      ) : null}
+      {content.map(({ target, content: item }) => (
+        <Box key={target} marginTop={1} flexDirection="column">
+          {targets.length > 1 ? <Text color="white" bold>{findOnboardingTool(target)?.title ?? target}</Text> : null}
+          {item.bullets.map((l, i) => <Text key={`b-${i}`} color="white">{l}</Text>)}
+          {item.notes.map((l, i) => <Text key={`n-${i}`} color={DIM}>{l}</Text>)}
+        </Box>
+      ))}
+      <Box marginTop={1}><Text color={ACCENT}>{readyOnly ? "› Confirm settings" : "› Enable Compaction"}</Text></Box>
+      <Box marginTop={1}><Text color={DIM}>{`Enter ${readyOnly ? "confirm" : "enable"} · ←/Esc back · q quit`}</Text></Box>
     </Box>
   );
 }
@@ -503,7 +556,7 @@ function ReadyScreen({
   fullApplyPendingReason
 }: {
   enabled: ReadyToolKey[];
-  /** The REAL detection rows, so the "one workflow was configured" line names actual other workflows. */
+  /** The REAL detection rows, so the ready screen can name any deliberately unselected workflows. */
   discovery: WorkflowDiscovery[];
   mode: OptimizationModeKey;
   status: OnboardingReadyStatus;
@@ -523,8 +576,7 @@ function ReadyScreen({
 }): React.ReactElement {
   const routing = readyRouting ? deriveReadyRouting(enabled, readyRouting) : undefined;
   const summary = buildReadySummaryLines(enabled, mode, routing);
-  // ONE target was configured. Automatic shaping covers that workflow and no other, so any other
-  // detected workflow is named here rather than left to be inferred from silence.
+  // Any deliberately unselected detected workflow is named rather than left to be inferred from silence.
   const uncovered = enabled.length > 0 ? onboardingUncoveredWorkflowsLine(discovery, enabled) : undefined;
   return (
     <Box flexDirection="column" paddingLeft={1} paddingTop={1}>
@@ -563,7 +615,11 @@ function ReadyScreen({
         <Text color={metric.state === "no-data" ? DIM : ACCENT}>{metric.line}</Text>
       </Box>
       <Box marginTop={1} flexDirection="column">
-        {readyPerTurnLinesForTools(enabled, shapingHooksInstalled).map((l, i) => (
+        {readyPerTurnLinesForTools(
+          enabled,
+          shapingHooksInstalled,
+          readyRouting?.codexShapingState === "configured" ? ["codex"] : []
+        ).map((l, i) => (
           <Text key={i} color={DIM}>{l}</Text>
         ))}
       </Box>
@@ -621,6 +677,12 @@ export interface OnboardingAppProps {
   /** Whether this device is ALREADY signed in (computed by init.ts; a plain boolean, never credentials). */
   signedIn?: boolean;
   /**
+   * Whether this device currently holds a VALID Community lease. Distinct from `signedIn`:
+   * credentials prove identity only; a verified lease proves authorization. The plan screen must
+   * not say "Community active" from identity alone.
+   */
+  communityAuthorized?: boolean;
+  /**
    * The hook-config write enabling `key` will perform, from the REAL installer (init.ts resolves the
    * path and the entry list; this component never derives them). Returning undefined means NO hook
    * config will be written — because the tool has none, or because output shaping is switched off
@@ -644,6 +706,7 @@ export function App({
   onOpenWaitlist,
   fullOptimizationReachable = true,
   signedIn = false,
+  communityAuthorized = false,
   hookDisclosure,
   onDone
 }: OnboardingAppProps): React.ReactElement {
@@ -658,6 +721,9 @@ export function App({
   const firstSelectable = Math.max(0, discovery.findIndex((d) => d.state !== "not-found"));
   const [screen, setScreen] = useState<Screen>("target");
   const [cursor, setCursor] = useState(firstSelectable);
+  const [selection, setSelection] = useState<Set<ReadyToolKey>>(
+    () => initialSelection(discovery) as Set<ReadyToolKey>
+  );
   const [target, setTarget] = useState<ReadyToolKey>(discovery[firstSelectable]?.key ?? "claude-code");
   const [modeIndex, setModeIndex] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -667,6 +733,9 @@ export function App({
   // `finalEnabled` because a hook failure must never un-connect the shim, and equally must never let
   // the ready screen describe a shaping effect that is not wired.
   const [shapingHooksInstalled, setShapingHooksInstalled] = useState<ReadyToolKey[]>([]);
+  const [codexShapingState, setCodexShapingState] = useState<ReadyRoutingInputs["codexShapingState"]>(
+    readyRouting?.codexShapingState
+  );
   const [finalStatus, setFinalStatus] = useState<OnboardingReadyStatus | null>(null);
   const [planIndex, setPlanIndex] = useState(0);
   const [authPhase, setAuthPhase] = useState<AuthPhase>({ kind: "starting" });
@@ -682,6 +751,9 @@ export function App({
   // there computed the Ready status for an empty selection and headlined a real install as "No
   // workflow was enabled". The ref is written synchronously and is correct at every await point.
   const enabledRef = useRef<ReadyToolKey[]>([]);
+  const selectedKeys = discovery.filter((d) => selection.has(d.key)).map((d) => d.key as ReadyToolKey);
+  const enableKeys = workflowsToEnable(selection, discovery) as ReadyToolKey[];
+  const alreadyReadyKeys = selectedReadyWorkflows(selection, discovery) as ReadyToolKey[];
 
   // A plan is offered ONLY when the seam that performs it was injected — a picker must never hold a
   // choice that cannot be carried out. Open needs nothing (it is the floor), Community needs the
@@ -742,19 +814,21 @@ export function App({
   /** Where BACK from the mode screen lands: Claude Code came from the list, others from `limited`. */
   const modeBackScreen = (key: ReadyToolKey): Screen => (key === "claude-code" ? "target" : "limited");
 
-  const pickTarget = (key: ReadyToolKey): void => {
-    const row = discovery.find((d) => d.key === key);
-    if (!row || row.state === "not-found") return; // not-found is never selectable
+  const continueFromSelection = (): void => {
+    if (selectedKeys.length === 0) return;
+    const key = selectedKeys[0] ?? "claude-code";
     setTarget(key);
     // A target with NO mode picker must not inherit a mode the user chose for a different tool. Picking
     // "Full optimization" for Codex, backing out, and then choosing Cursor left `modeIndex` at 1, so the
     // review read `use "Full optimization" as the default … (the only mode available for Cursor)` and
     // the enable persisted `cache-context-optimize` for a `supportsFullOptimization: false` workflow.
     // The mode index belongs to the screen that is shown; a target that skips it gets the default.
-    if (!modeScreenApplies(key)) setModeIndex(0);
+    const anyFullMode = selectedKeys.some(modeScreenApplies);
+    if (!anyFullMode) setModeIndex(0);
     // Claude Code goes straight to its mode picker; Codex/Cursor read the honest per-tool/per-auth
     // summary FIRST (it is a step, not a dead end) and then continue into the same flow.
-    setScreen(key === "claude-code" ? "mode" : "limited");
+    if (selectedKeys.length === 1 && key !== "claude-code") setScreen("limited");
+    else setScreen(anyFullMode ? "mode" : "plan");
   };
 
   /** Compute the REAL verified status and land on the honest end screen. */
@@ -835,13 +909,22 @@ export function App({
     // plan's apply posture. The posture is persisted for BOTH plans before any account step — so a
     // Community user who never finishes the browser confirmation still ends up on the Open floor
     // rather than below it.
-    const result = await onEnable([target]);
-    await onPersistMode(chosenOptimizationKey, result.connected);
+    const result = enableKeys.length > 0
+      ? await onEnable(enableKeys)
+      : { connected: [], failed: [], shapingHooksInstalled: [] };
+    const enabled = [...new Set([...alreadyReadyKeys, ...result.connected])] as ReadyToolKey[];
+    await onPersistMode(chosenOptimizationKey, enabled);
     const persisted = await onPersistPlan(chosenPlan);
-    enabledRef.current = result.connected;
-    setFinalEnabled(result.connected);
+    enabledRef.current = enabled;
+    setFinalEnabled(enabled);
     setFinalFailed(result.failed);
-    setShapingHooksInstalled(result.shapingHooksInstalled ?? []);
+    setShapingHooksInstalled([
+      ...new Set([
+        ...(readyRouting?.shapingHooksInstalled ?? []),
+        ...(result.shapingHooksInstalled ?? [])
+      ])
+    ] as ReadyToolKey[]);
+    setCodexShapingState(result.codexShapingState ?? readyRouting?.codexShapingState);
     setProductMode(persisted);
     if (chosenPlan === "community" && onCommunityAuth) {
       setScreen("auth");
@@ -865,7 +948,7 @@ export function App({
         return;
       }
     }
-    await showReady(result.connected);
+    await showReady(enabled);
   };
 
   /**
@@ -935,14 +1018,11 @@ export function App({
           const next = selectableIndexes[(pos + 1) % selectableIndexes.length];
           return next ?? c;
         });
-      } else if (input >= "1" && input <= String(discovery.length)) {
-        const idx = Number(input) - 1;
-        if (discovery[idx] && discovery[idx].state !== "not-found") {
-          setCursor(idx);
-          pickTarget(discovery[idx].key);
-        }
+      } else if (input === " ") {
+        const keyAtCursor = discovery[cursor]?.key;
+        if (keyAtCursor) setSelection((current) => toggleSelection(current, keyAtCursor, discovery) as Set<ReadyToolKey>);
       } else if (key.return) {
-        pickTarget(discovery[cursor]?.key ?? target);
+        continueFromSelection();
       }
       return;
     }
@@ -1026,13 +1106,26 @@ export function App({
     );
   }
 
-  if (screen === "target") return <TargetScreen version={version} discovery={discovery} cursor={cursor} maxWidth={maxWidth} compact={compactHeader} />;
+  if (screen === "target") return <TargetScreen version={version} discovery={discovery} selection={selection} cursor={cursor} maxWidth={maxWidth} compact={compactHeader} />;
   if (screen === "limited") return <LimitedScreen target={target} fullOptimizationReachable={fullOptimizationReachable} />;
-  if (screen === "mode") return <ModeScreen target={target} modeIndex={Math.min(modeIndex, modes.length - 1)} modes={modes} unavailable={unavailableModes} />;
-  if (screen === "plan") return <PlanScreen planIndex={Math.min(planIndex, plans.length - 1)} signedIn={signedIn} plans={plans} />;
+  if (screen === "mode") return <ModeScreen target={target} selectedCount={selectedKeys.length} modeIndex={Math.min(modeIndex, modes.length - 1)} modes={modes} unavailable={unavailableModes} />;
+  if (screen === "plan") {
+    return (
+      <PlanScreen
+        planIndex={Math.min(planIndex, plans.length - 1)}
+        signedIn={signedIn}
+        communityAuthorized={communityAuthorized}
+        plans={plans}
+      />
+    );
+  }
   if (screen === "review") {
-    const hooks = hookDisclosure?.(target);
-    return <ReviewScreen target={target} modeKey={chosenModeKey} plan={chosenPlan} {...(hooks ? { hooks } : {})} busy={busy} />;
+    const hooks: Partial<Record<ReadyToolKey, OnboardingHookDisclosure>> = {};
+    for (const key of enableKeys) {
+      const disclosure = hookDisclosure?.(key);
+      if (disclosure) hooks[key] = disclosure;
+    }
+    return <ReviewScreen targets={enableKeys} alreadyReady={alreadyReadyKeys} modeKey={chosenModeKey} plan={chosenPlan} hooks={hooks} busy={busy} />;
   }
   if (screen === "license") return <LicenseScreen url={engineEulaUrl()} />;
   if (screen === "auth") return <AuthScreen phase={authPhase} />;
@@ -1044,7 +1137,7 @@ export function App({
       mode={chosenOptimizationKey}
       status={finalStatus ?? { healthy: false, headline: "Setup incomplete", launcher: "unknown", gateway: "unknown", auth: "unknown" }}
       metric={readyMetric}
-      readyRouting={readyRouting ? { ...readyRouting, shapingHooksInstalled } : undefined}
+      readyRouting={readyRouting ? { ...readyRouting, shapingHooksInstalled, codexShapingState } : undefined}
       shapingHooksInstalled={shapingHooksInstalled}
       productMode={productMode}
       communityActive={communityActive}
@@ -1075,6 +1168,8 @@ export async function runOnboardingTui(deps: {
   /** Whether the adaptive engine could actually run (init.ts computes it; default true). */
   fullOptimizationReachable?: boolean;
   signedIn?: boolean;
+  /** Valid Community lease on this device (distinct from signedIn identity). */
+  communityAuthorized?: boolean;
   /** The hook-config write the enable will perform, per target (init.ts resolves it; see the prop). */
   hookDisclosure?: (key: ReadyToolKey) => OnboardingHookDisclosure | undefined;
 }): Promise<OnboardingResult> {
@@ -1097,6 +1192,7 @@ export async function runOnboardingTui(deps: {
         {...(deps.onOpenWaitlist ? { onOpenWaitlist: deps.onOpenWaitlist } : {})}
         fullOptimizationReachable={deps.fullOptimizationReachable ?? true}
         signedIn={deps.signedIn ?? false}
+        communityAuthorized={deps.communityAuthorized ?? false}
         {...(deps.hookDisclosure ? { hookDisclosure: deps.hookDisclosure } : {})}
         onDone={(r) => {
           result = r;

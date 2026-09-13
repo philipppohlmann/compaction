@@ -47,6 +47,7 @@ import { registerSummaryCommand } from "./commands/summary.js";
 import { registerWatchCommand } from "./commands/watch.js";
 import { registerLegacyUpgradeAlias, registerStatusCommand } from "./commands/upgrade-status.js";
 import { registerUsageCommand } from "./commands/usage.js";
+import { registerUpdateCommand } from "./commands/update.js";
 import { redeemPendingConsentsQuietly } from "../core/pending-authorizations.js";
 import { compactMarkFor } from "./terminal-logo.js";
 
@@ -149,6 +150,7 @@ registerSummaryCommand(program);
 registerWatchCommand(program);
 registerStatusCommand(program);
 registerUsageCommand(program);
+registerUpdateCommand(program);
 
 // Clean default `--help` surface (v0.1.2): show ONLY the free, local-first commands
 // that work without the private engine / Compaction API. Everything else (engine-gated,
@@ -163,6 +165,7 @@ const PUBLIC_COMMANDS = new Set([
   "logout",
   "devices",
   "engine",
+  "update",
   "capture",
   "import",
   "analyze",

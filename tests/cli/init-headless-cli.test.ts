@@ -18,7 +18,7 @@
  * - back-compat: `--connect 1` still installs + verifies the Claude Code hook.
  */
 import { execFile } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -92,6 +92,7 @@ const readPrefs = (): Record<string, unknown> => JSON.parse(readFileSync(prefsPa
 
 describe("compaction init - headless orchestration", () => {
   it("(10) --connect comma-list enables exactly the named workflows; Ready lists only those", async () => {
+    writeStub("claude");
     // shim dir on PATH so an installed Codex shim verifies active this run.
     const { stdout, code } = await runInitShimActive(["--connect", "codex,claude-code"]);
     expect(code).toBe(0);
@@ -131,6 +132,18 @@ describe("compaction init - headless orchestration", () => {
     const ready = stdout.slice(stdout.indexOf("Compaction is ready."));
     expect(ready).toContain("✓ Codex");
     expect(ready).toContain("✓ Cursor");
+  });
+
+  it("a named already-ready workflow is counted without reinstalling it", async () => {
+    await runInitShimActive(["--connect", "codex"]);
+    const installedShim = shimPath("codex");
+    const oldTimestamp = new Date(1_000);
+    utimesSync(installedShim, oldTimestamp, oldTimestamp);
+
+    const { stdout, code } = await runInitShimActive(["--connect", "codex"]);
+    expect(code).toBe(0);
+    expect(stdout.slice(stdout.indexOf("Compaction is ready."))).toContain("✓ Codex");
+    expect(statSync(installedShim).mtimeMs).toBe(oldTimestamp.getTime());
   });
 
   it("--connect none enables nothing but a --mode still persists (recorded default only)", async () => {
@@ -188,7 +201,7 @@ describe("compaction init - headless orchestration", () => {
     const { stdout, code } = await runInit(["--connect", "all"]);
     expect(code).toBe(0);
     const ready = stdout.slice(stdout.indexOf("Compaction is ready."));
-    expect(ready).toContain("✓ Claude Code");
+    expect(ready).not.toContain("✓ Claude Code");
     expect(ready).toContain("✓ Codex");
     expect(ready).toContain("✓ Cursor");
   });
@@ -221,6 +234,7 @@ describe("compaction init - headless orchestration", () => {
   });
 
   it("back-compat: --connect 1 still installs + verifies the Claude Code hook", async () => {
+    writeStub("claude");
     const { stdout, code } = await runInit(["--connect", "1"]);
     expect(code).toBe(0);
     expect(stdout).toContain("Compaction is now active for Claude Code");
@@ -229,5 +243,15 @@ describe("compaction init - headless orchestration", () => {
     // No mode flag -> no optimization_mode written. The verified connect DOES persist the content-free
     // connected-workflow enum (the gateway --workflow default source) - and nothing else.
     expect(readPrefs()).toEqual({ connected_workflows: ["claude-code"] });
+  });
+
+  it("a named absent target fails before any write", async () => {
+    const { stderr, code } = await runInit(["--connect", "claude-code", "--mode", "cache-plus-context"]);
+    expect(code).toBe(1);
+    expect(stderr).toContain("claude-code was not detected on this machine");
+    expect(stderr).toContain("nothing was changed");
+    expect(existsSync(prefsPath())).toBe(false);
+    expect(existsSync(settingsPath())).toBe(false);
+    expect(existsSync(shimPath("claude"))).toBe(false);
   });
 });

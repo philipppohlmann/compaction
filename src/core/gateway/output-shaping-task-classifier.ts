@@ -1,21 +1,8 @@
 /**
  * Task-aware gate for deterministic output shaping (pure, engine-free, content-free).
  *
- * Blanket output shaping is safe where an external signal carries the turn's state across turns -
- * the code artifact plus a test/verifier failure, and on short factual answers. It is NOT
- * established as safe on the pure-planning / no-oracle regime, where the model's own prose is the
- * only state it carries forward. This classifier holds shaping on that regime and shapes the rest.
- *
- * Measured boundary (every figure below is recorded in `docs/ops/evidence-matrix.md`): on code-output
- * turns, eval-gated A/Bs preserved task completion at 53.3% output reduction (`exp-cc-output-004`,
- * Claude Code) and at 59.0% / 47.5% (`exp-cc-output-006`, Claude Code / Codex — the same coding family
- * on two providers). There is NO single number: across ~7 families the reduction spans ~0-88% and
- * tracks CONTROL VERBOSITY. Codex's already-terse SQL answer leaves nothing to trim (0.0%,
- * `exp-cc-output-007`) and a verbose explanatory answer reaches ~88% (`exp-cc-output-008`), so the
- * magnitude is prompt- and model-specific and is not generalized. The no-oracle multi-step planning
- * regime is untested, so the conservative bias is to HOLD whenever the turn reads as planning/reasoning
- * or the client has explicitly asked the model to reason (extended thinking). Holding never hurts
- * quality; it only forgoes savings on that turn.
+ * Planning or no-oracle turns, and turns that explicitly request reasoning, are conservatively held
+ * because their prose may carry state. Eligible code and factual turns may receive shaping.
  *
  * `isExtendedThinkingEnabled` is a GATEWAY-ONLY hold IN PRACTICE. It reads `thinking` / `reasoning` /
  * `reasoning_effort` off the request body, and the hook path never carries any of them:

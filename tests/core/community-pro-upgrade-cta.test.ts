@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   communityFullApplyReceiptLine,
+  nonApplyReceiptLine,
   receiptCeiling,
   receiptLineFromGatewayReceipt,
   receiptLineOutputOnly
@@ -71,6 +72,7 @@ function receipt(over: Partial<GatewayReceipt> = {}): GatewayReceipt {
     reasons: { cost: "provider reports tokens, not billing" },
     claim_scope: "run-scoped",
     approval_status: "auto-applied-by-policy",
+    authorization_id: "pref-1234567890abcdef12345678",
     sync_status: "local-only",
     content_uploaded: false,
     label: "apply",
@@ -458,7 +460,8 @@ describe("a shaping-only ceiling turn does not claim an input reduction", () => 
 
   function lineFor(pause?: Record<string, unknown>): string {
     const r = (pause === undefined ? SYNTHETIC_RECEIPT : { ...SYNTHETIC_RECEIPT, allowance_pause: pause }) as GatewayReceipt;
-    return communityFullApplyReceiptLine(r, SAVED, receiptCeiling(r, PLAIN_ENV)) ?? "";
+    const ceiling = receiptCeiling(r, PLAIN_ENV);
+    return communityFullApplyReceiptLine(r, SAVED, ceiling) ?? nonApplyReceiptLine(r, SAVED, undefined, ceiling) ?? "";
   }
 
   it("pins the synthetic shaping-only conditions", () => {
@@ -469,15 +472,14 @@ describe("a shaping-only ceiling turn does not claim an input reduction", () => 
     expect(SYNTHETIC_RECEIPT.tokens.output).toBe(25);
   });
 
-  it("no longer renders the fabricated reduction even with NO pause recorded", () => {
-    // A shaping-only turn carrying no pause still has no input before→after. The axis follows
-    // `applied_components`, not request mutation alone.
+  it("refuses private Full posture when only output shaping ran", () => {
     const line = lineFor();
-    expect(line).toBe("compaction · input 1,050 · output 25 · full apply · id 11111111");
+    expect(line).toContain("input 1,050");
+    expect(line).toContain("output");
+    expect(line).not.toContain("full apply");
     expect(line).not.toContain("1,000");
     expect(line).not.toContain("1,100");
     expect(line).not.toContain("→1,100");
-    expect(line.split(" · output ")[0]).not.toContain("−"); // no reduction glyph on the input axis
   });
 
   it("states the pause on the input axis instead of a fabricated reduction", () => {
@@ -491,11 +493,9 @@ describe("a shaping-only ceiling turn does not claim an input reduction", () => 
     expect(line).not.toContain("−47%");
   });
 
-  it("drops the `full apply` label on a turn whose apply was refused", () => {
+  it("never gives the shaping-only turn a `full apply` label", () => {
     expect(lineFor({ reason: "exhausted", scope: "all-routes" })).not.toContain("full apply");
-    // ...and keeps it on the identical turn WITHOUT a pause, so the label was suppressed by the pause
-    // and not by some unrelated change to the builder.
-    expect(lineFor()).toContain("full apply");
+    expect(lineFor()).not.toContain("full apply");
   });
 
   it("gives that turn the conversion path it never had", () => {
@@ -532,7 +532,9 @@ describe("a shaping-only ceiling turn does not claim an input reduction", () => 
   it("no longer narrates shaping on the line, and still says it on the detail surface", () => {
     expect(lineFor({ reason: "exhausted", scope: "all-routes" })).not.toContain("output shaping continues");
     const noShaping = { ...SYNTHETIC_RECEIPT, applied_components: [], allowance_pause: { reason: "exhausted" } } as unknown as GatewayReceipt;
-    const line = communityFullApplyReceiptLine(noShaping, SAVED, receiptCeiling(noShaping, PLAIN_ENV)) ?? "";
+    const ceiling = receiptCeiling(noShaping, PLAIN_ENV);
+    const line = communityFullApplyReceiptLine(noShaping, SAVED, ceiling) ??
+      nonApplyReceiptLine(noShaping, SAVED, undefined, ceiling) ?? "";
     expect(line).not.toContain("output shaping continues");
     expect(line).toContain(UPGRADE_CTA_LABEL);
     expect(upgradeNoticeLines({ reason: "exhausted", scope: "all-routes", env: PLAIN_ENV })).toContain("Output shaping remains active.");

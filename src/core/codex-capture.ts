@@ -172,8 +172,8 @@ export function normalizeCodexExecEvents(params: {
     ? createUsageMetadata({
         inputTokens,
         outputTokens,
-        // reasoning tokens are part of the output charge; surface in total, not double-counted as output.
-        totalTokens: inputTokens + outputTokens + reasoningOutputTokens,
+        // Reasoning tokens are already a subset of outputTokens.
+        totalTokens: inputTokens + outputTokens,
         cacheReadInputTokens: cachedInputTokens,
         providerReportedTokens: true,
         estimatedTokens: false,

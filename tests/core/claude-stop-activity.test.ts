@@ -1,18 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
   buildClaudeStopActivityEvent,
-  buildClaudeTranscriptStopActivityEvent
+  buildClaudeTranscriptStopActivityEvent,
+  claudeStopOutputCalibrationQuery
 } from "../../src/core/claude-stop-activity.js";
 import { claudeLogicalRunIdentity } from "../../src/core/claude-logical-run-id.js";
 import { validateActivityEventForStore } from "../../src/core/activity-store.js";
 import { settledStopLineFromActivityEvent } from "../../src/core/settled-stop-activity.js";
 import { outputCalibrationResolver } from "../../src/core/output-shaping-savings.js";
-import { emptyCalibration } from "../../src/core/output-shaping-calibration-store.js";
+import { emptyCalibration, foldCalibrationConfirmation } from "../../src/core/output-shaping-calibration-store.js";
 import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import type { UserRun } from "../../src/core/gateway/run-boundary.js";
 import { createUsageMetadata, missingUsageMetadata } from "../../src/core/usage-metadata.js";
+import { confirmedOutputCalibration } from "../helpers/output-calibration-fixture.js";
 
 const CORRELATION = "1".repeat(32);
+const POLICY = `output-shaping.v1.sha256.${"a".repeat(64)}`;
 const RUN: UserRun = {
   session_correlation_id: CORRELATION,
   run_seq: 4,
@@ -108,7 +111,8 @@ describe("Claude whole-run Stop event", () => {
           estimated_input_tokens_before: 100,
           estimated_input_tokens_after: 60,
           applied_components: ["lcm-compaction"],
-          approval_status: "auto-applied-by-policy"
+          approval_status: "auto-applied-by-policy",
+          authorization_id: "pref-1234567890abcdef12345678"
         })],
         truncated: false
       },
@@ -117,6 +121,7 @@ describe("Claude whole-run Stop event", () => {
     expect(event.apply_posture).toBe("full");
     expect(settledStopLineFromActivityEvent(event)).toContain("input 100→60 (−40%)");
     expect(settledStopLineFromActivityEvent(event)).toContain("full apply");
+    expect(settledStopLineFromActivityEvent(event)).not.toContain("+~");
   });
 
   it("keeps public explicit deterministic input apply exact and unlabelled", () => {
@@ -165,18 +170,142 @@ describe("Claude whole-run Stop event", () => {
     expect(line).not.toMatch(/apply off|basic shaping|full apply/);
   });
 
-  it("fails closed without an exact complete gateway run", () => {
+  it("fails closed on malformed component provenance in a whole-run Stop event", () => {
+    const event = buildClaudeStopActivityEvent({
+      run: RUN,
+      window: {
+        receipts: [receipt({
+          mode: "apply",
+          request_mutated: true,
+          model_visible_bytes_changed: true,
+          estimated_input_tokens_before: 100,
+          estimated_input_tokens_after: 60,
+          applied_components: { 0: "lcm-compaction" } as unknown as GatewayReceipt["applied_components"]
+        })],
+        truncated: false
+      },
+      calibrationResolver: resolver
+    });
+    expect(event).toBeDefined();
+    const line = settledStopLineFromActivityEvent(event!)!;
+    expect(line).toContain("input 100");
+    expect(line).not.toContain("→");
+    expect(line).not.toContain("full apply");
+  });
+
+  it("accepts a truncated tail whose whole-window append boundary covers the run", () => {
+    const foreignCoverage = receipt({
+      receipt_id: "foreign-coverage",
+      captured_at: "2026-09-04T09:59:59.000Z",
+      request_started_at: "2026-09-04T09:59:58.000Z",
+      session_correlation_id: "2".repeat(32),
+      provider: "foreign-provider",
+      model: "foreign-model",
+      tokens: { prompt_input: 10_000, output: 5_000 },
+      output_shaping_state: "already-active",
+      output_shaping_policy_version: `output-shaping.v1.sha256.${"b".repeat(64)}`
+    });
+    const exactReceipts = [
+      receipt({
+        receipt_id: "a",
+        output_shaping_state: "already-active",
+        output_shaping_policy_version: POLICY
+      }),
+      receipt({
+        receipt_id: "b",
+        request_started_at: "2026-09-04T10:03:00.000Z",
+        captured_at: "2026-09-04T10:03:01.000Z",
+        tokens: { prompt_input: 200, output: 30 },
+        output_shaping_state: "already-active",
+        output_shaping_policy_version: POLICY
+      })
+    ];
+    const window = { receipts: [foreignCoverage, ...exactReceipts], truncated: true };
+
+    const event = buildClaudeStopActivityEvent({ run: RUN, window, calibrationResolver: resolver })!;
+    expect(event).toMatchObject({
+      input_before: 300,
+      output_after: 50,
+      apply_posture: "basic",
+      measurement_source: "gateway-run"
+    });
+    expect(settledStopLineFromActivityEvent(event)).toContain(
+      "observed input 300 · output N/A→50 (N/A%, est.) · basic shaping"
+    );
+    expect(claudeStopOutputCalibrationQuery({ run: RUN, window })).toEqual({
+      policyVersion: POLICY,
+      provider: "anthropic",
+      model: "claude-opus-5"
+    });
+  });
+
+  it("fails closed when a truncated tail starts after the run", () => {
+    const window = {
+      receipts: [receipt({
+        captured_at: "2026-09-04T10:05:01.000Z",
+        request_started_at: "2026-09-04T10:05:00.000Z",
+        output_shaping_state: "already-active",
+        output_shaping_policy_version: POLICY
+      })],
+      truncated: true
+    };
+    expect(buildClaudeStopActivityEvent({ run: RUN, window, calibrationResolver: resolver })).toBeUndefined();
+    expect(claudeStopOutputCalibrationQuery({ run: RUN, window })).toBeUndefined();
+  });
+
+  it("uses append capture time, not a foreign receipt's earlier request time, for tail coverage", () => {
+    const window = {
+      receipts: [
+        receipt({
+          receipt_id: "foreign-late-append",
+          captured_at: "2026-09-04T10:04:00.000Z",
+          request_started_at: "2026-09-04T09:59:00.000Z",
+          session_correlation_id: "2".repeat(32)
+        }),
+        receipt({
+          receipt_id: "exact",
+          captured_at: "2026-09-04T10:05:00.000Z",
+          output_shaping_state: "already-active",
+          output_shaping_policy_version: POLICY
+        })
+      ],
+      truncated: true
+    };
+    expect(buildClaudeStopActivityEvent({ run: RUN, window, calibrationResolver: resolver })).toBeUndefined();
+    expect(claudeStopOutputCalibrationQuery({ run: RUN, window })).toBeUndefined();
+  });
+
+  it("fails closed without a valid truncated-window capture anchor", () => {
+    for (const captured_at of [undefined, "not-a-timestamp", "2026-09-04T09:59:59Z"]) {
+      const window = {
+        receipts: [
+          receipt({
+            receipt_id: "invalid-anchor",
+            captured_at: captured_at as string,
+            session_correlation_id: "2".repeat(32)
+          }),
+          receipt({
+            receipt_id: "exact",
+            output_shaping_state: "already-active",
+            output_shaping_policy_version: POLICY
+          })
+        ],
+        truncated: true
+      };
+      expect(buildClaudeStopActivityEvent({ run: RUN, window, calibrationResolver: resolver })).toBeUndefined();
+      expect(claudeStopOutputCalibrationQuery({ run: RUN, window })).toBeUndefined();
+    }
+
+    const invalidRun = { ...RUN, started_at: "not-a-timestamp" };
+    const window = { receipts: [receipt()], truncated: true };
+    expect(buildClaudeStopActivityEvent({ run: invalidRun, window, calibrationResolver: resolver })).toBeUndefined();
+    expect(claudeStopOutputCalibrationQuery({ run: invalidRun, window })).toBeUndefined();
+  });
+
+  it("fails closed without any receipts", () => {
     expect(buildClaudeStopActivityEvent({
       run: RUN,
       window: { receipts: [], truncated: false },
-      calibrationResolver: resolver
-    })).toBeUndefined();
-    expect(buildClaudeStopActivityEvent({
-      run: RUN,
-      window: {
-        receipts: [receipt({ request_started_at: "2026-09-04T10:05:00.000Z" })],
-        truncated: true
-      },
       calibrationResolver: resolver
     })).toBeUndefined();
   });
@@ -195,7 +324,8 @@ describe("Claude transcript Stop fallback", () => {
         provider: "anthropic",
         model: "claude-opus-5"
       }),
-      shaped: true
+      shapingOutcome: "shape",
+      calibrationResolver: resolver
     })!;
     expect(validateActivityEventForStore(event).problems).toEqual([]);
     expect(event).toMatchObject({
@@ -232,7 +362,7 @@ describe("Claude transcript Stop fallback", () => {
         estimatedTokens: true,
         provider: "anthropic"
       }),
-      shaped: false
+      calibrationResolver: resolver
     })!;
     expect(validateActivityEventForStore(event).problems).toEqual([]);
     expect(event.token_source).toEqual({
@@ -266,7 +396,8 @@ describe("Claude transcript Stop fallback", () => {
         cacheCreationInputTokens: null,
         tokenSource: "provider-reported"
       },
-      shaped: true
+      shapingOutcome: "shape",
+      calibrationResolver: resolver
     })!;
     expect(event).toMatchObject({
       input_before: 950,
@@ -280,6 +411,42 @@ describe("Claude transcript Stop fallback", () => {
     expect(line).not.toContain("session cumulative");
     expect(line).toContain("observed input 950");
     expect(line).toContain("output N/A→80 (N/A%, est.)");
+  });
+
+  it("resolves only the exact transcript shaping outcome cohort", () => {
+    const measured = outputCalibrationResolver(foldCalibrationConfirmation(
+      emptyCalibration(),
+      confirmedOutputCalibration({
+        provider: "anthropic",
+        model: "claude-opus-5",
+        regime: "default-shapeable"
+      })
+    ));
+    const usage = createUsageMetadata({
+      inputTokens: 100,
+      outputTokens: 60,
+      providerReportedTokens: true,
+      estimatedTokens: false,
+      provider: "anthropic",
+      model: "claude-opus-5"
+    });
+    const exact = buildClaudeTranscriptStopActivityEvent({
+      run: RUN,
+      usage,
+      shapingOutcome: "shape",
+      calibrationResolver: measured
+    })!;
+    expect(settledStopLineFromActivityEvent(exact)).toContain("output 100→60 (−40%, est.)");
+    expect(exact.output_estimate_state).toBe("calibrated");
+
+    const basic = buildClaudeTranscriptStopActivityEvent({
+      run: RUN,
+      usage,
+      shapingOutcome: "shape-basic",
+      calibrationResolver: measured
+    })!;
+    expect(settledStopLineFromActivityEvent(basic)).toContain("output N/A→60 (N/A%, est.)");
+    expect(basic.output_estimate_state).toBe("unseeded");
   });
 
   it("omits a regressing or source-conflicting baseline axis instead of relabelling cumulative usage", () => {
@@ -299,7 +466,7 @@ describe("Claude transcript Stop fallback", () => {
         cacheCreationInputTokens: null,
         tokenSource: "provider-reported"
       },
-      shaped: false
+      calibrationResolver: resolver
     })).toBeUndefined();
     expect(buildClaudeTranscriptStopActivityEvent({
       run: RUN,
@@ -317,7 +484,7 @@ describe("Claude transcript Stop fallback", () => {
         cacheCreationInputTokens: null,
         tokenSource: "local-estimate"
       },
-      shaped: false
+      calibrationResolver: resolver
     })).toBeUndefined();
   });
 
@@ -325,7 +492,7 @@ describe("Claude transcript Stop fallback", () => {
     expect(buildClaudeTranscriptStopActivityEvent({
       run: RUN,
       usage: missingUsageMetadata({ provider: "anthropic" }),
-      shaped: false
+      calibrationResolver: resolver
     })).toBeUndefined();
     expect(buildClaudeTranscriptStopActivityEvent({
       run: RUN,
@@ -335,7 +502,8 @@ describe("Claude transcript Stop fallback", () => {
         estimatedTokens: false,
         provider: "anthropic"
       }),
-      shaped: true
+      shapingOutcome: "shape",
+      calibrationResolver: resolver
     })).toBeUndefined();
   });
 
@@ -349,7 +517,8 @@ describe("Claude transcript Stop fallback", () => {
         estimatedTokens: false,
         provider: "anthropic"
       }),
-      shaped: true
+      shapingOutcome: "shape",
+      calibrationResolver: resolver
     })!;
     expect(validateActivityEventForStore({ ...event, input_after: 80 }).problems)
       .toContain("activity_kind claude-stop: transcript usage cannot claim post-compaction input");

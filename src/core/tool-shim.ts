@@ -13,11 +13,21 @@
  * preserved exit code.
  *
  * Two shim kinds share this install/verify/uninstall machinery:
- * - CAPTURE shims (`codex`, `cursor-agent`): for the MEASURABLE batch form ONLY
- *   (`codex exec --json` / `cursor-agent … --output-format json`) they tee stdout to a temp copy
- *   and, after the real binary exits, invoke the CONTENT-FREE `compaction capture <tool> --from-shim`
- *   bridge (usage token fields only; no prompt/response/message text is ever read into the event).
- *   Interactive / other invocations PASS THROUGH untouched and are honestly NOT measured (never faked).
+ * - The Codex GATEWAY-ROUTING shim routes EVERY normal `codex` invocation - interactive included -
+ *   through the explicit ChatGPT-subscription Gateway envelope. Receipt consumers report only settled
+ *   artifacts; the shim itself never asserts that every routed request produced one. It steps
+ *   aside and runs the legacy measurable-batch-form capture path unrouted (see the Cursor bullet below
+ *   for what that path does) when it detects the user's OWN route already declared - an
+ *   `OPENAI_BASE_URL`/`OPENAI_API_BASE` env override; an argv `-c`/`--config`, `--oss`, or
+ *   `--local-provider` route; a non-empty top-level `model_provider` in `$CODEX_HOME/config.toml` or
+ *   the selected `$CODEX_HOME/<profile>.config.toml`; or an OpenAI API key present in the environment
+ *   (signalling API-key auth, not the ChatGPT-subscription login this route requires).
+ * - The Cursor CAPTURE shim: for the MEASURABLE batch form ONLY (`cursor-agent … --output-format json`)
+ *   it tees stdout to a temp copy and, after the real binary exits, invokes the CONTENT-FREE
+ *   `compaction capture <tool> --from-shim` bridge (usage token fields only; no prompt/response/message
+ *   text is ever read into the event). Interactive / other invocations PASS THROUGH untouched and are
+ *   honestly NOT measured (never faked). Codex's own unrouted fallback (above) reuses this same
+ *   measurable-batch-form mechanism.
  * - The GATEWAY-ROUTING shim (`claude`): starts-or-reuses the persistent local RECORD-mode gateway
  *   (`compaction gateway ensure`, byte-safe; request and response forwarded unchanged; content-free
  *   receipts; the credential rides through untouched), injects ANTHROPIC_BASE_URL at it, and execs the
@@ -35,6 +45,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, copyFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { defaultManagedRoot, loadManagedInstallation } from "./update/ownership.js";
 
 /**
  * The tools this run can shim. `cursor` installs a shim named `cursor-agent` (the installed binary);
@@ -42,7 +53,7 @@ import path from "node:path";
  */
 export type ShimTool = "codex" | "cursor" | "claude-code";
 
-/** The capture-kind shims (tee + content-free capture bridge). `claude-code` is gateway-routing instead. */
+/** Capture bridge inputs retained by the capture/precall commands. */
 export type CaptureShimTool = "codex" | "cursor";
 
 /** Per-tool shim config: the on-disk shim name, the shim kind, and (capture kind) the capture surface. */
@@ -59,7 +70,7 @@ interface ShimToolConfig {
 }
 
 export const SHIM_TOOLS: Readonly<Record<ShimTool, ShimToolConfig>> = {
-  codex: { shimName: "codex", kind: "capture", captureTool: "codex", forwardArgs: false },
+  codex: { shimName: "codex", kind: "gateway-route" },
   cursor: { shimName: "cursor-agent", kind: "capture", captureTool: "cursor", forwardArgs: true },
   "claude-code": { shimName: "claude", kind: "gateway-route" }
 };
@@ -140,7 +151,8 @@ function bashSingleQuote(value: string): string {
 function detectorSnippet(tool: CaptureShimTool): string {
   if (tool === "codex") {
     return [
-      "# Codex measurable batch form: `codex exec ... --json` (an interactive `codex` is NOT measured).",
+      "# Codex measurable batch form: `codex exec ... --json` (gates the extra before-call stdin step;",
+      "# on the unrouted fallback path it also gates whether this run is captured at all).",
       "__has_exec=0; __has_json=0",
       'for __a in "$@"; do',
       '  case "$__a" in',
@@ -241,7 +253,7 @@ function captureSnippet(tool: CaptureShimTool): string {
 function generateClaudeRoutingShimScript(realBin: string): string {
   return `#!/usr/bin/env bash
 # ${SHIM_MARKER}: claude-code
-# Compaction transparent ROUTING shim for "claude" - installed by \`compaction init --connect 1\`.
+# Compaction transparent ROUTING shim for "claude" - installed by \`compaction init --connect claude-code\`.
 #
 # It starts-or-reuses the persistent local Compaction gateway (RECORD mode - byte-safe: request and
 # response forwarded byte-for-byte, no mutation; content-free receipts, token/cache counts only),
@@ -268,7 +280,7 @@ if [ ! -x "$REAL_BIN" ]; then
   # PATH with THIS shim's own directory removed - exact-dir match (each entry resolved to its
   # physical path before comparing, so trailing slashes/symlinks can't defeat it, and unrelated
   # entries are never dropped) - and exec it UNROUTED so the tool keeps working. Routing resumes
-  # after 'compaction init --connect 1' re-records the binary.
+  # after 'compaction init --connect claude-code' re-records the binary.
   __self_dir="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)" || __self_dir=""
   __clean_path=""
   __old_ifs="$IFS"
@@ -285,7 +297,7 @@ if [ ! -x "$REAL_BIN" ]; then
   if [ -n "$__fallback" ] && [ -x "$__fallback" ] && ! [ "$__fallback" -ef "$0" ]; then
     exec "$__fallback" "$@"
   fi
-  echo "compaction shim: the recorded claude binary was not found at $REAL_BIN and no other claude is on PATH - re-run 'compaction init --connect 1' to re-resolve it." 1>&2
+  echo "compaction shim: the recorded claude binary was not found at $REAL_BIN and no other claude is on PATH - re-run 'compaction init --connect claude-code' to re-resolve it." 1>&2
   exit 127
 fi
 
@@ -307,17 +319,215 @@ exec "$REAL_BIN" "$@"
 }
 
 /**
+ * Detect a user-declared route in `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) WITHOUT
+ * ever reading a credential. Rule: the file declares its own route when it sets a non-empty TOP-LEVEL
+ * `model_provider` key - i.e. one that appears BEFORE the first `[table]` header, which is what Codex
+ * actually reads to select the active provider. A `[model_providers.*]` block that exists but is never
+ * selected this way changes nothing about which provider Codex uses, so it does NOT count on its own -
+ * counting it would fail open in the wrong direction (silently refusing to route users who have no
+ * active override at all). Missing, unreadable, or malformed files fail open to "no override" - never
+ * a crash. Only the KEY is inspected; the file is never echoed, logged, or persisted anywhere, and no
+ * credential-bearing field (nothing under `~/.codex/auth.json`, no API key, no token) is ever touched.
+ * A `model_provider` whose value is literally OUR OWN provider id (`compaction_subscription`) does not
+ * count: Compaction never writes that id to the user's file, so its presence is not a competing route -
+ * it already names this route, and routing normally is exactly correct there.
+ */
+function codexConfigRouteOverrideSnippet(): string {
+  return [
+    "__codex_cfg_override=0",
+    '__codex_cfg_home_default=""',
+    'if [ -n "${HOME:-}" ]; then __codex_cfg_home_default="$HOME/.codex"; fi',
+    '__codex_cfg_home="${CODEX_HOME:-$__codex_cfg_home_default}"',
+    "__codex_cfg_has_route() {",
+    '  __codex_cfg="$1"',
+    '  if ! [ -f "$__codex_cfg" ] || ! [ -r "$__codex_cfg" ]; then return 1; fi',
+    '  while IFS= read -r __codex_cfg_line || [ -n "$__codex_cfg_line" ]; do',
+    '    __codex_cfg_line="${__codex_cfg_line#"${__codex_cfg_line%%[![:space:]]*}"}"',
+    '    case "$__codex_cfg_line" in',
+    "      \\[*) break ;;",
+    "      model_provider[[:space:]]*=*|model_provider=*)",
+    '        __codex_cfg_val="${__codex_cfg_line#*=}"',
+    "        __codex_cfg_val=\"$(printf '%s' \"$__codex_cfg_val\" | sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\"//' -e 's/\"$//')\"",
+    '        if [ -n "$__codex_cfg_val" ] && [ "$__codex_cfg_val" != "compaction_subscription" ]; then return 0; fi',
+    "        return 1",
+    "        ;;",
+    "    esac",
+    '  done < "$__codex_cfg" 2>/dev/null',
+    "  return 1",
+    "}",
+    'if [ -n "$__codex_cfg_home" ]; then',
+    '  if __codex_cfg_has_route "$__codex_cfg_home/config.toml"; then __codex_cfg_override=1; fi',
+    "fi"
+  ].join("\n");
+}
+
+/** Generate the normal-invocation Codex ChatGPT-subscription routing shim. */
+function generateCodexRoutingShimScript(realBin: string): string {
+  const unroutedStdinApply = stdinApplyBlock("codex");
+  const configOverride = codexConfigRouteOverrideSnippet();
+  return `#!/usr/bin/env bash
+# ${SHIM_MARKER}: codex
+# Compaction transparent ChatGPT-subscription routing shim for "codex".
+# Existing route overrides pass through unchanged - environment, argv (including selected profiles
+# and local-provider flags), an existing model_provider in Codex config, or an OpenAI API key already
+# in the environment. No credential is read, copied, or stored here: config files are inspected for
+# their ROUTE key only, never a credential field.
+set -u
+
+REAL_BIN=${bashSingleQuote(realBin)}
+COMPACTION_BIN="\${COMPACTION_BIN:-compaction}"
+
+if [ ! -x "$REAL_BIN" ]; then
+  echo "compaction shim: the recorded codex binary was not found at $REAL_BIN - re-run 'compaction init --connect' to re-resolve it." 1>&2
+  exit 127
+fi
+
+# The legacy measurable path remains the fail-open/explicit-override behavior. It performs the
+# recommendation/approval-gated stdin step, tees the single real invocation, and bridges its usage.
+__run_unrouted() {
+  __measurable=0
+  ${detectorSnippet("codex")}
+  if [ "$__measurable" = "1" ]; then
+${unroutedStdinApply}    __itty=0
+    if [ -t 0 ] && [ -t 1 ]; then __itty=1; fi
+    "$COMPACTION_BIN" precall codex --interactive "$__itty" -- "$@" </dev/null >/dev/null 2>&1 || true
+    __tmp="$(mktemp "\${TMPDIR:-/tmp}/compaction-codex-XXXXXX" 2>/dev/null)" || exec "$REAL_BIN" "$@"
+    "$REAL_BIN" "$@" | tee "$__tmp"
+    __code=\${PIPESTATUS[0]}
+    ${captureSnippet("codex")}
+    rm -f "$__tmp" >/dev/null 2>&1 || true
+    exit "$__code"
+  fi
+  exec "$REAL_BIN" "$@"
+}
+
+# Environment route overrides are authoritative: never clobber or double-route them.
+if [ -n "\${OPENAI_BASE_URL:-}" ] || [ -n "\${OPENAI_API_BASE:-}" ]; then
+  __run_unrouted "$@"
+fi
+
+# A declared OpenAI API key variable - even empty - is a conservative read-only EXISTENCE signal
+# (never the value) that this Codex may be set up for API-key auth, not the ChatGPT-subscription
+# login this route requires (requires_openai_auth). Forcing the loopback route here would silently
+# break that auth.
+if [ -n "\${OPENAI_API_KEY+x}" ] || [ -n "\${OPENAI_KEY+x}" ]; then
+  __run_unrouted "$@"
+fi
+
+# Codex command-line configuration can declare a provider/base route. Detect the supported -c/--config
+# forms, selected profile, and local-provider flags without printing their values, then preserve the
+# invocation byte-for-byte. A missing/invalid profile argument is ambiguous, so it stays unrouted.
+__route_override=0
+__expect_config=0
+__expect_profile=0
+__selected_profile=""
+for __arg in "$@"; do
+  if [ "$__expect_config" = "1" ]; then
+    case "$__arg" in
+      model_provider=*|openai_base_url=*|chatgpt_base_url=*|model_providers.*.base_url=*) __route_override=1 ;;
+    esac
+    __expect_config=0
+    continue
+  fi
+  if [ "$__expect_profile" = "1" ]; then
+    case "$__arg" in
+      ""|-*) __route_override=1 ;;
+      *) __selected_profile="$__arg" ;;
+    esac
+    __expect_profile=0
+    continue
+  fi
+  case "$__arg" in
+    -c|--config) __expect_config=1 ;;
+    --config=model_provider=*|--config=openai_base_url=*|--config=chatgpt_base_url=*|--config=model_providers.*.base_url=*) __route_override=1 ;;
+    model_provider=*|openai_base_url=*|chatgpt_base_url=*|model_providers.*.base_url=*) __route_override=1 ;;
+    -p|--profile) __expect_profile=1 ;;
+    -p=*|--profile=*)
+      __selected_profile="\${__arg#*=}"
+      if [ -z "$__selected_profile" ]; then __route_override=1; fi
+      ;;
+    --oss|--local-provider|--local-provider=*) __route_override=1 ;;
+  esac
+done
+if [ "$__expect_profile" = "1" ]; then __route_override=1; fi
+if [ "$__route_override" = "1" ]; then
+  __run_unrouted "$@"
+fi
+
+# The user's OWN $CODEX_HOME/config.toml can already declare a model_provider - reading it is reading
+# configuration, never a credential (see codexConfigRouteOverrideSnippet). A declared provider passes
+# through unrouted rather than being silently replaced by the ChatGPT-subscription route below.
+${configOverride}
+if [ "$__codex_cfg_override" = "1" ]; then
+  __run_unrouted "$@"
+fi
+
+# A selected profile layers $CODEX_HOME/<name>.config.toml over the base config. Inspect ONLY that
+# selected file's top-level route key; dormant profile files must not disable normal subscription
+# routing. Unsafe names or an unavailable selected file are ambiguous and therefore stay unrouted.
+if [ -n "$__selected_profile" ]; then
+  case "$__selected_profile" in
+    .|..|*/*|*[!A-Za-z0-9._-]*) __run_unrouted "$@" ;;
+  esac
+  if [ -z "$__codex_cfg_home" ]; then __run_unrouted "$@"; fi
+  __codex_profile_cfg="$__codex_cfg_home/$__selected_profile.config.toml"
+  if ! [ -f "$__codex_profile_cfg" ] || ! [ -r "$__codex_profile_cfg" ]; then __run_unrouted "$@"; fi
+  if __codex_cfg_has_route "$__codex_profile_cfg"; then __run_unrouted "$@"; fi
+fi
+
+# With no usable Compaction launcher, preserve the complete pre-existing fail-open capture path.
+if ! command -v "$COMPACTION_BIN" >/dev/null 2>&1; then
+  __run_unrouted "$@"
+fi
+
+# Routed mode retains Codex's before-call recommendation and approval-gated stdin boundary. The
+# Gateway receipt replaces ONLY the post-hoc tee/capture bridge: exactly one real inference runs.
+__measurable=0
+${detectorSnippet("codex")}
+if [ "$__measurable" = "1" ]; then
+  if [ ! -t 0 ] && "$COMPACTION_BIN" precall codex --stdin-boundary-check -- "$@" </dev/null >/dev/null 2>&1; then
+    __ttyavail=0; if [ -t 1 ]; then __ttyavail=1; fi
+    __sfile="$(mktemp "\${TMPDIR:-/tmp}/compaction-codex-stdin-XXXXXX" 2>/dev/null)"
+    __cfile="$(mktemp "\${TMPDIR:-/tmp}/compaction-codex-cpct-XXXXXX" 2>/dev/null)"
+    if [ -n "$__sfile" ] && [ -n "$__cfile" ]; then
+      cat > "$__sfile"
+      "$COMPACTION_BIN" precall codex --interactive "$__ttyavail" --stdin-file "$__sfile" --compacted-out "$__cfile" -- "$@" </dev/null >/dev/null 2>&1 || true
+      __infile="$__sfile"
+      if [ -s "$__cfile" ]; then __infile="$__cfile"; fi
+      "$COMPACTION_BIN" gateway run --provider openai --workflow codex --subscription -- "$REAL_BIN" "$@" < "$__infile"
+      __code=$?
+      rm -f "$__sfile" "$__cfile" >/dev/null 2>&1 || true
+      exit "$__code"
+    fi
+    rm -f "$__sfile" "$__cfile" >/dev/null 2>&1 || true
+  fi
+  __itty=0
+  if [ -t 0 ] && [ -t 1 ]; then __itty=1; fi
+  "$COMPACTION_BIN" precall codex --interactive "$__itty" -- "$@" </dev/null >/dev/null 2>&1 || true
+fi
+exec "$COMPACTION_BIN" gateway run --provider openai --workflow codex --subscription -- "$REAL_BIN" "$@"
+`;
+}
+
+/**
  * Generate the transparent shim script for `tool`, baking in the resolved absolute `realBin` path.
  *
- * Capture kind (codex/cursor): (1) execs the real binary with all args + inherited stdio + preserved
- * exit code; (2) for the measurable batch form ONLY, runs a FAIL-OPEN, CONTENT-FREE before-call
- * recommendation step (`compaction precall`; recommendation-only - it never mutates the input), then
- * tees stdout to a temp copy and calls the content-free capture bridge, then deletes the temp;
- * (3) passes everything else through untouched.
+ * Capture kind (cursor; also codex's own unrouted fallback): (1) execs the real binary with all args +
+ * inherited stdio + preserved exit code; (2) for the measurable batch form ONLY, runs a FAIL-OPEN,
+ * CONTENT-FREE before-call recommendation step (`compaction precall`; recommendation-only - it never
+ * mutates the input), then tees stdout to a temp copy and calls the content-free capture bridge, then
+ * deletes the temp; (3) passes everything else through untouched.
  *
- * Gateway-route kind (claude-code): see `generateClaudeRoutingShimScript`.
+ * Gateway-route kind (claude-code, codex): see `generateClaudeRoutingShimScript` /
+ * `generateCodexRoutingShimScript`. Codex routes EVERY normal invocation, falling back to the capture
+ * kind above only when the user's own route is detected (see the module doc comment).
  */
-export function generateShimScript(tool: ShimTool, realBin: string): string {
+export function generateShimScript(tool: ShimTool, realBin: string, managedLauncher?: string): string {
+  if (managedLauncher) {
+    const script = generateShimScript(tool, realBin);
+    return script.replace("set -u\n", `set -u\n# COMPACTION_MANAGED_SESSION_V1\nexec ${bashSingleQuote(managedLauncher)} --managed-session-shim "$0" -- "$@"\n`);
+  }
+  if (tool === "codex") return generateCodexRoutingShimScript(realBin);
   if (tool === "claude-code") return generateClaudeRoutingShimScript(realBin);
   const cfg = SHIM_TOOLS[tool];
   const captureTool: CaptureShimTool = cfg.captureTool ?? tool;
@@ -538,7 +748,9 @@ export function installToolShim(tool: ShimTool, env: ShimEnv = process.env, opti
   }
 
   mkdirSync(shimDir, { recursive: true });
-  writeFileSync(shimPath, generateShimScript(tool, realBin), "utf8");
+  let managedLauncher: string | undefined;
+  try { managedLauncher = loadManagedInstallation(defaultManagedRoot(env as NodeJS.ProcessEnv), false).receipt.launcherPath; } catch { /* Nonmanaged installs retain their existing shim flow. */ }
+  writeFileSync(shimPath, generateShimScript(tool, realBin, managedLauncher), "utf8");
   chmodSync(shimPath, 0o755);
   const record = readRecord(env);
   record.shims[tool] = { shimName, realBin, installedAt: now() };

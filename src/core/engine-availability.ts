@@ -40,9 +40,53 @@ export type EngineAvailability =
  */
 export async function engineAvailability(env: NodeJS.ProcessEnv = process.env): Promise<EngineAvailability> {
   const { resolveEngine } = await import("./gateway/engine-ipc/supervisor.js");
-  if (resolveEngine({ env }).path !== null) return "present";
+  const { loadExecutingManagedInstallation } = await import("./update/ownership.js");
+  let managed: ReturnType<typeof loadExecutingManagedInstallation>;
+  try { managed = loadExecutingManagedInstallation(env); }
+  catch { return "unavailable"; }
+  if (resolveEngine({ env, ...(managed ? {
+    verifiedInstalledArtifact: managed.pair.engine.mode === "signed" ? managed.pair.engine : null
+  } : {}) }).path !== null) return "present";
   const { pinnedRootKeys } = await import("./engine-install/manifest.js");
   return pinnedRootKeys().length > 0 ? "installable" : "unavailable";
+}
+
+/**
+ * WHETHER THE ENGINE THAT WOULD RUN CAN DO INPUT COMPACTION AT ALL — the question `engineAvailability`
+ * does NOT answer, and whose absence let a flagship capability die unseen for five days.
+ *
+ * An engine can be present, signed, verified, and spawning happily while every input-compacted body
+ * it produces is refused on the way out because it declares a meter unit this client cannot place.
+ * The gateway logged one line per request and nothing else asked. `status` says `Engine: ready`,
+ * because an engine IS ready — for output shaping. This is the missing second question.
+ *
+ * `"unsupported"` is the only state that makes a claim about an artifact, and it makes it from the
+ * engine's own SIGNED manifest, never from a guess about an older engine's unit.
+ */
+export type EngineInputCompaction =
+  /** No engine resolves at all — a separate problem, already reported by `engineAvailability`. */
+  | "no-engine"
+  /** The resolved engine's signed manifest declares this client's active meter unit. */
+  | "supported"
+  /** The resolved engine's signed manifest declares a unit this client cannot place, or declares none. */
+  | "unsupported"
+  /** No signed manifest to read (dev build / explicit path override). Not a claim either way. */
+  | "undeclared";
+
+export async function engineInputCompaction(env: NodeJS.ProcessEnv = process.env): Promise<EngineInputCompaction> {
+  const { resolveEngine } = await import("./gateway/engine-ipc/supervisor.js");
+  const { loadExecutingManagedInstallation } = await import("./update/ownership.js");
+  let managed: ReturnType<typeof loadExecutingManagedInstallation>;
+  try { managed = loadExecutingManagedInstallation(env); }
+  catch { return "no-engine"; }
+  // The SAME resolution the supervisor performs, with the same options — so this cannot describe a
+  // different engine from the one a request would reach.
+  const resolved = resolveEngine({ env, ...(managed ? {
+    verifiedInstalledArtifact: managed.pair.engine.mode === "signed" ? managed.pair.engine : null
+  } : {}) });
+  if (resolved.path === null) return "no-engine";
+  return resolved.inputCompaction.support === "supported" ? "supported"
+    : resolved.inputCompaction.support === "unsupported" ? "unsupported" : "undeclared";
 }
 
 /**

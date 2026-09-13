@@ -36,12 +36,15 @@ import { devRootKeyPath, readDevRootKey } from "../../core/engine-install/verify
 import {
   ENGINE_EULA_SUMMARY,
   ENGINE_EULA_VERSION,
+  canPresentEngineEula,
   engineEulaAccepted,
   engineEulaUrl,
   readEngineEulaAcceptance,
   recordEngineEulaAcceptance
 } from "../../core/legal/engine-eula.js";
 import { resolveEngine } from "../../core/gateway/engine-ipc/supervisor.js";
+import { loadExecutingManagedInstallation } from "../../core/update/ownership.js";
+import { stageManagedEngine } from "../../core/update/engine-pair.js";
 
 const DEV_SIGNED_WARNING =
   "DEV-SIGNED engine: this install was verified against a LOCAL dev root key, not a Compaction " +
@@ -55,7 +58,22 @@ function describeTrust(trust: "pinned-root" | "dev-root"): string {
 /** `compaction engine status` — local read only. */
 function runStatus(env: NodeJS.ProcessEnv = process.env): void {
   console.log(chalk.cyan("compaction engine status"));
-  const resolved = resolveEngine({ env });
+  let managed: ReturnType<typeof loadExecutingManagedInstallation>;
+  try { managed = loadExecutingManagedInstallation(env); }
+  catch {
+    console.log(chalk.red("  Managed engine: unavailable (installation or session identity could not be verified)."));
+    console.log(chalk.dim("  This command read local files only — no network call was made."));
+    process.exitCode = 1;
+    return;
+  }
+  const resolved = resolveEngine({ env, ...(managed ? {
+    verifiedInstalledArtifact: managed.pair.engine.mode === "signed" ? managed.pair.engine : null
+  } : {}) });
+  if (managed) {
+    console.log(`  Active managed pair: ${managed.pair.id}`);
+    if (managed.pair.engine.mode === "basic") console.log("  Active managed engine: Basic (no compatible signed engine selected).");
+    if (managed.state.staged) console.log("  A separate update is staged for a safe next session.");
+  }
 
   if (resolved.source === "installed" && resolved.installed) {
     const { manifest, trust } = resolved.installed;
@@ -66,7 +84,7 @@ function runStatus(env: NodeJS.ProcessEnv = process.env): void {
     if (trust === "dev-root") console.log(chalk.yellow(`  ${DEV_SIGNED_WARNING}`));
   } else if (resolved.source === "installed" && resolved.unverifiedReason !== undefined) {
     console.log(chalk.red(`  Installed engine: NOT verified (${resolved.unverifiedReason})`));
-    console.log(chalk.dim(`  Pointer:  ${enginePointerPath(env)} -> ${readCurrentPointer(env) ?? "(unreadable)"}`));
+    if (!managed) console.log(chalk.dim(`  Pointer:  ${enginePointerPath(env)} -> ${readCurrentPointer(env) ?? "(unreadable)"}`));
     console.log(
       chalk.dim(
         "  An unverified install never runs: the gateway degrades fail-open (requests are forwarded " +
@@ -113,8 +131,12 @@ function runStatus(env: NodeJS.ProcessEnv = process.env): void {
  * accepted its terms because nobody was watching is precisely the outcome the gate exists to
  * prevent, so a non-interactive run is refused and told the one command that resolves it.
  */
-async function ensureEngineEulaAccepted(env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
-  if (engineEulaAccepted(env)) return true;
+async function ensureEngineEulaAccepted(env: NodeJS.ProcessEnv, requiredVersion: string): Promise<boolean> {
+  if (!canPresentEngineEula(requiredVersion)) {
+    console.log(chalk.yellow(engineEulaRequirementInstruction(requiredVersion)));
+    return false;
+  }
+  if (engineEulaAccepted(env, requiredVersion)) return true;
   printEngineEulaOffer(env);
   if (!process.stdin.isTTY) {
     console.log(
@@ -129,6 +151,8 @@ async function ensureEngineEulaAccepted(env: NodeJS.ProcessEnv = process.env): P
   let answer: string;
   try {
     answer = await rl.question("  Accept the Compaction Engine License Agreement? Type yes to accept: ");
+  } catch {
+    answer = "";
   } finally {
     rl.close();
   }
@@ -141,6 +165,14 @@ async function ensureEngineEulaAccepted(env: NodeJS.ProcessEnv = process.env): P
   const record = recordEngineEulaAcceptance(env);
   console.log(chalk.green(`  Accepted version ${record.version}. Recorded on this device.`));
   return true;
+}
+
+/** Version comes from verified release metadata, never from installer error prose. */
+export function engineEulaRequirementInstruction(requiredVersion: string): string {
+  if (canPresentEngineEula(requiredVersion)) {
+    return `The signed engine release requires EULA ${requiredVersion}. Run \`compaction engine license\` to review it, then explicitly accept with \`compaction engine license --accept\` and retry.`;
+  }
+  return `The signed engine release requires EULA ${requiredVersion}; this CLI can present only EULA ${ENGINE_EULA_VERSION}. Update and activate a CLI that includes the required terms, then run \`compaction engine license\` to review and explicitly accept them before retrying.`;
 }
 
 /** The agreement, its address, and the short statement of what it covers. Printing only. */
@@ -193,6 +225,19 @@ async function runInstall(
     return;
   }
 
+  let managed: ReturnType<typeof loadExecutingManagedInstallation>;
+  try { managed = loadExecutingManagedInstallation(env); }
+  catch {
+    console.log(chalk.red("  Engine update refused: managed installation or session identity could not be verified."));
+    process.exitCode = 1;
+    return;
+  }
+  if (managed && (channel !== "stable" || opts.devRootKey !== undefined)) {
+    console.log(chalk.red("  Managed pairs require a stable engine verified against the production release root."));
+    process.exitCode = 1;
+    return;
+  }
+
   if (opts.devRootKey !== undefined) {
     let spki: string;
     try {
@@ -218,19 +263,41 @@ async function runInstall(
     // THE ACCOUNT PRECONDITION IS READ BEFORE THE LICENCE IS OFFERED. Engine releases are a
     // Community-account feature, so a logged-out device cannot receive the artifact whatever it
     // agrees to; offering the agreement first would collect consent for something that cannot
-    // happen, and would bury the one thing the user actually has to fix. Both checks are local
-    // reads — neither reaches the network. `installEngineRelease` re-checks the same store, so this
+    // happen, and would bury the one thing the user actually has to fix. This check is local;
+    // release metadata is then verified before the required licence is offered. The installer re-checks the same store, so this
     // is a precondition on the order the two refusals are shown, not a replacement for its guard.
     if (readStoredCredentials(env) === undefined) {
       throw new EngineInstallError("not logged in — run `compaction login` first", "not-logged-in");
     }
 
-    if (!(await ensureEngineEulaAccepted(env))) {
-      process.exitCode = 1;
+    if (managed) {
+      let selected = await stageManagedEngine(managed.root, { env, refresh: true, intent: "explicit" });
+      if (selected.reason === "eula-not-accepted" && selected.requiredEulaVersion &&
+        canPresentEngineEula(selected.requiredEulaVersion) &&
+        await ensureEngineEulaAccepted(env, selected.requiredEulaVersion)) {
+        selected = await stageManagedEngine(managed.root, { env, refresh: true, intent: "explicit" });
+      }
+      if (selected.reason) {
+        console.log(chalk.yellow(`  Engine ${verb} did not acquire a new compatible release (${selected.reason}).`));
+        if (selected.requiredEulaVersion) console.log(chalk.dim(engineEulaRequirementInstruction(selected.requiredEulaVersion)));
+        process.exitCode = 1;
+      }
+      if (selected.staged) console.log("  Compatible CLI/engine pair staged for a safe next session. This session keeps its current pair.");
+      else console.log("  The active managed pair is unchanged.");
       return;
     }
-
-    const result = await installEngineRelease({ channel: channel as EngineChannel, env });
+    const acquire = () => installEngineRelease({ channel: channel as EngineChannel, env });
+    let result: Awaited<ReturnType<typeof acquire>>;
+    try {
+      result = await acquire();
+    } catch (error) {
+      if (!(error instanceof EngineInstallError) || error.code !== "eula-not-accepted" || !error.requiredEulaVersion) throw error;
+      if (!(await ensureEngineEulaAccepted(env, error.requiredEulaVersion))) {
+        process.exitCode = 1;
+        return;
+      }
+      result = await acquire();
+    }
     if (!result.updated) {
       console.log(chalk.green(`  Already up to date: engine ${chalk.bold(result.version)} (${result.channel} channel).`));
     } else {
@@ -259,6 +326,8 @@ async function runInstall(
         );
       } else if (error.code === "no-published-release") {
         console.log(chalk.dim(`  The service has no published release on the ${channel} channel.`));
+      } else if (error.code === "eula-not-accepted" && error.requiredEulaVersion) {
+        console.log(chalk.dim(engineEulaRequirementInstruction(error.requiredEulaVersion)));
       }
     } else {
       console.log(chalk.red(`  Engine ${verb} did not complete: ${error instanceof Error ? error.message : String(error)}`));

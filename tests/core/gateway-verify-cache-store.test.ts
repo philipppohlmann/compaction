@@ -81,11 +81,11 @@ describe("capability matrix liveVerified is derived from real verification evide
     // A non-openai / non-routed row is NOT flipped by an openai record.
     expect(capabilityForWorkflow(matrix, "claude-code")!.liveVerified).toBe(false);
     expect(capabilityForWorkflow(matrix, "cursor")!.liveVerified).toBe(false);
-    // Codex routes to openai by DEFAULT but is only `if-configured` (not actually routed through the Gateway
-    // by default), so a passing openai record must NOT flip its liveVerified, it has no cache-proof path yet.
+    // Codex's normal saved-login shim routes to OpenAI through the Gateway, so the provider-level
+    // passing verification applies to this routed row too.
     const codex = capabilityForWorkflow(matrix, "codex")!;
-    expect(codex.liveVerified).toBe(false);
-    expect(codex.reasons.liveVerified).toBe(LIVE_UNVERIFIED_REASON);
+    expect(codex.liveVerified).toBe(true);
+    expect(codex.reasons.liveVerified).toBeUndefined();
   });
 
   it("a FAILING (liveVerified:false) or ABSENT record never yields liveVerified:true", () => {

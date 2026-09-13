@@ -38,7 +38,7 @@ export const CODEX_SHAPING_HOOK_TIMEOUT_SECONDS = 10;
  * uses, so the two matchers in this pair cannot disagree about what "ours" means. A substring test
  * ("compaction" + "hooks shape" + the tool) claims every foreign command that WRAPS ours, e.g.
  * `echo compaction hooks shape cursor`: install would then skip (believing ours is present) and
- * uninstall — the path `init --disconnect 2|3` runs — would DELETE the user's own entry, against this
+ * uninstall — the named Codex/Cursor disconnect path runs — would DELETE the user's own entry, against this
  * module's promise that every foreign entry survives. Install writes only a command it produced
  * itself, so an exact comparison is both sufficient and the only safe rule. Surrounding whitespace is
  * tolerated because a hand-edited config often carries it.

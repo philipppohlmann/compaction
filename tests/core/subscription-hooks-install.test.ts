@@ -43,6 +43,9 @@ describe("the entry list is the SAME list that gets written (one source of truth
     expect(codex.map((e) => e.command)).toEqual(["compaction hooks shape codex", "compaction hooks line codex"]);
     // The shaping entry names the model-visible effect — that is what makes the review screen consent.
     expect(codex[0].effect).toContain("what the model sees");
+    expect(codex[1].effect).toContain("settled content-free receipt evidence");
+    expect(codex[1].effect).toContain("when recorded");
+    expect(codex[1].effect).not.toMatch(/after each turn|per-turn receipt line/);
 
     const cursor = subscriptionHookEntries("cursor");
     expect(cursor.map((e) => e.event)).toEqual(["sessionStart"]);
@@ -67,7 +70,7 @@ describe("installSubscriptionHooks", () => {
     const config = JSON.parse(readFileSync(codexFile(), "utf8"));
     expect(hasAllSubscriptionHooks("codex", config)).toBe(true);
     expect(config.hooks.UserPromptSubmit[0].hooks[0].timeout).toBe(10);
-    expect(config.hooks.Stop[0].hooks[0].timeout).toBe(5);
+    expect(config.hooks.Stop[0].hooks[0].timeout).toBe(15);
   });
 
   it("Cursor: writes the FLAT sessionStart entry plus the required schema version", async () => {

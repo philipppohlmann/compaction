@@ -9,11 +9,14 @@
  * Contract:
  *  - Read the Claude Code session JSON from stdin (fields include `cwd`, `session_id`, model/token/cost;
  *    tolerate ANY shape). Resolve cwd (the JSON's `cwd` when present, else process.cwd()).
+ *  - IT MAY NOT ASSERT HEALTH IT CANNOT SUPPORT. When this directory's transparent-routing endpoint is
+ *    recorded down or quarantined, the line says so and says nothing else — see `routing-health.ts`.
+ *    That is a synchronous read of a prior render's measurement, never a probe on this path.
  *  - THE LINE DESCRIBES THE USER'S RUN, not one provider call. With a run boundary for this session,
  *    print that run's aggregate and NEVER a per-call receipt — a run with nothing to show falls
  *    through to the content-free stdin fallbacks rather than to the ledger.
- *  - No run boundary at all (no hook, or no `session_id`) → the per-call path: the LATEST gateway
- *    receipt (tail-only, fast) via `receiptLineFromGatewayReceipt`.
+ *  - No run boundary at all → the legacy per-call path, but a receipt carrying a different named
+ *    session's correlation is rejected instead of being borrowed from the cwd.
  *  - Either way, last: a minimal content-free OUTPUT-ONLY line from the stdin token counts, else a
  *    short quiet placeholder (`compaction · recording`). Never empty-crash.
  *
@@ -33,6 +36,7 @@ import {
   type GatewayReceipt,
   type GatewayReceiptTailWindow
 } from "../../core/gateway/receipt.js";
+import { routingEndpointState } from "../../core/gateway/routing-health.js";
 import { sessionCorrelationId } from "../../core/gateway/session-correlation.js";
 import {
   completedUserRuns,
@@ -42,12 +46,14 @@ import {
 } from "../../core/gateway/run-boundary.js";
 import { aggregateRun } from "../../core/gateway/run-aggregate.js";
 import {
+  latestConsistentClaudeStopEvent,
   settledRunApplyPosture,
   settledStopLineFromActivityEvent
 } from "../../core/settled-stop-activity.js";
 import {
   isReceiptLineEnabled,
   communityFullApplyReceiptLine,
+  isRealApply,
   nonApplyReceiptLine,
   receiptCeiling,
   receiptLineFromGatewayReceipt,
@@ -68,6 +74,33 @@ import { resolveOpenTier } from "../../core/onboarding-preferences.js";
 
 /** The quiet, claim-free placeholder when there is nothing to report yet (never empty). */
 export const STATUS_LINE_PLACEHOLDER = "compaction · recording";
+
+/**
+ * The line while this directory's routed endpoint is not answering.
+ *
+ * It REPLACES the normal line rather than decorating it. Two reasons, both load-bearing:
+ *  - every other rung of this ladder describes recording or shaping that is not happening. The
+ *    placeholder says `recording`; a run or receipt line shows counts that cannot advance while the
+ *    endpoint is down, because no receipt can land. Appending a warning to a stale number leaves the
+ *    stale number as the sentence's subject.
+ *  - a suffix is what a narrow terminal truncates first, which would delete the warning in exactly
+ *    the case it exists for.
+ *
+ * It asserts the present tense only. It does NOT promise revival - the same reason the quarantined
+ * routing row in `gateway status` prints a bare `NOT ANSWERING`.
+ */
+export const STATUS_LINE_ROUTING_DOWN = "compaction · routing endpoint not answering";
+
+/**
+ * The line while the routed endpoint's reserved port is quarantined.
+ *
+ * Kept distinct from the line above because the states differ in the one way that matters to the
+ * user: a plain refusal is repaired at the same address, a quarantine never is. This surface has no
+ * room for the reason, so it names the state and points at the surface that carries the reason. A
+ * pointer, not a promise.
+ */
+export const STATUS_LINE_ROUTING_QUARANTINED =
+  "compaction · routing endpoint quarantined · see 'compaction gateway status'";
 
 /** The (loosely-typed) fields we read off the Claude Code status-line stdin JSON. Any shape tolerated. */
 interface StatusLineStdin {
@@ -116,7 +149,7 @@ export interface StatusLineDeps {
    * Read the receipts in the tail window for the run aggregate (injectable for tests). A bare array
    * is taken as a complete read; a window carries the truncation fact.
    */
-  readReceipts?: (cwd: string) => Promise<GatewayReceipt[] | GatewayReceiptTailWindow>;
+  readReceipts?: (cwd: string, coverFrom?: string) => Promise<GatewayReceipt[] | GatewayReceiptTailWindow>;
   /** Read the LATEST gateway receipt for `cwd` (tail-only; injectable for tests). */
   readReceipt?: (cwd: string) => Promise<GatewayReceipt | undefined>;
   env?: NodeJS.ProcessEnv;
@@ -144,9 +177,13 @@ interface RunRender {
 }
 
 /**
- * Read the one settled activity event for THIS exact closed run. This is only a no-receipt fallback:
+ * Read the settled activity event for THIS exact closed run. This is only a no-receipt fallback:
  * gateway aggregation remains authoritative above it, an open run can never resurrect an earlier
- * result, and conflicting duplicates fail closed rather than selecting "latest" by accident.
+ * result. A long run settles more than once - the Stop hook writes a fresh cumulative snapshot on
+ * every Stop - so more than one match is the ORDINARY case, not a conflict: `latestConsistentClaudeStopEvent`
+ * picks the series' latest snapshot when the whole set is provably one consistent cumulative series,
+ * and still fails closed (returns `undefined`) on a genuine conflict rather than guessing "latest" by
+ * accident. See its doc comment for the exact consistency rule.
  */
 async function exactSettledClaudeActivityLine(cwd: string, run: UserRun): Promise<string | undefined> {
   if (!run.ended_at) return undefined;
@@ -159,7 +196,8 @@ async function exactSettledClaudeActivityLine(cwd: string, run: UserRun): Promis
       event.session_id === identity.sessionId &&
       event.run_id === identity.runId
     );
-    return matches.length === 1 ? settledStopLineFromActivityEvent(matches[0]) : undefined;
+    const selected = latestConsistentClaudeStopEvent(matches);
+    return selected ? settledStopLineFromActivityEvent(selected) : undefined;
   } catch {
     // A status render must never turn an unreadable optional activity fallback into a host failure.
     return undefined;
@@ -220,6 +258,9 @@ function runLineFor(args: {
     ...(outputCalibrated ? { outputBasis: "measured" as const } : {}),
     ...(!outputCalibrated && aggregate.shapedCallCount > 0 ? { outputState: "unseeded" as const } : {}),
     ...(ceiling !== undefined ? { ceiling } : {}),
+    ...(args.run.ended_at
+      ? { activeWindow: { startedAt: args.run.started_at, endedAt: args.run.ended_at } }
+      : {}),
     ...(incomplete ? { incomplete } : {})
   });
 }
@@ -227,9 +268,10 @@ function runLineFor(args: {
 /**
  * The RUN render, or `undefined` when this session has no run boundary to describe at all.
  *
- * Returns `undefined` — handing the render to the per-receipt path — in exactly three honest cases: the
- * stdin carried no `session_id`, the device could not produce a correlation id (no salt), or no
- * `UserPromptSubmit` marker exists for this session yet. It never guesses a run.
+ * Returns `undefined` — handing the render to the per-receipt path — when stdin carries no
+ * `session_id`, the device cannot produce a correlation id, or no `UserPromptSubmit` marker exists.
+ * The fallback requires an exact receipt correlation whenever stdin names a session. Legacy
+ * uncorrelated receipts remain available only to legacy stdin that itself has no session identity.
  *
  * IN EVERY OTHER CASE THE RUN PATH IS AUTHORITATIVE OVER THE PER-CALL RECEIPT. Once a session has run
  * boundaries, a receipt is never again allowed to take this surface — see the between-runs note below.
@@ -239,7 +281,7 @@ async function runAggregateStatusLine(args: {
   env: NodeJS.ProcessEnv;
   stdin: StatusLineStdin;
   calibrationResolver: OutputCalibrationResolver;
-  readReceipts: (cwd: string) => Promise<GatewayReceipt[] | GatewayReceiptTailWindow>;
+  readReceipts: (cwd: string, coverFrom?: string) => Promise<GatewayReceipt[] | GatewayReceiptTailWindow>;
 }): Promise<RunRender | undefined> {
   const sessionId = asString(args.stdin.session_id);
   if (!sessionId) return undefined;
@@ -248,7 +290,10 @@ async function runAggregateStatusLine(args: {
   const run = currentUserRun(correlationId, args.env);
   if (!run) return undefined;
 
-  const read = await args.readReceipts(args.cwd);
+  // Cover THIS run: the window grows back past its start rather than stopping at a fixed byte tail
+  // measured from the end of the ledger, so a normal long run is COMPLETE instead of reporting an
+  // ambiguous partial total. A run that still exceeds the ceiling keeps its honest `truncated`.
+  const read = await args.readReceipts(args.cwd, run.started_at);
   const window: GatewayReceiptTailWindow = Array.isArray(read) ? { receipts: read, truncated: false } : read;
   const line = runLineFor({ run, window, env: args.env, calibrationResolver: args.calibrationResolver });
   if (line !== undefined) return { line };
@@ -283,6 +328,9 @@ async function runAggregateStatusLine(args: {
 /**
  * Compute the ONE status line to print for a given stdin blob. Pure + fail-open: returns a string to
  * print, or `undefined` to print NOTHING (kill switch on). Never throws.
+ *  0. this directory's routed endpoint is quarantined or has been unreachable past the grace window →
+ *     the ROUTING STATE line, and nothing else. Every rung below describes recording or shaping that
+ *     is not happening.
  *  1. this session has a run boundary with something to report → the RUN line.
  *  2. else a gateway receipt for this cwd → the canonical per-call input+output line. SKIPPED ENTIRELY
  *     when the session has a run boundary: a run with nothing renderable stays quiet rather than
@@ -298,6 +346,26 @@ export async function computeStatusLine(rawStdin: string, deps: StatusLineDeps =
   try {
     const stdin = parseStatusLineStdin(rawStdin);
     const cwd = asString(stdin.cwd) ?? deps.cwd ?? process.cwd();
+
+    // ======================= THE SURFACE MAY NOT ASSERT HEALTH IT CANNOT SUPPORT =======================
+    // Every rung below describes recording or shaping. During the measured outage the endpoint backing
+    // this session was dead for minutes and every request failed, and this line went on rendering
+    // anyway - the one surface whose job is telling the user what is happening asserted that something
+    // was.
+    //
+    // This is a READ, never a probe: `routingEndpointState` opens no socket, performs no handshake and
+    // starts nothing. It resolves what the previous render's detection pass already measured
+    // (`detectDeadRoutingEndpoint` -> `routing-revival.ts` -> `routing-health.ts`), so the render-loop
+    // rail is untouched: still no wait, still no blocked turn.
+    //
+    // GATED ON THE SLOT'S EXISTENCE, so an unrouted directory - every hooks-only and subscription
+    // device - renders byte-for-byte what it rendered before. And a state is only reported after the
+    // endpoint has been unreachable for longer than a successful self-repair takes, so an ordinary
+    // recovery does not flash a failure across this line on its way back up.
+    const routingState = routingEndpointState(cwd, env);
+    if (routingState === "quarantined") return STATUS_LINE_ROUTING_QUARANTINED;
+    if (routingState === "unavailable") return STATUS_LINE_ROUTING_DOWN;
+
     const readReceipt = deps.readReceipt ?? ((c: string) => readLatestGatewayReceiptTail(c));
 
     // The OPEN per-turn tier label from the local product-mode store (`apply off` / `basic shaping`),
@@ -358,7 +426,9 @@ export async function computeStatusLine(rawStdin: string, deps: StatusLineDeps =
     // what resurrected the previous run's last micro-call.
     const runRender = await runAggregateStatusLine({
       cwd, env, stdin, calibrationResolver,
-      readReceipts: deps.readReceipts ?? ((c: string) => readGatewayReceiptTailWindow(c))
+      readReceipts:
+        deps.readReceipts ??
+        ((c: string, coverFrom?: string) => readGatewayReceiptTailWindow(c, undefined, coverFrom))
     });
     if (runRender?.line !== undefined) return runRender.line;
     // OWNERSHIP IS SCOPED TO THE PER-CALL RECEIPT RUNG, AND ONLY TO IT. Suppressing rung 2 is the whole
@@ -374,11 +444,23 @@ export async function computeStatusLine(rawStdin: string, deps: StatusLineDeps =
     // output shaping — trading a between-run flicker for the loss of the whole visible surface.
     const runOwnsSurface = runRender !== undefined;
 
-    const receipt = runOwnsSurface ? undefined : await readReceipt(cwd);
+    const candidateReceipt = runOwnsSurface ? undefined : await readReceipt(cwd);
+    const namedSessionId = asString(stdin.session_id);
+    const expectedCorrelation = namedSessionId ? sessionCorrelationId(namedSessionId, env) : undefined;
+    // Modern receipts identify their session with a keyed, content-free correlation. Named-session
+    // stdin therefore requires an exact match: an uncorrelated legacy receipt is no more attributable
+    // to this session than a receipt positively naming another one. Legacy fallback remains only for
+    // legacy stdin that carries no session identity of its own.
+    const receipt =
+      namedSessionId !== undefined
+        ? expectedCorrelation !== undefined && candidateReceipt?.session_correlation_id === expectedCorrelation
+          ? candidateReceipt
+          : undefined
+        : candidateReceipt;
     if (receipt) {
-      // FULL tier (a valid entitlement lease is present): a REAL full-apply receipt renders the
-      // `full apply` line via the community builder; any non-apply turn falls back to the honest Open
-      // observe line (`full apply` never rides a record turn). `observe`/`basic` use the Open builder.
+      // FULL tier (a valid entitlement lease is present): only a successful stored-policy private LCM
+      // input reduction renders `full apply`. Other real input reductions keep their measured arrow via
+      // the generic builder; record/shaping-only turns use the label-free fallback.
       // The ceiling rides the FALLBACK too: a full-tier user whose metered allowance is locally spent
       // sees non-apply turns, and those are exactly the turns that must say why.
       // THE GATEWAY IS NOW A SHAPING SURFACE TOO.
@@ -468,14 +550,16 @@ export async function computeStatusLine(rawStdin: string, deps: StatusLineDeps =
       // `full apply → apply off → full apply` while ONE task was running.
       //
       // `apply off` is the Open OBSERVE posture — the user's choice of no model-visible mutation — and is
-      // now unreachable from the full tier. `full apply` stays reserved for a real apply receipt, so the
+      // now unreachable from the full tier. `full apply` stays reserved for proven private input apply, so the
       // fallback renders the turn's counts with no label at all: the device's posture across a task is a
       // run-level statement, not a per-call one. Per-call component activity stays in the
       // receipt/evidence layer (`watch`, `status`), where it belongs.
       const line =
         productTier === "full"
           ? (communityFullApplyReceiptLine(receipt, savedForReceipt, ceiling) ??
-            nonApplyReceiptLine(receipt, savedForReceipt, allowanceResetsOn, ceiling))
+            (isRealApply(receipt)
+              ? receiptLineFromGatewayReceipt(receipt, undefined, undefined, savedForReceipt, ceiling)
+              : nonApplyReceiptLine(receipt, savedForReceipt, allowanceResetsOn, ceiling)))
           : receiptLineFromGatewayReceipt(receipt, openTier, allowanceResetsOn, savedForReceipt, ceiling);
       if (line) return line;
     }
@@ -517,6 +601,37 @@ async function readAllStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/**
+ * DETECTION ONLY for a dead transparent-routing endpoint.
+ *
+ * The status line runs continuously inside Claude Code's render loop, so this call site is held to a
+ * harder rail than the `UserPromptSubmit` repair: it NEVER waits for a gateway to come up, never
+ * performs the identity handshake, and never blocks a turn. A refused reserved port makes it spawn a
+ * replacement detached and return; a port that answers makes it do nothing at all.
+ *
+ * That is why it is safe without the handshake: it hands out no base URL and draws no conclusion
+ * about who is listening. Authorisation lives where a URL is actually handed over - `ensure.ts` and
+ * the waiting path of `routing-revival.ts` - and both authenticate before returning anything.
+ *
+ * An unrouted session costs one cheap slot-existence check and returns.
+ */
+async function detectDeadRoutingEndpoint(stdinRaw: string): Promise<void> {
+  try {
+    let cwd = process.cwd();
+    try {
+      const parsed = JSON.parse(stdinRaw) as { cwd?: unknown } | null;
+      if (typeof parsed?.cwd === "string" && parsed.cwd.trim() !== "") cwd = parsed.cwd;
+    } catch {
+      /* any shape tolerated; fall back to this process's cwd */
+    }
+    const { hasRoutingSlotForCwd, reviveRoutingGatewayIfDown } = await import("../../core/gateway/routing-revival.js");
+    if (!hasRoutingSlotForCwd(cwd)) return;
+    await reviveRoutingGatewayIfDown(cwd, { wait: false });
+  } catch {
+    /* FAIL-OPEN: detection is a convenience; the invariant rests on the UserPromptSubmit repair. */
+  }
+}
+
 export function registerStatuslineCommand(program: Command): void {
   program
     .command("statusline")
@@ -533,6 +648,10 @@ export function registerStatuslineCommand(program: Command): void {
         const raw = await readAllStdin();
         const line = await computeStatusLine(raw);
         if (line) process.stdout.write(`${line}\n`);
+        // AFTER the line is written, never before. This is detection only: it shortens the time
+        // between a routing gateway dying and something noticing, and it must never add latency to
+        // a render or hold the turn. See `detectDeadRoutingEndpoint`.
+        await detectDeadRoutingEndpoint(raw);
       } catch {
         // Swallow everything - a status-line command must never break the host UI.
       }

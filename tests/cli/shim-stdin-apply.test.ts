@@ -13,8 +13,6 @@ import { installToolShim } from "../../src/core/tool-shim.js";
  * COMPACTION_BIN that writes to --compacted-out (standing in for an operator's `y`); the real-CLI case
  * proves the no-tty path feeds the original unchanged.
  */
-const TSX = path.resolve("node_modules/.bin/tsx");
-const CLI_ENTRY = path.resolve("src/cli/index.ts");
 const NODE_DIR = path.dirname(process.execPath);
 
 const BLOCK = "SHARED CONTEXT BLOCK long enough to clear the duplicate size floor for sure here.";
@@ -40,39 +38,42 @@ exit 3
   chmodSync(p, 0o755);
 }
 
-/** The REAL compaction CLI as COMPACTION_BIN (no tty → never applies). */
-function realCompactionBin(): string {
-  const bin = path.join(root, "compaction-real");
-  writeFileSync(bin, `#!/usr/bin/env bash\nexec ${JSON.stringify(TSX)} ${JSON.stringify(CLI_ENTRY)} "$@"\n`, "utf8");
-  chmodSync(bin, 0o755);
-  return bin;
-}
-
 /**
- * A FAKE compaction bin that stands in for an operator approval WITHOUT a tty:
+ * A fake Compaction launcher that stands in for the precall decision and Gateway wrapper:
  * - `precall … --stdin-boundary-check …` → exit 0 (safe boundary) unless a positional prompt is present.
- * - `precall … --stdin-file S --compacted-out C …` → writes COMPACTED content to C (simulated approval).
- * Everything else is a no-op exit 0. It NEVER reads the tool's stdin.
+ * - `precall … --compacted-out C …` → optionally writes approved compacted content to C.
+ * - `gateway run … -- REAL …` → execs that one real child with inherited stdio.
+ * Every invocation is logged by command name so the tests can reject post-hoc capture/double routing.
  */
-function fakeApprovingCompactionBin(compacted: string): string {
+function fakeCompactionBin(compacted = ""): string {
   const bin = path.join(root, "compaction-fake");
+  const calls = path.join(root, "compaction-calls");
   const script = `#!/usr/bin/env bash
-__out=""
-__is_check=0
-for __a in "$@"; do
-  case "$__a" in
-    --stdin-boundary-check) __is_check=1 ;;
-  esac
-done
-# find --compacted-out value
-__prev=""
-for __a in "$@"; do
-  if [ "$__prev" = "--compacted-out" ]; then __out="$__a"; fi
-  __prev="$__a"
-done
-if [ "$__is_check" = "1" ]; then exit 0; fi
-if [ -n "$__out" ]; then printf '%s' ${JSON.stringify(compacted)} > "$__out"; fi
-exit 0
+printf '%s\n' "$1" >> ${JSON.stringify(calls)}
+case "$1" in
+  gateway)
+    while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+    [ "$#" -gt 0 ] && shift
+    exec "$@"
+    ;;
+  precall)
+    __check=0; __after=0; __positional=0; __out=""; __prev=""
+    for __a in "$@"; do
+      if [ "$__prev" = "--compacted-out" ]; then __out="$__a"; fi
+      if [ "$__a" = "--stdin-boundary-check" ]; then __check=1; fi
+      if [ "$__after" = "1" ]; then
+        case "$__a" in exec|--json) ;; -*) ;; *) __positional=1 ;; esac
+      fi
+      if [ "$__a" = "--" ]; then __after=1; fi
+      __prev="$__a"
+    done
+    if [ "$__check" = "1" ]; then [ "$__positional" = "0" ]; exit $?; fi
+    if [ -n "$__out" ] && [ -n ${JSON.stringify(compacted)} ]; then printf '%s' ${JSON.stringify(compacted)} > "$__out"; fi
+    exit 0
+    ;;
+  capture) exit 0 ;;
+esac
+exit 1
 `;
   writeFileSync(bin, script, "utf8");
   chmodSync(bin, 0o755);
@@ -122,33 +123,38 @@ function stubStdin(stdout: string): string {
   return m ? m[1] : "";
 }
 
-describe("shim stdin-boundary apply (e2e, synthetic stub + generated Codex shim)", () => {
-  it("APPROVED (fake approval writes compacted-out): the real binary receives the COMPACTED stdin", async () => {
-    const compactedBin = fakeApprovingCompactionBin("COMPACTED_STDIN_CONTENT");
+describe("Codex shim precall + single Gateway inference (e2e, synthetic stub)", () => {
+  it("APPROVED: the one gateway-routed real child receives compacted stdin, with no capture bridge", async () => {
+    const compactedBin = fakeCompactionBin("COMPACTED_STDIN_CONTENT");
     const { stdout, code } = await runShim(compactedBin, ["exec", "--json"], dupStdin);
     expect(code).toBe(3); // exit preserved
     expect(stdout).toContain("ARGS: exec --json");
-    expect(stubStdin(stdout)).toBe("COMPACTED_STDIN_CONTENT"); // the shim swapped in the compacted stream
-    // the original secret never reached the tool (it was "compacted" away by the fake) and is not in stdout
-    expect(stdout).not.toContain(SECRET);
+    expect(stubStdin(stdout)).toBe("COMPACTED_STDIN_CONTENT");
+    const calls = readFileSync(path.join(root, "compaction-calls"), "utf8").trim().split("\n");
+    expect(calls.filter((call) => call === "gateway")).toHaveLength(1);
+    expect(calls).not.toContain("capture");
   });
 
-  it("NO approval (real CLI, no tty): the real binary receives the ORIGINAL stdin UNCHANGED", async () => {
-    const { stdout, code } = await runShim(realCompactionBin(), ["exec", "--json"], dupStdin);
+  it("NO approval: the one gateway-routed child receives original stdin unchanged", async () => {
+    const { stdout, code } = await runShim(fakeCompactionBin(), ["exec", "--json"], dupStdin);
     expect(code).toBe(3);
     expect(stubStdin(stdout)).toBe(dupStdin); // byte-for-byte original - nothing applied without approval
-    // a content-free before-call event was still recorded (no-tty, not-asked); no prompt/secret stored
+    const calls = readFileSync(path.join(root, "compaction-calls"), "utf8").trim().split("\n");
+    expect(calls.filter((call) => call === "gateway")).toHaveLength(1);
+    expect(calls).not.toContain("capture");
+    // No shim-local capture/activity file is created; the Gateway receipt is the single measurement.
     const activity = path.join(projDir, ".compaction", "activity", "activity.jsonl");
     const raw = existsSync(activity) ? readFileSync(activity, "utf8") : "";
     expect(raw).not.toContain(SECRET);
     expect(raw).not.toContain("SHARED CONTEXT BLOCK");
   }, 15_000);
 
-  it("UNSAFE boundary (positional prompt): the real probe returns 1 → shim never buffers; ORIGINAL stdin", async () => {
-    // The REAL CLI's argv-only boundary probe returns 1 for a positional prompt, so the shim skips the
-    // stdin path entirely and the tool runs with inherited (original) stdin - no mutation, no hang.
-    const { stdout, code } = await runShim(realCompactionBin(), ["exec", "--json", "a positional prompt"], dupStdin);
+  it("preserves positional prompts and original stdin", async () => {
+    const { stdout, code } = await runShim(fakeCompactionBin("MUST_NOT_APPLY"), ["exec", "--json", "a positional prompt"], dupStdin);
     expect(code).toBe(3);
     expect(stubStdin(stdout)).toBe(dupStdin); // original stdin, never a compacted stream
+    const calls = readFileSync(path.join(root, "compaction-calls"), "utf8").trim().split("\n");
+    expect(calls.filter((call) => call === "gateway")).toHaveLength(1);
+    expect(calls).not.toContain("capture");
   }, 15_000);
 });

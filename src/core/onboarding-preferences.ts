@@ -15,8 +15,9 @@
  *    and `product_mode` (enum: `"observe"` / `"basic"` / `"full"`, the open-core product-tier apply
  *    posture — content-free, no account/
  *    entitlement/usage/network call is made to read or write it).
+ *    Update settings add only an auto_updates boolean and a stable/preview channel.
  *    No prompt/response/tool-invocation content, no credential, no path, no free-form field -
- *    every value is enum-only plain JSON. An assertion in the single write path fail-closes if
+ *    every value is closed plain JSON. An assertion in the single write path fail-closes if
  *    anything else would ever be written.
  *  - The mode is a content-free runtime default. `cache-plus-context` is effective only for a
  *    routed Claude Code or Codex workflow with a matching narrow stored authorization; the Gateway
@@ -58,7 +59,7 @@ const CONNECTED_KEY = "connected_workflows" as const;
 const PRODUCT_MODE_KEY = "product_mode" as const;
 
 /** The exhaustive on-disk key whitelist. Nothing else is ever written (enforced in `writeStoredPreferences`). */
-const LEGAL_PREFERENCE_KEYS: readonly string[] = [PREFERENCE_KEY, CONNECTED_KEY, PRODUCT_MODE_KEY];
+const LEGAL_PREFERENCE_KEYS: readonly string[] = [PREFERENCE_KEY, CONNECTED_KEY, PRODUCT_MODE_KEY, "auto_updates", "update_channel"];
 
 /**
  * The open-core product-mode (apply-posture) enum:
@@ -113,6 +114,8 @@ export interface OnboardingPreferences {
   optimization_mode?: OptimizationModePreference;
   connected_workflows?: ConnectedRoutableWorkflow[];
   product_mode?: ProductMode;
+  auto_updates?: boolean;
+  update_channel?: "stable" | "preview";
 }
 
 /** Type guard: is `v` one of the two legal enum strings? */
@@ -170,6 +173,8 @@ function readStoredPreferences(env: EnvLike = process.env): OnboardingPreference
   if (isProductMode(raw[PRODUCT_MODE_KEY])) {
     result.product_mode = raw[PRODUCT_MODE_KEY] as ProductMode;
   }
+  if (raw.auto_updates !== undefined) result.auto_updates = raw.auto_updates === true;
+  if (raw.update_channel === "stable" || raw.update_channel === "preview") result.update_channel = raw.update_channel;
   return result;
 }
 
@@ -192,6 +197,8 @@ function writeStoredPreferences(preferences: OnboardingPreferences, env: EnvLike
   if (preferences.product_mode !== undefined && !isProductMode(preferences.product_mode)) {
     throw new Error(`refusing to persist illegal product_mode: ${JSON.stringify(preferences.product_mode)}`);
   }
+  if (preferences.auto_updates !== undefined && typeof preferences.auto_updates !== "boolean") throw new Error("Invalid automatic-update preference");
+  if (preferences.update_channel !== undefined && !["stable", "preview"].includes(preferences.update_channel)) throw new Error("Invalid update channel");
   if (preferences.connected_workflows !== undefined) {
     const list = preferences.connected_workflows;
     const canonical = CONNECTED_ROUTABLE_WORKFLOWS.filter((w) => list.includes(w));
@@ -233,9 +240,8 @@ export function writeOptimizationMode(mode: OptimizationModePreference, env: Env
   const existing = readStoredPreferences(env);
   return writeStoredPreferences(
     {
-      optimization_mode: mode,
-      ...(existing.connected_workflows ? { connected_workflows: existing.connected_workflows } : {}),
-      ...(existing.product_mode ? { product_mode: existing.product_mode } : {})
+      ...existing,
+      optimization_mode: mode
     },
     env
   );
@@ -266,9 +272,8 @@ export function writeProductMode(mode: ProductMode, env: EnvLike = process.env):
   const existing = readStoredPreferences(env);
   return writeStoredPreferences(
     {
-      product_mode: mode,
-      ...(existing.optimization_mode ? { optimization_mode: existing.optimization_mode } : {}),
-      ...(existing.connected_workflows ? { connected_workflows: existing.connected_workflows } : {})
+      ...existing,
+      product_mode: mode
     },
     env
   );
@@ -449,9 +454,8 @@ export function addConnectedWorkflows(workflows: readonly ConnectedRoutableWorkf
   );
   return writeStoredPreferences(
     {
-      ...(existing.optimization_mode ? { optimization_mode: existing.optimization_mode } : {}),
-      ...(merged.length > 0 ? { connected_workflows: merged } : {}),
-      ...(existing.product_mode ? { product_mode: existing.product_mode } : {})
+      ...existing,
+      connected_workflows: merged.length > 0 ? merged : undefined
     },
     env
   );
@@ -466,10 +470,28 @@ export function removeConnectedWorkflow(workflow: ConnectedRoutableWorkflow, env
   const remaining = (existing.connected_workflows ?? []).filter((w) => w !== workflow);
   return writeStoredPreferences(
     {
-      ...(existing.optimization_mode ? { optimization_mode: existing.optimization_mode } : {}),
-      ...(remaining.length > 0 ? { connected_workflows: remaining } : {}),
-      ...(existing.product_mode ? { product_mode: existing.product_mode } : {})
+      ...existing,
+      connected_workflows: remaining.length > 0 ? remaining : undefined
     },
     env
   );
+}
+
+export function readUpdatePreferences(env: EnvLike = process.env): { autoUpdates: boolean; channel: "stable" | "preview" } {
+  try {
+    if (existsSync(preferencesPath(env))) {
+      const value: unknown = JSON.parse(readFileSync(preferencesPath(env), "utf8"));
+      if (!value || typeof value !== "object" || Array.isArray(value)) return { autoUpdates: false, channel: "stable" };
+    }
+  } catch { return { autoUpdates: false, channel: "stable" }; }
+  const preferences = readStoredPreferences(env);
+  return { autoUpdates: preferences.auto_updates !== false, channel: preferences.update_channel ?? "stable" };
+}
+
+export function writeUpdatePreferences(update: { autoUpdates?: boolean; channel?: "stable" | "preview" }, env: EnvLike = process.env): string {
+  return writeStoredPreferences({
+    ...readStoredPreferences(env),
+    ...(update.autoUpdates !== undefined ? { auto_updates: update.autoUpdates } : {}),
+    ...(update.channel !== undefined ? { update_channel: update.channel } : {})
+  }, env);
 }

@@ -22,8 +22,8 @@ import {
  * workflow routing descriptors, NEVER a hardcoded optimism table. These tests pin the honesty
  * boundaries: Mistral has no cache
  * field (cache proof structurally unavailable); Claude Code is activity-only; Cursor is local-estimate; the
- * custom OpenAI-compatible app + OpenAI is cache-proof-SUPPORTED but NOT live-verified; Codex is routable
- * only if-configured; `liveVerified` is false everywhere; every false capability carries a reason; the whole
+ * custom OpenAI-compatible app + OpenAI is cache-proof-SUPPORTED but NOT live-verified; Codex is routed
+ * by its normal saved-login shim; `liveVerified` is false everywhere; every false capability carries a reason; the whole
  * model is content-free; and it is generated from `ADAPTERS` (remove an adapter → its rows decay). Pure -
  * fixtures only, no live provider calls.
  */
@@ -171,18 +171,19 @@ describe("custom OpenAI-compatible app + OpenAI - supported but NOT live-proven"
   });
 });
 
-describe("Codex - routable only if-configured", () => {
-  it("is gatewayRoutable:if-configured, unrouted → not cache-proof-supported, with an honest note", () => {
+describe("Codex - normal saved-login shim route", () => {
+  it("is gateway-routable by default without becoming activity-only or claiming live verification", () => {
     const row = capabilityForWorkflow(computeCapabilityMatrix(), "codex")!;
-    expect(row.gatewayRoutable).toBe("if-configured");
+    expect(row.gatewayRoutable).toBe(true);
     expect(row.providerId).toBe("openai");
-    // Not routed by default → no provider-reported proof.
-    expect(row.canShowProviderReportedUsage).toBe(false);
-    expect(row.cacheProofSupported).toBe(false);
-    expect(row.contextOptimizeWithApprovalSupported).toBe(false);
-    expect(row.reasons.gatewayRoutable.length).toBeGreaterThan(0);
-    expect(row.reasons.cacheProofSupported.length).toBeGreaterThan(0);
-    expect(row.routingNote).toMatch(/OPENAI_BASE_URL/);
+    expect(row.activityOnly).toBe(false);
+    expect(row.canRecordUsage).toBe(true);
+    expect(row.canShowProviderReportedUsage).toBe(true);
+    expect(row.cacheProofSupported).toBe(true);
+    expect(row.contextOptimizeWithApprovalSupported).toBe(true);
+    expect(row.liveVerified).toBe(false);
+    expect(row.routingNote).toMatch(/normal `codex` invocation.*existing ChatGPT login/i);
+    expect(row.routingNote).not.toMatch(/capture\/activity|does NOT route|OPENAI_BASE_URL/);
   });
 });
 
@@ -375,7 +376,7 @@ describe("workflow routing descriptors match the honest current integration", ()
   it("exposes exactly the four workflows in the expected routing states", () => {
     const byKey = Object.fromEntries(WORKFLOW_ROUTING.map((r) => [r.workflow, r]));
     expect(byKey["custom-openai-app"].gatewayRoutable).toBe(true);
-    expect(byKey["codex"].gatewayRoutable).toBe("if-configured");
+    expect(byKey["codex"].gatewayRoutable).toBe(true);
     expect(byKey["claude-code"].gatewayRoutable).toBe(false);
     expect(byKey["cursor"].gatewayRoutable).toBe(false);
     expect(byKey["mistral"]).toBeUndefined();

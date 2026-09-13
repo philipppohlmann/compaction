@@ -29,8 +29,8 @@ export function codexTurnLineCommand(): string {
   return "compaction hooks line codex";
 }
 
-/** Codex `Stop` hook timeout (seconds). The local rollout read is bounded; this is generous headroom. */
-export const CODEX_TURN_LINE_HOOK_TIMEOUT_SECONDS = 5;
+/** Codex `Stop` hook timeout (seconds). Settlement is local and bounded, but large real runs can exceed 5s. */
+export const CODEX_TURN_LINE_HOOK_TIMEOUT_SECONDS = 15;
 
 /**
  * Recognise OUR Stop-hook entry — by EXACT match, not by tokens.
@@ -75,8 +75,15 @@ export function installCodexTurnLineHook(input: CodexHooksConfig): {
   }
   const groups = (hooks.Stop ??= []) as CodexHookGroup[];
 
-  if (groups.some((g) => (g.hooks ?? []).some((h) => isCompactionTurnLineHookCommand(h.command)))) {
-    return { config: input, changed: false, alreadyPresent: true };
+  const existingEntries = groups.flatMap((group) => group.hooks ?? [])
+    .filter((hook) => isCompactionTurnLineHookCommand(hook.command));
+  if (existingEntries.length > 0) {
+    const needsTimeoutMigration = existingEntries.some(
+      (hook) => hook.timeout !== CODEX_TURN_LINE_HOOK_TIMEOUT_SECONDS
+    );
+    if (!needsTimeoutMigration) return { config: input, changed: false, alreadyPresent: true };
+    for (const hook of existingEntries) hook.timeout = CODEX_TURN_LINE_HOOK_TIMEOUT_SECONDS;
+    return { config, changed: true, alreadyPresent: true };
   }
 
   groups.push({

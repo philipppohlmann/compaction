@@ -87,6 +87,20 @@ describe("Ed25519 primitives", () => {
 });
 
 describe("trust-root resolution", () => {
+  it("accepts the exact known-good legacy rollback signature only under v1 policy", () => {
+    const manifest = Buffer.from(
+      '{"schema_version":1,"version":"0.6.10","channel":"stable","platform":"any","arch":"any","artifact_kind":"node-script","sha256":"a211bfef01d872dfcd95414bf9fab0cd89040b189c7bdc7624838a7ef7b8037d","size_bytes":139415}'
+    );
+    const signature = "1QUcjdqwP_e0l3maBTMIDLD2d7ys5LL0_JLM09seW2CjKO1x-HVnc1EjHtWUywKghV4TPUypGLeh1Lr8f26TCQ";
+    expect(verifyManifestSignature(manifest, signature, env)).toEqual({
+      verified: true, trust: "pinned-root", key_id: "compaction-engine-root-v1"
+    });
+    const changedIdentity = Buffer.from(manifest.toString().replace('"version":"0.6.10"', '"version":"0.6.11"'));
+    expect(verifyManifestSignature(changedIdentity, signature, env)).toEqual({
+      verified: false, reason: "signature-invalid"
+    });
+  });
+
   it("a foreign key never verifies against the pinned production root, and no dev root", () => {
     // The production engine root is pinned in this build, so an unknown signer no longer stops at
     // `root-key-not-pinned` — it reaches the signature check and is refused there. Either way the

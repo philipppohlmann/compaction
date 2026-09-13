@@ -10,10 +10,10 @@
  * `runGatewayStart` is exported so the guided onboarding TUI (`GatewayTui` → `init`) can start the same
  * gateway with a config picked interactively, no duplicate server, no new behavior.
  */
-import { URL } from "node:url";
+import { URL, fileURLToPath } from "node:url";
 import path from "node:path";
-import { writeFileSync } from "node:fs";
-import { Command } from "commander";
+import { realpathSync, writeFileSync } from "node:fs";
+import { Command, Option } from "commander";
 import { startGatewayServer, type GatewayServerMode } from "../../core/gateway/server.js";
 import { DEFAULT_GATEWAY_RECEIPTS_DIR, GATEWAY_RECEIPTS_FILE, formatFreshBilledInputReduction } from "../../core/gateway/receipt.js";
 import {
@@ -22,14 +22,22 @@ import {
   readGatewayPid,
   getGatewayStatus,
   isProcessAlive,
-  readReceipts
+  probeListening,
+  readReceipts,
+  type GatewayPidRecord
 } from "../../core/gateway/status.js";
 import { planGatewayConfigure, applyGatewayConfigure, formatConfigurePlan } from "../../core/gateway/configure.js";
 import { DEDUPE_POLICY } from "../../core/gateway/request-shape.js";
 import { GATEWAY_RECOVERY_DIR, readRecovery } from "../../core/gateway/recovery.js";
 import { isInputCompactionAvailable } from "../../core/gateway/input-compaction-seam.js";
 import { runThroughGateway, injectionEnv, defaultUpstreamFor, type RunThroughGatewayOptions } from "./dev.js";
-import { ensureGateway } from "../../core/gateway/ensure.js";
+import { ensureGateway, stopTransparentRoutingGateway } from "../../core/gateway/ensure.js";
+import {
+  removeRoutingSlot,
+  routingSlotsForCwd,
+  writeRoutingSlot,
+  type RoutingSlotRecord
+} from "../../core/gateway/routing-registry.js";
 import { resolveApplyRoutingActivation } from "../../core/gateway/apply-routing-activation.js";
 import { compareGatewayProof, formatGatewayProof, proofSummaryFromReceipt, receiptsForGatewayProof } from "../../core/gateway/proof.js";
 import { computeCapabilityMatrix } from "../../core/gateway/capability-matrix.js";
@@ -37,6 +45,11 @@ import { formatCapabilityMatrix } from "../../core/gateway/capability-view.js";
 import { liveVerificationsForMatrix } from "../../core/gateway/verification-store.js";
 import { autoWorkflowNote, resolveWorkflowForGatewayStart, resolveProviderForGatewayStart, providerInferenceNote } from "../../core/gateway/workflow-default.js";
 import { runVerifyCache } from "./gateway-verify-cache.js";
+import { createGatewayReleaseIdentity, registerGatewayInstance } from "../../core/gateway/update-identity.js";
+import { defaultManagedRoot } from "../../core/update/ownership.js";
+import { resolveSessionPin } from "../../core/update/sessions.js";
+import { withManagedLock } from "../../core/update/state.js";
+import type { EngineSupervisorOptions } from "../../core/gateway/engine-ipc/supervisor.js";
 
 interface GatewayStartOptions {
   provider?: string;
@@ -47,6 +60,7 @@ interface GatewayStartOptions {
   approval?: string;
   workflow?: string;
   idleTtl?: string;
+  routingSlot?: string;
 }
 
 /** Parse `--listen http://127.0.0.1:8787` (or `127.0.0.1:8787`) into host + port. */
@@ -92,6 +106,8 @@ export interface GatewayStartConfig {
   persistLifecycle?: boolean;
   /** Default-off Claude Code subscription envelope (`gateway run --subscription`); never accepted by `gateway start`. */
   claudeSubscription?: { capability: string };
+  /** Default-off Codex ChatGPT-subscription envelope (`gateway run --subscription`); never accepted by `gateway start`. */
+  codexSubscription?: { capability: string };
   /**
    * Idle auto-shutdown TTL in ms - DEFAULT OFF (absent/0 = long-lived until `gateway stop`/Ctrl-C).
    * When > 0 the gateway self-stops cleanly after being idle that long (no request in flight is ever
@@ -100,6 +116,17 @@ export interface GatewayStartConfig {
    * `--idle-ttl`.
    */
   idleTtlMs?: number;
+  /**
+   * TRANSPARENT-ROUTING lifecycle. When set, this gateway owns the user-global routing slot named by
+   * the key - it writes the slot on listen and removes it on close - and writes NO project pidfile.
+   *
+   * That separation is the point: the routing endpoint backs a long-lived interactive session, and
+   * while it lived in `<cwd>/.compaction/gateway/gateway.json` it was owned by whatever directory
+   * the tool happened to launch from and shared that ownership with ordinary development and test
+   * activity. With the slot, `compaction gateway stop` (which acts on the project pidfile) can no
+   * longer reach it; `gateway stop --routing` and `init --disconnect` own routing explicitly.
+   */
+  routingSlot?: string;
 }
 
 export interface RunningGateway {
@@ -122,16 +149,37 @@ export async function runGatewayStart(config: GatewayStartConfig): Promise<Runni
   }
   const cwd = config.cwd ?? process.cwd();
   const log = config.log ?? ((line: string) => console.log(line));
-  const persistLifecycle = config.persistLifecycle !== false;
+  const routingSlot = config.routingSlot;
+  // A routing gateway persists its lifecycle in the user-global SLOT, never in the project pidfile.
+  const persistLifecycle = routingSlot === undefined && config.persistLifecycle !== false;
   const idleTtlMs = config.idleTtlMs !== undefined && config.idleTtlMs > 0 ? config.idleTtlMs : undefined;
-
-  const started = await startGatewayServer({
+  const managedRoot = defaultManagedRoot();
+  let releaseIdentity = createGatewayReleaseIdentity();
+  let unregister = (): void => {};
+  const started = await withManagedLock(managedRoot, async () => {
+    const token = process.env.COMPACTION_SESSION_PIN;
+    const pair = token ? resolveSessionPin(managedRoot, token) : undefined;
+    if (token && !pair) throw new Error("Managed Gateway session pin is invalid or no longer active");
+    if (pair && pair.cli.version !== releaseIdentity.cliVersion) throw new Error("Managed Gateway CLI version does not match the admitted pair");
+    if (pair && realpathSync(pair.cli.root) !== realpathSync(fileURLToPath(new URL("../../../", import.meta.url)))) {
+      throw new Error("Managed Gateway must start from the admitted CLI installation");
+    }
+    if (pair) releaseIdentity = createGatewayReleaseIdentity(pair.id);
+    const verifiedInstalledArtifact: EngineSupervisorOptions["verifiedInstalledArtifact"] = pair
+      ? pair.engine.mode === "basic" ? null : {
+        artifactPath: pair.engine.artifactPath, manifest: pair.engine.manifest, compatibility: pair.engine.compatibility
+      }
+      : undefined;
+    const instance = await startGatewayServer({
+    releaseIdentity,
+    verifiedInstalledArtifact,
     provider: config.provider,
     upstream: config.upstream,
     mode: config.mode,
     ...(config.policy ? { policy: config.policy } : {}),
     ...(config.workflow ? { workflow: config.workflow } : {}),
     ...(config.claudeSubscription ? { claudeSubscription: config.claudeSubscription } : {}),
+    ...(config.codexSubscription ? { codexSubscription: config.codexSubscription } : {}),
     ...(idleTtlMs !== undefined
       ? {
           idleTtlMs,
@@ -139,7 +187,8 @@ export async function runGatewayStart(config: GatewayStartConfig): Promise<Runni
           // dead gateway as live, and the next routed run transparently starts a fresh one. With the
           // listener closed, the unref'd timer cleared, and no other handles, the process exits cleanly.
           onIdleShutdown: () => {
-            if (persistLifecycle) removeGatewayPid(cwd);
+            if (persistLifecycle) removeGatewayPid(cwd, releaseIdentity.instanceId);
+            if (routingSlot) removeRoutingSlot(routingSlot, process.env, releaseIdentity.instanceId);
             log(
               `compaction gateway: idle for over ${formatIdleTtl(idleTtlMs)} - stopped cleanly ` +
                 "(the next routed run starts a fresh gateway automatically; or run 'compaction gateway start')."
@@ -151,6 +200,37 @@ export async function runGatewayStart(config: GatewayStartConfig): Promise<Runni
     log,
     host: config.host,
     port: config.port
+  });
+    const record: GatewayPidRecord = {
+      pid: process.pid, host: instance.address.host, port: instance.address.port,
+      upstream: config.upstream, provider: config.provider, mode: config.mode,
+      ...(config.workflow === "codex" || config.workflow === "claude-code" ? { workflow: config.workflow } : {}),
+      startedAt: new Date().toISOString(), release: releaseIdentity
+    };
+    const slotRecord: RoutingSlotRecord | undefined = routingSlot
+      ? {
+          pid: process.pid, host: instance.address.host, port: instance.address.port,
+          // A fresh routing start binds the port it was told to reserve, so the two are the same
+          // here. They diverge only for an ADOPTED legacy gateway, whose slot `ensure` writes.
+          reservedPort: instance.address.port,
+          upstream: config.upstream, provider: config.provider, mode: config.mode,
+          ...(config.workflow === "codex" || config.workflow === "claude-code" ? { workflow: config.workflow } : {}),
+          cwd, startedAt: record.startedAt, release: releaseIdentity
+        }
+      : undefined;
+    try {
+      unregister = registerGatewayInstance(managedRoot, record);
+      if (persistLifecycle) writeGatewayPid(record, cwd);
+      if (routingSlot && slotRecord) writeRoutingSlot(routingSlot, slotRecord, process.env);
+    } catch (error) { await instance.close(); unregister(); throw error; }
+    instance.server.once("close", () => {
+      unregister();
+      if (persistLifecycle) removeGatewayPid(cwd, releaseIdentity.instanceId);
+      // Guarded by instanceId: an explicit stop removes the slot BEFORE signalling, so by the time
+      // this fires a replacement may already own the slot and must not have its record deleted.
+      if (routingSlot) removeRoutingSlot(routingSlot, process.env, releaseIdentity.instanceId);
+    });
+    return instance;
   });
 
   // ---- Entitlement self-repair, once per gateway process ------------------------------------------
@@ -182,21 +262,6 @@ export async function runGatewayStart(config: GatewayStartConfig): Promise<Runni
   })();
 
   const base = `http://${started.address.host}:${started.address.port}`;
-  if (persistLifecycle) {
-    writeGatewayPid(
-      {
-        pid: process.pid,
-        host: started.address.host,
-        port: started.address.port,
-        upstream: config.upstream,
-        provider: config.provider,
-        mode: config.mode,
-        ...(config.workflow === "codex" || config.workflow === "claude-code" ? { workflow: config.workflow } : {}),
-        startedAt: new Date().toISOString()
-      },
-      cwd
-    );
-  }
 
   // Asked, not assumed. The banner below describes a mutation capability before any request has
   // arrived to demonstrate it, and in a public build that capability is absent — see F76.
@@ -256,7 +321,8 @@ export async function runGatewayStart(config: GatewayStartConfig): Promise<Runni
   log("  Stop from another terminal:  compaction gateway stop   ·   or press Ctrl-C here.");
 
   const close = async (): Promise<void> => {
-    if (persistLifecycle) removeGatewayPid(cwd);
+    if (persistLifecycle) removeGatewayPid(cwd, releaseIdentity.instanceId);
+    if (routingSlot) removeRoutingSlot(routingSlot, process.env, releaseIdentity.instanceId);
     await started.close();
   };
 
@@ -270,6 +336,44 @@ export async function runGatewayStart(config: GatewayStartConfig): Promise<Runni
   }
 
   return { base, close };
+}
+
+/** Content-free view of one routing slot for `gateway status` (no URL with userinfo, no capability). */
+interface RoutingSlotView {
+  base: string;
+  pid: number;
+  provider: string;
+  workflow?: "codex" | "claude-code";
+  reservedPort: number;
+  adopted: boolean;
+  live: boolean;
+  quarantine?: { reason: string; at: string };
+}
+
+/**
+ * The routing slots this directory owns, with a live probe of each reserved port.
+ *
+ * `live` here is a REACHABILITY fact and is labelled as one. It is not an authorisation and nothing
+ * is handed out on its strength - the identity handshake is what authorises reuse or revival, in
+ * `ensure.ts` and `routing-revival.ts`. Reporting reachability in a status view is safe precisely
+ * because the view hands nobody a base URL to use.
+ */
+async function describeRoutingSlots(cwd: string): Promise<RoutingSlotView[]> {
+  const slots = [...routingSlotsForCwd(cwd, "anthropic"), ...routingSlotsForCwd(cwd, "openai")];
+  const views: RoutingSlotView[] = [];
+  for (const { record } of slots) {
+    views.push({
+      base: `http://${record.host}:${record.reservedPort}`,
+      pid: record.pid,
+      provider: record.provider,
+      ...(record.workflow ? { workflow: record.workflow } : {}),
+      reservedPort: record.reservedPort,
+      adopted: record.adopted === true,
+      live: isProcessAlive(record.pid) && (await probeListening(record.host, record.reservedPort)),
+      ...(record.quarantine ? { quarantine: record.quarantine } : {})
+    });
+  }
+  return views;
 }
 
 export function registerGatewayCommand(program: Command): void {
@@ -301,7 +405,18 @@ export function registerGatewayCommand(program: Command): void {
       "--idle-ttl <ms>",
       "Auto-stop the gateway cleanly after this many milliseconds without a request (in-flight requests always finish; the pidfile is removed on stop). Omitted or 0: the gateway is long-lived until 'compaction gateway stop' or Ctrl-C. The transparent-routing gateway spawned by 'gateway ensure' sets this automatically; an explicit start opts in here."
     )
+    .addOption(
+      new Option(
+        "--routing-slot <key>",
+        "INTERNAL. Own the user-global transparent-routing slot with this key: record the gateway there instead of in the project pidfile, and remove it on exit. Set only by 'gateway ensure' and the in-session revival triggers."
+      ).hideHelp()
+    )
     .action(async (options: GatewayStartOptions) => {
+      if (options.routingSlot !== undefined && !/^[0-9a-f]{32}$/.test(options.routingSlot)) {
+        console.error("error: --routing-slot expects a 32-character routing slot key (it is set internally, not by hand).");
+        process.exitCode = 1;
+        return;
+      }
       const mode = (options.mode ?? "record") as GatewayServerMode;
       if (mode !== "record" && mode !== "apply" && mode !== "dry-run") {
         console.error(`error: gateway mode '${mode}' is not implemented (record | apply | dry-run).`);
@@ -374,6 +489,7 @@ export function registerGatewayCommand(program: Command): void {
           ...(options.policy ? { policy: options.policy } : {}),
           ...(workflow ? { workflow } : {}),
           ...(idleTtlMs !== undefined ? { idleTtlMs } : {}),
+          ...(options.routingSlot ? { routingSlot: options.routingSlot } : {}),
           host: listen.host,
           port: listen.port
         });
@@ -385,24 +501,54 @@ export function registerGatewayCommand(program: Command): void {
 
   gateway
     .command("status")
-    .description("Show whether the local gateway is running + a content-free rollup of its receipts (token/cache; no content).")
+    .description("Show this directory's project/dev gateway state and its transparent-routing state (two separate lifecycles) + a content-free rollup of its receipts (token/cache; no content).")
     .option("--json", "Print the content-free status as JSON.")
     .action(async (options: { json?: boolean }) => {
       const status = await getGatewayStatus(process.cwd());
+      const routing = await describeRoutingSlots(process.cwd());
       if (options.json) {
-        console.log(JSON.stringify(status, null, 2));
+        // TWO LIFECYCLES, NAMED. `running` has always described the PROJECT/dev pidfile at
+        // `<cwd>/.compaction/gateway/gateway.json`, and the routing gateway deliberately no longer
+        // writes that file - so a consumer reading `running` alone reads `false` while transparent
+        // routing is live. The two explicit booleans are additive and unambiguous; the legacy
+        // `running` key keeps its meaning and its shape.
+        console.log(
+          JSON.stringify(
+            {
+              ...status,
+              projectGatewayRunning: status.running,
+              transparentRoutingLive: routing.some((slot) => slot.live),
+              routing
+            },
+            null,
+            2
+          )
+        );
         return;
       }
       console.log("compaction gateway status");
+      // THE PROJECT/DEV GATEWAY ROW DESCRIBES THE PROJECT/DEV GATEWAY, AND SAYS SO.
+      // It reads the cwd pidfile, which `gateway start` / `gateway run` / `dev` write. The
+      // transparent-routing gateway - the one a connected Claude Code session actually depends on -
+      // owns a user-global slot instead and is reported in its own block below. Labelled `gateway
+      // running`, this row printed `no` while routing was live, and then offered to start a gateway
+      // the user already had.
       if (status.running) {
-        console.log(`  gateway running:      yes  ${status.base ?? ""}  (pid ${status.pid})`);
+        console.log(`  project/dev gateway:  running  ${status.base ?? ""}  (pid ${status.pid})`);
         console.log(`  provider / mode:      ${status.provider} / ${status.mode}`);
         console.log(`  workflow identity:    ${status.workflow ?? "none (generic or legacy gateway)"}`);
         console.log(`  listen URL:           ${status.base ?? "(unknown)"}`);
+        console.log(`  release identity:     ${status.releaseIdentity ? `CLI ${status.releaseIdentity.cliVersion}, protocol ${status.releaseIdentity.protocolVersion}, pair ${status.releaseIdentity.pairId}` : "unverified (update replacement unavailable)"}`);
+        if (status.releaseIdentity) console.log(`  update activity:      ${status.releaseIdentity.activeRequests} requests, ${status.releaseIdentity.pendingBookkeeping} writes, ${status.releaseIdentity.unsettledRuns + status.releaseIdentity.unsettledCodex + status.releaseIdentity.unsettledClaude} unsettled${status.releaseIdentity.settlementUnknown ? "; settlement unknown" : ""}`);
       } else if (status.pid) {
-        console.log(`  gateway running:      no  (stale pidfile for pid ${status.pid} - run 'compaction gateway stop' to clear it)`);
+        console.log(`  project/dev gateway:  not running  (stale pidfile for pid ${status.pid} - run 'compaction gateway stop' to clear it)`);
+      } else if (routing.length > 0) {
+        // The start advice is WRONG here and was the harmful half of the conflation: a project/dev
+        // gateway is not the routed endpoint, so starting one repairs nothing a routed session uses.
+        // What this directory has is reported in its own block below, whatever state it is in.
+        console.log("  project/dev gateway:  not running  (this directory is transparently routed instead - see below)");
       } else {
-        console.log("  gateway running:      no  (start it with 'compaction gateway start', or 'compaction' → Gateway setup)");
+        console.log("  project/dev gateway:  not running  (start it with 'compaction gateway start', or 'compaction' → Gateway setup)");
       }
       console.log(`  requests observed:    ${status.receiptsCount}  (local-only, content-free)`);
       console.log(`  last request:         ${status.lastRequestAt ?? "none observed yet"}`);
@@ -410,6 +556,37 @@ export function registerGatewayCommand(program: Command): void {
       if (status.receiptsCount > 0) {
         console.log(`  best fresh/billed input reduction:  ${formatFreshBilledInputReduction(status.summary.bestReduction)}`);
         console.log(`  ${status.summary.modelVisibleBytesUnchanged ? "model-visible bytes unchanged" : "model-visible bytes: mixed - check receipts"}`);
+      }
+      // The ROUTING row. Without it the transparent-routing gateway - which is the one a connected
+      // Claude Code session actually depends on - would be invisible here, because it deliberately
+      // no longer writes the project pidfile the rows above describe.
+      console.log("");
+      console.log("  transparent routing (this directory)");
+      if (routing.length === 0) {
+        console.log("    routed:             no  (connect with 'compaction init --connect claude-code')");
+      }
+      for (const slot of routing) {
+        console.log(`    routed:             yes  ${slot.base}  (pid ${slot.pid}, ${slot.provider}${slot.workflow ? `/${slot.workflow}` : ""})`);
+        // The revival promise is TRUE only while the slot can actually be revived. A quarantined
+        // slot's reserved port is held by a listener that failed the identity handshake: nothing
+        // will be started there and the pinned session is beyond repair. Promising revival in that
+        // state would contradict the quarantine lines printed just below it, and would do so in the
+        // one case where the user most needs the truth. The quarantine lines are the account there.
+        console.log(
+          `    endpoint:           ${
+            slot.live
+              ? "live"
+              : slot.quarantine
+                ? "NOT ANSWERING"
+                : "NOT ANSWERING - the next prompt in a connected session revives it at this same address"
+          }`
+        );
+        console.log(`    reserved port:      ${slot.reservedPort}${slot.adopted ? "  (adopted from a pre-upgrade gateway; this port was kernel-chosen and may sit inside the OS ephemeral range)" : ""}`);
+        if (slot.quarantine) {
+          console.log(`    quarantined:        ${slot.quarantine.reason}`);
+          console.log("                        Nothing was started on that port and no base URL was handed out. A session pinned to it cannot be repaired; the next tool launch routes on a fresh port.");
+        }
+        console.log(`    stop routing:       compaction gateway stop --routing   (plain 'gateway stop' never touches it)`);
       }
     });
 
@@ -507,7 +684,15 @@ export function registerGatewayCommand(program: Command): void {
       // The shim contract is unchanged: only the base URL prints on success, and any failure is
       // fail-open (the tool runs unrouted). Never throws.
       const applyRouting = await resolveApplyRoutingActivation({ provider, cwd: process.cwd() });
+      const sessionToken = process.env.COMPACTION_SESSION_PIN;
+      const sessionPair = sessionToken ? resolveSessionPin(defaultManagedRoot(), sessionToken) : undefined;
+      if (sessionToken && !sessionPair) {
+        console.error("compaction gateway ensure: managed session pin is invalid or no longer active");
+        process.exitCode = 1;
+        return;
+      }
       const result = await ensureGateway({
+        ...(sessionPair ? { releasePairId: sessionPair.id, cliEntry: path.join(sessionPair.cli.root, "dist/cli/index.js") } : {}),
         provider,
         upstream,
         cwd: process.cwd(),
@@ -546,7 +731,8 @@ export function registerGatewayCommand(program: Command): void {
         "unchanged, preserves its exit code, and prints a content-free traffic summary. " +
         "Route Codex:  compaction gateway run --workflow codex -- codex exec --json \"<task>\"   ·   " +
         "Route Claude Code:  compaction gateway run --provider anthropic --workflow claude-code -- claude   ·   " +
-        "Keyless Claude Code (saved login, no API key):  compaction gateway run --provider anthropic --subscription -- claude   ·   " +
+        "ChatGPT-subscription Codex (no API key):  compaction gateway run --provider openai --workflow codex --subscription -- codex   ·   " +
+        "Saved-login Claude Code (no API key):  compaction gateway run --provider anthropic --subscription -- claude   ·   " +
         "One-command deterministic apply (EXPERIMENTAL, same gates as 'gateway start --mode apply'):  " +
         `compaction gateway run --mode apply --policy ${DEDUPE_POLICY} --provider anthropic -- claude -p \"<task>\"`
     )
@@ -563,11 +749,10 @@ export function registerGatewayCommand(program: Command): void {
     .option("--workflow <tool>", "Routed workflow identity: codex | claude-code | auto | none. Omitted (or `auto`): defaults ONLY when the launched command is the connected workflow's own tool binary on its matching provider route (connected via `compaction init`); a generic command never inherits an identity. `none` disables the default; an explicit tool always wins.")
     .option(
       "--subscription",
-      "EXPLICIT keyless route for Claude Code under your saved login (Anthropic/Claude Code ONLY; default off). " +
+      "EXPLICIT saved-login route for OpenAI/Codex or Anthropic/Claude Code (default off). " +
         "Credential-free: your saved-login credential rides through UNTOUCHED - never read, stored, or logged. " +
-        "Byte-safe; pinned to api.anthropic.com (no cross-origin redirects); fail-open (any failure runs the " +
-        "original claude command unchanged). Not yet live-proven. Codex/ChatGPT subscription routing is " +
-        "vendor-blocked and is rejected honestly."
+        "The upstream is pinned per provider and redirects are rejected; a startup failure runs the original " +
+        "tool command unchanged."
     )
     .argument("[command...]", "The command to run through the gateway (after --), e.g. -- npm run dev")
     // Unknown flags BEFORE `--` are rejected (they used to be swallowed into the child command, producing
@@ -680,8 +865,35 @@ export function registerGatewayCommand(program: Command): void {
 
   gateway
     .command("stop")
-    .description("Stop a running local gateway (started in another terminal) via its pidfile.")
-    .action(() => {
+    .description(
+      "Stop a running local gateway (started in another terminal) via this project's pidfile. It does NOT " +
+        "touch the transparent-routing gateway backing a connected tool session - that one is user-global " +
+        "and is stopped explicitly with --routing (or 'compaction init --disconnect claude-code')."
+    )
+    .option(
+      "--routing",
+      "Stop this directory's TRANSPARENT-ROUTING gateway instead: remove its routing slot first, then signal it. " +
+        "Removing the slot first is what makes the stop stick - the in-session revival triggers are gated on the " +
+        "slot's existence, so with it gone nothing brings the endpoint back. A connected tool session will lose " +
+        "its route until it is launched again."
+    )
+    .action((options: { routing?: boolean }) => {
+      if (options.routing) {
+        const anthropic = stopTransparentRoutingGateway(process.cwd(), "anthropic");
+        const openai = stopTransparentRoutingGateway(process.cwd(), "openai");
+        const stopped = [anthropic, openai].filter((result) => result.stopped);
+        if (stopped.length === 0) {
+          console.log(`compaction gateway stop --routing: ${anthropic.reason ?? "no routing gateway is recorded for this directory"}.`);
+          return;
+        }
+        for (const result of stopped) {
+          console.log(
+            `compaction gateway stop --routing: removed the routing slot and sent SIGTERM to pid ${result.pid}. ` +
+              "Nothing will revive it; the next tool launch starts a fresh routing gateway."
+          );
+        }
+        return;
+      }
       const rec = readGatewayPid(process.cwd());
       if (!rec) {
         console.log("compaction gateway stop: no gateway pidfile found - nothing to stop.");

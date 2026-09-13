@@ -253,7 +253,7 @@ describe("reconcileUsage (upload)", () => {
   });
 
   it("a 400 from a server that predates the v2 shape LOSES NOTHING: no watermark, no dropped entry", async () => {
-    // THE DEPLOY-ORDER CASE. The control-plane API is deployed; until the founder redeploys it, a
+    // THE DEPLOY-ORDER CASE. Until the control-plane API is redeployed, a
     // v2-shaped upload is refused wholesale (`.strict()` rejects the unknown key, and the route
     // parses the WHOLE body). That must be a retryable no-op, not a silent loss of consumption: the
     // entries stay in the journal, the watermark does not move, and they reconcile after redeploy.

@@ -24,25 +24,34 @@ function run(args: string[]): { stdout: string; stderr: string; code: number } {
 }
 
 describe("gateway capabilities - honest table rendered from the matrix", () => {
-  it("prints supported ONLY for the custom app (qualified live-unverified), not-supported+reason elsewhere", () => {
+  it("prints Codex and the custom app as routed/supported, both qualified live-unverified", () => {
     const r = run(["gateway", "capabilities"]);
     expect(r.code).toBe(0);
     // Supported row is always qualified live-unverified; never presented as proven/live.
     expect(r.stdout).toMatch(/cache proof:\s*supported \(pipeline; live-unverified/);
     expect(r.stdout).not.toMatch(/proven live|live-proven|ready live/i);
-    // Claude Code / Cursor / Codex must show not-supported with a reason.
+    expect(r.stdout).toMatch(/Codex CLI[\s\S]*routing:\s*gateway-routable/);
+    expect(r.stdout).toMatch(/Codex CLI[\s\S]*cache proof:\s*supported \(pipeline; live-unverified/);
+    // Claude Code / Cursor remain not-supported with a reason.
     expect(r.stdout).toMatch(/Claude Code[\s\S]*cache proof:\s*not supported -/);
     expect(r.stdout).toMatch(/Cursor[\s\S]*cache proof:\s*not supported -/);
+    const codexBlock = r.stdout.slice(r.stdout.indexOf("Codex CLI"), r.stdout.indexOf("Claude Code"));
+    expect(codexBlock).not.toMatch(/capture\/activity|does NOT route/);
     expect(r.stdout).toMatch(/supported ≠ live-verified/);
   });
 
   it("--json prints the content-free matrix (no key/content substrings)", () => {
     const r = run(["gateway", "capabilities", "--json"]);
     expect(r.code).toBe(0);
-    const parsed = JSON.parse(r.stdout) as Array<{ workflow: string; cacheProofSupported: boolean }>;
+    const parsed = JSON.parse(r.stdout) as Array<{ workflow: string; gatewayRoutable: boolean | string; activityOnly: boolean; cacheProofSupported: boolean }>;
     expect(parsed.map((row) => row.workflow).sort()).toEqual(
       ["claude-code", "codex", "cursor", "custom-openai-app"].sort()
     );
+    expect(parsed.find((row) => row.workflow === "codex")).toMatchObject({
+      gatewayRoutable: true,
+      activityOnly: false,
+      cacheProofSupported: true
+    });
     expect(r.stdout).not.toMatch(/sk-[A-Za-z0-9]/);
     expect(r.stdout).not.toMatch(/api[_-]?key/i);
   });
@@ -68,9 +77,15 @@ describe("tests 8/9 - wiring did not leak the custom app or a provider into onbo
     expect(keys).not.toContain("openai");
   });
 
-  it("the connect-once menu is unchanged (no custom app / provider lane)", () => {
+  it("the named connect-once menu has no custom app / provider lane", () => {
     const labels = CONNECT_MENU.map((m) => m.label);
-    expect(labels).toEqual(["Claude Code", "Codex", "Cursor", "All supported", "Skip"]);
+    expect(labels).toEqual(["Claude Code", "Codex", "Cursor", "All detected tools"]);
+    expect(CONNECT_MENU.map((m) => m.command)).toEqual([
+      "compaction init --connect claude-code",
+      "compaction init --connect codex",
+      "compaction init --connect cursor",
+      "compaction init --connect all"
+    ]);
   });
 
   it("the custom OpenAI-compatible app stays Advanced-only", () => {

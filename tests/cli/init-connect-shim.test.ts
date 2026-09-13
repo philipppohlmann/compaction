@@ -115,7 +115,23 @@ describe("init --connect 2 (Codex shim) claims-honesty at the CLI surface", () =
     const out = await runInit(["init", "--connect", "2", "--static"], activePath);
     expect(out).toContain("- connected");
     expect(out).toContain("codex exec --json");
-    expect(out).toContain("NOT measured"); // honest scope: interactive runs are not measured
+    // HONEST SCOPE, MATCHING RUNTIME (`kind: "gateway-route"` in `core/tool-shim.ts`): every normal
+    // codex invocation - interactive included - routes through the local Gateway. Evidence is claimed
+    // only for a settled artifact, never merely from routing.
+    expect(out).toContain("interactive included - also routes through the local Gateway");
+    expect(out).not.toMatch(/produces a receipt|receipt is produced|IS measured/);
+    expect(out).not.toMatch(/Interactive \/ other codex invocations pass through untouched and are NOT measured \(never faked\)\./);
+    // Sweep the whole uninterrupted connect screen, not just the primary consent line. These were
+    // live contradictions after Codex changed from a capture shim to a normal-invocation Gateway shim.
+    expect(out).not.toContain("interactive sessions are not measured");
+    expect(out).not.toContain("No Gateway route from this setup.");
+    expect(out).toContain("Routed automatically through the local Gateway");
+    expect(out).toContain(
+      "`compaction watch` shows settled Gateway evidence when recorded, including interactive Codex sessions."
+    );
+    expect(out).not.toContain(
+      "`compaction watch` shows Gateway-routed Codex turns, interactive sessions included."
+    );
   });
 
   /**

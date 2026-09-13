@@ -7,10 +7,9 @@
  * sits at acquisition, not at install, not at first run, and not in onboarding generally.
  *
  * WHY A LOCAL RECORD AND NOT A SERVER FLAG. Acceptance is a statement about THIS DEVICE receiving
- * THIS ARTIFACT. Recording it locally keeps the whole gate on the client, needs no schema change to
- * the signed release manifest (a frozen, signature-covered byte order — versioning it to carry
- * licence text would be a wire-contract escalation, not a packaging change), and needs no new
- * control-plane field. The file is content-free: a version string and a timestamp.
+ * THIS ARTIFACT. Recording it locally keeps the gate on the client. Signed manifest v2 names the
+ * required agreement version; legacy v1 uses the shipped agreement version. Records contain only
+ * a version and timestamp, with prior acceptances retained for pinned older releases.
  *
  * RE-ACCEPTANCE IS BUILT IN. The recorded version is compared against `ENGINE_EULA_VERSION`. A future
  * agreement version simply stops matching, so the next acquisition asks again. Nothing has to
@@ -28,6 +27,11 @@ import { webUrl, type EnvLike } from "../web-origin.js";
  * to. Bump it in the same change that changes the operative text, never separately.
  */
 export const ENGINE_EULA_VERSION = "1.0";
+
+/** Acquisition cannot infer informed consent to terms this CLI cannot present. */
+export function canPresentEngineEula(version: string): boolean {
+  return version === ENGINE_EULA_VERSION;
+}
 
 /** The canonical site route carrying the operative agreement text. */
 export const ENGINE_EULA_PATH = "/eula";
@@ -67,23 +71,30 @@ export function engineEulaAcceptancePath(env: ConfigDirEnv = process.env): strin
  * NEVER THROWS, and a malformed file reads as NO acceptance rather than as an error or as consent.
  * The file is user-writable state, so the only safe reading of anything unexpected is "not accepted".
  */
-export function readEngineEulaAcceptance(env: ConfigDirEnv = process.env): EngineEulaAcceptance | undefined {
+export function readEngineEulaAcceptance(env: ConfigDirEnv = process.env, version?: string): EngineEulaAcceptance | undefined {
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(engineEulaAcceptancePath(env), "utf8"));
+    const latest = JSON.parse(readFileSync(engineEulaAcceptancePath(env), "utf8"));
+    raw = version === undefined || latest?.version === version ? latest
+      : JSON.parse(readFileSync(versionedAcceptancePath(env, version), "utf8"));
   } catch {
     return undefined;
   }
   if (typeof raw !== "object" || raw === null) return undefined;
-  const { version, accepted_at: acceptedAt } = raw as { version?: unknown; accepted_at?: unknown };
-  if (typeof version !== "string" || version.trim() === "") return undefined;
+  const { version: recordedVersion, accepted_at: acceptedAt } = raw as { version?: unknown; accepted_at?: unknown };
+  if (typeof recordedVersion !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(recordedVersion)) return undefined;
   if (typeof acceptedAt !== "string" || acceptedAt.trim() === "") return undefined;
-  return { version, accepted_at: acceptedAt };
+  return { version: recordedVersion, accepted_at: acceptedAt };
 }
 
 /** Whether THIS build's agreement version has been accepted on this device. */
-export function engineEulaAccepted(env: ConfigDirEnv = process.env): boolean {
-  return readEngineEulaAcceptance(env)?.version === ENGINE_EULA_VERSION;
+export function engineEulaAccepted(env: ConfigDirEnv = process.env, version = ENGINE_EULA_VERSION): boolean {
+  return readEngineEulaAcceptance(env, version)?.version === version;
+}
+
+function versionedAcceptancePath(env: ConfigDirEnv, version: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(version)) throw new Error("invalid EULA version");
+  return join(compactionConfigDir(env), "engine-eula-acceptances", `${version}.json`);
 }
 
 /**
@@ -93,11 +104,19 @@ export function engineEulaAccepted(env: ConfigDirEnv = process.env): boolean {
  */
 export function recordEngineEulaAcceptance(
   env: ConfigDirEnv = process.env,
-  now: Date = new Date()
+  now: Date = new Date(),
+  version = ENGINE_EULA_VERSION
 ): EngineEulaAcceptance {
-  const record: EngineEulaAcceptance = { version: ENGINE_EULA_VERSION, accepted_at: now.toISOString() };
+  const archivePath = versionedAcceptancePath(env, version);
+  const record: EngineEulaAcceptance = { version, accepted_at: now.toISOString() };
   const dir = compactionConfigDir(env);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  mkdirSync(join(dir, "engine-eula-acceptances"), { recursive: true, mode: 0o700 });
+  const previous = readEngineEulaAcceptance(env);
+  if (previous) {
+    writeFileSync(versionedAcceptancePath(env, previous.version), `${JSON.stringify(previous)}\n`, { mode: 0o600 });
+  }
+  writeFileSync(archivePath, `${JSON.stringify(record)}\n`, { mode: 0o600 });
   const path = engineEulaAcceptancePath(env);
   writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
   try {

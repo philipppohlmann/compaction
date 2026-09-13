@@ -29,18 +29,21 @@ describe("a cacheProofSupported:false row never shows supported and shows its re
     expect(text).toContain("activity-only");
   });
 
-  it("Cursor (local-estimate) and Codex (if-configured) also render not-supported + reason", () => {
-    for (const key of ["cursor", "codex"] as const) {
-      const row = capabilityForWorkflow(computeCapabilityMatrix(), key)!;
-      const text = formatCapabilityRow(row).join("\n");
-      expect(row.cacheProofSupported).toBe(false);
-      expect(text).toMatch(/cache proof:\s*not supported -/);
-      expect(text).toContain(row.reasons.cacheProofSupported);
-    }
+  it("Cursor stays unsupported while Codex renders its normal Gateway route as supported but live-unverified", () => {
+    const cursor = capabilityForWorkflow(computeCapabilityMatrix(), "cursor")!;
+    const cursorText = formatCapabilityRow(cursor).join("\n");
+    expect(cursor.cacheProofSupported).toBe(false);
+    expect(cursorText).toMatch(/cache proof:\s*not supported -/);
+    expect(cursorText).toContain(cursor.reasons.cacheProofSupported);
     // Honest labels are the row's own labels, not invented.
-    expect(formatCapabilityRow(capabilityForWorkflow(computeCapabilityMatrix(), "cursor")!).join("\n")).toContain(
-      "local-estimate"
-    );
+    expect(cursorText).toContain("local-estimate");
+
+    const codex = capabilityForWorkflow(computeCapabilityMatrix(), "codex")!;
+    const codexText = formatCapabilityRow(codex).join("\n");
+    expect(codex.gatewayRoutable).toBe(true);
+    expect(codex.cacheProofSupported).toBe(true);
+    expect(codexText).toMatch(/routing:\s*gateway-routable/);
+    expect(codexText).toMatch(/cache proof:\s*supported \(pipeline; live-unverified/);
   });
 });
 

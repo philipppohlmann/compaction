@@ -28,8 +28,7 @@ import { describe, expect, it } from "vitest";
 
 const REPO_ROOT = join(__dirname, "..", "..");
 const ONBOARDING_DIRS = [
-  join(REPO_ROOT, "src", "cli", "onboarding"),
-  join(REPO_ROOT, "src", "cli", "onboarding-prototype")
+  join(REPO_ROOT, "src", "cli", "onboarding")
 ];
 
 /** Import/require specifiers this tree may never reach for. */

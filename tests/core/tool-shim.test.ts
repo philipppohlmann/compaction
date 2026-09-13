@@ -144,18 +144,22 @@ describe("tool-shim reversible shell-rc editing (opt-in only)", () => {
 });
 
 describe("generateShimScript honesty", () => {
-  it("execs the real binary transparently and only captures the measurable batch form", () => {
+  it("routes normal Codex exactly once through the ChatGPT-subscription gateway and preserves override bypass", () => {
     const script = generateShimScript("codex", "/abs/real/codex");
     expect(script).toContain("#!/usr/bin/env bash");
     expect(script).toContain(`${SHIM_MARKER}: codex`);
     expect(script).toContain("/abs/real/codex");
-    // Transparent exec for the non-measurable path; tee + PIPESTATUS for the measurable path.
+    expect(script).toContain("gateway run --provider openai --workflow codex --subscription --");
     expect(script).toContain('exec "$REAL_BIN" "$@"');
+    expect(script).toContain('${OPENAI_BASE_URL:-}');
+    expect(script).toContain('${OPENAI_API_BASE:-}');
+    expect(script).toContain("model_provider=*");
+    expect(script).toContain("model_providers.*.base_url=*");
+    // Legacy tee/capture remains inside the explicit-override/fail-open function only; the routed
+    // branch names the Gateway receipt as its sole post-call measurement.
     expect(script).toContain('tee "$__tmp"');
-    expect(script).toContain("PIPESTATUS[0]");
-    // Codex measurable detector: exec + --json.
-    expect(script).toContain("__has_exec");
-    expect(script).toContain("--json");
+    expect(script).toContain("capture codex");
+    expect(script).toContain("Gateway receipt replaces ONLY the post-hoc tee/capture bridge");
   });
 
   it("the cursor shim forwards the original invocation for a LOCAL-ESTIMATE input count", () => {

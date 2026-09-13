@@ -122,11 +122,10 @@ function timeout(ms: number): Promise<void> {
  * module header.)
  *
  * ORDERING (why in-flight requests are covered too). `server.close(cb)` fires `cb` only after every
- * connection has ended. A request's bookkeeping is tracked from the upstream response's `end` event,
- * which `handleProxy` subscribes to AFTER `upstreamRes.pipe(res)` — so it runs in the same synchronous
- * emit that ends the client response, strictly before the client's socket can close. A request in
- * flight when `close()` is called therefore always registers its write before the close callback
- * could observe the connection as gone.
+ * connection has ended. `handleProxy` registers one response-settlement promise before it starts
+ * piping any response byte. EOF or bounded authoritative Codex terminal-event evidence then starts
+ * the receipt work behind that promise. A request in flight when `close()` is called is therefore
+ * already visible to the drain before the close callback can observe the connection as gone.
  *
  * The callback's `err` (node reports `ERR_SERVER_NOT_RUNNING` on a second `close`) is passed through
  * unchanged; the drain neither swallows it nor adds one of its own.

@@ -63,17 +63,16 @@ async function runInit(
 
 describe("compaction init --connect: Page-4 Ready summary", () => {
   it("appears after a successful connect and lists every workflow this run configured", async () => {
-    // --connect all on a machine whose shim dir is NOT on PATH — the fresh-machine state. Claude Code
-    // verifies its hook into the project .claude/settings.json; the Codex/Cursor shims install and get
-    // their rc PATH line written. All three were configured, so all three are Enabled; PATH-pending is
-    // reported per workflow, not by omitting the workflow from the list.
+    // --connect all on a machine whose shim dir is NOT on PATH — the fresh-machine state. Only Codex
+    // and Cursor are detected, so only their shims install and get their rc PATH line written. The
+    // absent Claude Code workflow remains untouched.
     const { stdout, code } = await runInit(["--connect", "all"]);
     expect(code).toBe(0);
 
     // Header + Enabled list.
     expect(stdout).toContain("Compaction is ready.");
     expect(stdout).toContain("Enabled:");
-    expect(stdout).toContain("✓ Claude Code");
+    expect(stdout).not.toContain("✓ Claude Code");
     const readySection = stdout.slice(stdout.indexOf("Compaction is ready."));
     expect(readySection).toContain("✓ Codex");
     expect(readySection).toContain("✓ Cursor");
@@ -83,11 +82,12 @@ describe("compaction init --connect: Page-4 Ready summary", () => {
 
     // Run commands for the enabled tools.
     expect(readySection).toContain("Run your workflows normally:");
-    expect(readySection).toMatch(/Run your workflows normally:\n\s+claude\n/);
+    expect(readySection).not.toMatch(/Run your workflows normally:\n\s+claude\n/);
 
     // Honest "Compaction will" bullets.
     expect(stdout).toContain("Compaction will:");
-    expect(stdout).toContain("✓ record usage (content-free token/cache receipts)");
+    expect(stdout).toContain("✓ report only observed usage from content-free token/cache artifacts");
+    expect(stdout).not.toContain("✓ record usage (content-free token/cache receipts)");
     expect(stdout).toContain(
       "✓ show provider-reported proof when the provider caches and fresh input drops (compaction gateway proof)"
     );
@@ -103,14 +103,7 @@ describe("compaction init --connect: Page-4 Ready summary", () => {
     // Record-only boundary; the advanced routing / cache-proof / apply detail moved to
     // `compaction status`, pointed to by a single line.
     expect(readySection).toContain("Per workflow - enabled on the plan-auth default (no API key):");
-    expect(readySection).toContain("Claude Code → ✓ Enabled (plan-auth, default):  claude");
-    // F65: this pinned "Record-only - nothing the model sees is mutated." on a REAL `--connect 1` run,
-    // i.e. the exact run that writes the `--shape-prompt-hook` UserPromptSubmit entry. The suite was
-    // therefore enforcing a sentence the same command's own settings file contradicted.
-    expect(readySection).toContain(
-      "Output shaping: on - a concise-response instruction is attached before each shapeable turn. " +
-        "Your input is not compacted or edited."
-    );
+    expect(readySection).not.toContain("Claude Code → ✓ Enabled");
     expect(readySection).toContain("Advanced routing, cache proof, and per-workflow detail:  compaction status");
     // The advanced detail is NOT inlined on the enable screen (it lives in `compaction status`).
     expect(readySection).not.toContain("Optional (Advanced) - provider cache proof:");
@@ -137,16 +130,13 @@ describe("compaction init --connect: Page-4 Ready summary", () => {
     expect(stdout).toContain("✓ Codex");
     const readySection = stdout.slice(stdout.indexOf("Compaction is ready."));
     expect(readySection).toMatch(/Run your workflows normally:\n\s+codex\n/);
-    // Codex concise enable line + run command + the HONEST per-tool boundary. The Record-only line is
-    // deliberately absent: this connect installs a capture shim plus the tool's own hooks, so there is
-    // no gateway route AND an instruction IS attached to what the model sees.
+    // Codex concise enable line + run command + the honest per-tool boundary.
     expect(readySection).toContain("Codex → ✓ Enabled (plan-auth, default):  codex");
-    // The instruction IS named (the whole point of the correction) and the absent Gateway route is
-    // stated. The turn-scope clause is probe-driven (a build with the task classifier says "held", one
-    // without says "every prompt"), so both honest forms are accepted here and pinned exactly, with
-    // their conditions, in tests/cli/init-ready-routing.test.ts.
-    expect(readySection).toContain("a concise-response instruction is attached before generation");
-    expect(readySection).toContain("No Gateway route from this setup.");
+    // The stub cannot answer Codex's native trust query, so configured must not be presented as active.
+    expect(readySection).toContain("output shaping is configured for Codex");
+    expect(readySection).toContain("depends on its one-time hook approval");
+    expect(readySection).toContain("Routed automatically through the local Gateway");
+    expect(readySection).not.toContain("No Gateway route from this setup.");
     expect(readySection).not.toContain("Record-only - nothing the model sees is mutated.");
     expect(readySection).toContain("Advanced routing, cache proof, and per-workflow detail:  compaction status");
     expect(readySection).not.toContain("verify-cache");

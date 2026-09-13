@@ -204,7 +204,7 @@ async function runLogin(
  * not, so a user whose access was renewed but whose engine download failed reads both halves.
  */
 async function printCommunitySetup(env: NodeJS.ProcessEnv): Promise<void> {
-  const runtime = await ensureCommunityRuntime(env);
+  const runtime = await ensureCommunityRuntime(env, undefined, { engineIntent: "explicit" });
   if (runtime.account === "absent") return; // nothing to set up, and nothing was attempted
 
   // WHAT THIS CALL ACTUALLY DID, one line each, and empty when it did nothing. Printed FIRST and on
