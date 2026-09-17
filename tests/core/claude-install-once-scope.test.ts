@@ -229,6 +229,9 @@ describe("E. migration through the REAL CLI connect path", () => {
     );
     expect(effective.reduce((a, b) => a + b, 0)).toBe(1);
     expect(await isStopHookInstalled(userSettings())).toBe(true);
+    const installed = readJson(userSettings());
+    expect(installed.statusLine).toEqual({ type: "command", command: CLAUDE_CODE_STATUS_LINE_COMMAND });
+    expect(hookCommands(installed, "UserPromptSubmit")).toContain(CLAUDE_CODE_SHAPING_HOOK_COMMAND);
 
     // The foreign hook is not ours to remove.
     expect(hookCommands(readJson(projectFile), "UserPromptSubmit")).toContain("foreign-linter --check");

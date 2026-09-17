@@ -70,8 +70,8 @@ export const CONNECT_SURFACES: ConnectSurface[] = [
   {
     key: "cursor",
     title: "Cursor",
-    connectNote: "connect where possible: local-estimate only",
-    path: "Cursor: live wrapper / local-estimate where available",
+    connectNote: "connect: native session hook; CLI capture when available",
+    path: "Cursor: native sessionStart hook / local estimate; optional CLI capture",
     connectable: true
   },
   {
@@ -102,9 +102,20 @@ export interface ConnectDetection {
      */
     hookReady?: boolean;
   };
-  /** Codex/Cursor shim status: connected (active) / installed-not-active / real binary found / absent. */
+  /** Codex routing-shim status: active / installed-not-active / real binary found / absent. */
   codex: "active" | "installed" | "found" | "absent";
-  cursor: "active" | "installed" | "found" | "absent";
+  /** Whether the complete native Codex hook bundle was re-read and verified in Codex's config. */
+  codexHooksInstalled?: boolean;
+  /** Whether Codex has both the shaping hook and its one-time native approval. */
+  codexHookReady?: boolean;
+  cursor: {
+    /** Cursor desktop app/environment discovery, independent of a shell command. */
+    desktopDetected: boolean;
+    /** The native Cursor sessionStart hook was re-read and verified on disk. */
+    hookReady: boolean;
+    /** Optional headless CLI/capture-shim state. Desktop use does not require this. */
+    cli: "active" | "installed" | "found" | "absent";
+  };
 }
 
 /**
@@ -139,8 +150,8 @@ export interface WorkflowDiscovery {
  */
 export const CODEX_DISCOVERY_COPY = {
   foundMeaning: "codex binary found on PATH",
-  readyMeaning: "Compaction shim runs before the real Codex binary",
-  enableAction: "Install reversible Compaction shim. The real Codex binary is never replaced."
+  readyMeaning: "Compaction routing shim and native hooks are configured",
+  enableAction: "Install the reversible Compaction routing shim and native hooks. The real Codex binary is never replaced."
 } as const;
 
 export const CLAUDE_CODE_DISCOVERY_COPY = {
@@ -152,9 +163,9 @@ export const CLAUDE_CODE_DISCOVERY_COPY = {
 } as const;
 
 export const CURSOR_DISCOVERY_COPY = {
-  foundMeaning: "cursor binary found on PATH",
-  readyMeaning: "Compaction shim is active",
-  enableAction: "Install reversible Compaction shim."
+  foundMeaning: "Cursor desktop app or CLI found",
+  readyMeaning: "Compaction sessionStart hook is verified",
+  enableAction: "Install the reversible Cursor sessionStart hook; add the capture launcher only when the CLI is available."
 } as const;
 
 /**
@@ -165,7 +176,7 @@ export const CURSOR_DISCOVERY_COPY = {
 export const DISCOVERY_FOUND_LABEL: Record<WorkflowDiscovery["key"], string> = {
   codex: "installed",
   "claude-code": "sessions found",
-  cursor: "installed"
+  cursor: "detected"
 };
 
 /** The line shown above the discovery rows on both surfaces. Test-pinned, do not reword. */
@@ -204,9 +215,14 @@ export function shortLabel(state: DiscoveryState, foundLabel: string): string {
  * deliberately not discovery rows (infra / Advanced-only / not implemented).
  */
 export function deriveDiscovery(det: ConnectDetection): WorkflowDiscovery[] {
-  // Codex: found = binary on PATH (active|installed|found); ready = shim active; not-found = absent.
+  // Codex routing and native hooks are separate facts. An active shim with no verified hook bundle
+  // still needs the normal enable path so onboarding can install the missing native integration.
   const codexState: DiscoveryState =
-    det.codex === "absent" ? "not-found" : det.codex === "active" ? "ready" : "found";
+    det.codex === "absent"
+      ? "not-found"
+      : det.codex === "active" && det.codexHooksInstalled === true
+        ? "ready"
+        : "found";
 
   // Claude Code: found = local sessions/settings exist; ready = hook installed AND verified.
   // Without a verified hook bit, Claude Code is at most `found`, never `ready`.
@@ -216,9 +232,10 @@ export function deriveDiscovery(det: ConnectDetection): WorkflowDiscovery[] {
       ? "ready"
       : "found";
 
-  // Cursor: found = cursor/cursor-agent binary on PATH; ready = shim active; not-found = absent.
-  const cursorState: DiscoveryState =
-    det.cursor === "absent" ? "not-found" : det.cursor === "active" ? "ready" : "found";
+  // Cursor desktop is independently usable through its native hook. The CLI is optional capture
+  // support; neither desktop presence nor an active shim alone is enough to claim the hook ready.
+  const cursorPresent = det.cursor.desktopDetected || det.cursor.cli !== "absent";
+  const cursorState: DiscoveryState = !cursorPresent ? "not-found" : det.cursor.hookReady ? "ready" : "found";
 
   return [
     {
@@ -313,7 +330,8 @@ export function selectedReadyWorkflows(sel: ReadonlySet<WorkflowKey>, discovery:
 }
 
 /**
- * Optimization-mode model (Page 3). Invariant: neither mode introduces a new optimizer -
+ * Advanced/manual optimization-mode model. Normal onboarding derives this from the selected plan
+ * and does not render another mode picker. Invariant: neither mode introduces a new optimizer -
  * both map to existing capabilities.
  *  - `cache-optimize` (default) = Gateway record + `gateway proof`. No model-visible change,
  *    no approval needed; the provider does the caching, Compaction measures and proves it.
@@ -399,11 +417,11 @@ export function findOptimizationMode(key: string): OptimizationMode | undefined 
   return OPTIMIZATION_MODES.find((m) => m.key === key);
 }
 
-/** The header shown above the optimization-mode section on both surfaces. */
+/** Legacy heading retained for advanced/manual mode documentation and focused model tests. */
 export const OPTIMIZATION_MODE_HEADER = "Optimization mode (how context is handled for supported runs):";
 
 /**
- * Footer under the two modes. Invariant: the mode screen writes nothing and choosing a mode
+ * Footer for advanced/manual mode documentation. Invariant: choosing a mode
  * never enables automatic application - that exists only under a separate explicit scoped
  * stored authorization.
  */
@@ -900,7 +918,8 @@ export function readyModeLine(modeKey?: OptimizationModeKey): string {
 export function buildReadySummaryLines(
   enabled: readonly ReadyToolKey[],
   modeKey?: OptimizationModeKey,
-  routing?: readonly ReadyRoutingCapability[]
+  routing?: readonly ReadyRoutingCapability[],
+  options: { cursorDesktopOnly?: boolean } = {}
 ): string[] {
   const order: ReadyToolKey[] = ["claude-code", "codex", "cursor"];
   const tools = order.filter((k) => enabled.includes(k));
@@ -915,11 +934,15 @@ export function buildReadySummaryLines(
   lines.push(`  ${readyModeLine(modeKey)}`);
   lines.push("");
   lines.push(`  ${READY_RUN_HEADER}`);
-  for (const k of tools) lines.push(`    ${READY_TOOL_COPY[k].runCommand}`);
+  for (const k of tools) {
+    lines.push(`    ${k === "cursor" && options.cursorDesktopOnly ? "Cursor desktop app (native session hook)" : READY_TOOL_COPY[k].runCommand}`);
+  }
   const routingSection = routing ? readyRoutingSectionLines(routing) : [];
   if (routingSection.length > 0) {
     lines.push("");
-    lines.push(...routingSection);
+    lines.push(...(options.cursorDesktopOnly
+      ? routingSection.map((line) => line.replace(":  cursor-agent", ":  native sessionStart hook"))
+      : routingSection));
   }
   lines.push("");
   lines.push(`  ${READY_WILL_HEADER}`);
@@ -1180,73 +1203,56 @@ export const FOOTER_LINES = [
 ] as const;
 
 /* ================================================================================================
- * Production onboarding flow model (target → mode/limited → review → ready).
+ * Production onboarding flow model (tools → plan → setup → ready).
  *
- * The interactive `compaction init` walks the user through: (1) select from the detected workflows,
- * which are preselected by default; (2) choose how Compaction optimizes the selected set where each
- * workflow supports it; (3) review exactly what enabling does;
- * (4) run the REAL installers; (5) an honest ready screen with a REAL measured metric (or the
- * "unavailable until measured" state). All copy here is data-only (no React/chalk); the TUI is a
- * thin renderer, and every write routes through the same injected engine callbacks the static and
- * headless surfaces use.
+ * The interactive flow selects detected workflows, confirms a plan, installs, then
+ * renders verified status and follow-up commands. This module holds data and pure derivation; the TUI
+ * delegates all writes to injected callbacks shared with the headless surface.
  *
  * Per-tool / per-auth honesty (the claim boundary this model carries):
- *  - All three tools get OUTPUT-SHAPING (shorter responses) on a plan/subscription - no API key.
- *  - FULL optimization = output-shaping PLUS input compaction; the input side needs an API key /
- *    the Gateway route (an apply-capable provider). Off by default; approval-gated.
- *  - Cursor is session-level output-shaping + a LOCAL ESTIMATE only (Compaction does not ingest its
- *    conditional `result.usage`); input savings need an API key and are not measured on Cursor.
- *  - A subscription buys output-shaping + headroom (more useful work per plan window), NEVER a
- *    dollar-savings claim.
+ *  - All three tools get output shaping without an API key.
+ *  - Community adds input compaction on supported Claude Code and Codex subscription/API-key routes.
+ *  - Cursor is session-level output shaping only; it does not receive input compaction.
+ *  - Value claims remain estimates: active agent minutes for subscription use and provider-priced
+ *    savings where supported for API-key use.
  * ============================================================================================== */
 
 /** The auth Compaction detected for a workflow's provider - read-only (a key's VALUE is never read). */
 export type OnboardingAuthState = "api-key" | "subscription";
 
-/** Per-tool onboarding copy: title, availability tag, and the honest per-auth capability lines. */
+/** Per-tool onboarding copy used by the workflow, plan, and completion screens. */
 export interface OnboardingToolCopy {
   key: ReadyToolKey;
   title: string;
-  /** The detection/availability tag shown next to the title (e.g. "detected · recommended"). */
-  availabilityTag: string;
-  /** One honest line describing what this tool gets, per auth (no savings/cost claim). */
-  capability: string;
-  /** The honest "with an API key you additionally get…" line, or the vendor-gap note for Cursor. */
-  fullOptimizationNote: string;
-  /** True iff full optimization (input compaction via the Gateway) is even possible for this tool. */
-  supportsFullOptimization: boolean;
+  /** One concise capability line for the tool picker. */
+  selectionSummary: string;
+  /** Whether Community can add input compaction for this workflow. */
+  supportsInputCompaction: boolean;
 }
 
 /**
  * Per-tool onboarding copy, in the flow's display order (Claude Code recommended first). Wording is
- * test-pinned. No tool line makes a dollar-savings or output-token-savings claim; input compaction
- * is always gated on an API key / Gateway route, and Cursor is honestly local-estimate/session-level.
+ * test-pinned. Dollar value is explicitly estimated and provider-priced where supported, never
+ * billing-confirmed. Cursor stays honestly local-estimate/session-level with no input compaction.
  */
 export const ONBOARDING_TOOLS: OnboardingToolCopy[] = [
   {
     key: "claude-code",
     title: "Claude Code",
-    availabilityTag: "recommended",
-    capability: "Shorter responses on your Claude subscription or an Anthropic API key - no key needed for output shaping.",
-    fullOptimizationNote: "Add an Anthropic API key (Gateway route) for full optimization: deterministic input compaction on supported requests.",
-    supportsFullOptimization: true
+    selectionSummary: "Input + output token reduction · Subscription or API key · Results: status line",
+    supportsInputCompaction: true
   },
   {
     key: "codex",
-    title: "Codex CLI",
-    availabilityTag: "output shaping (subscription) · full optimization (API key)",
-    capability: "Shorter responses on your ChatGPT plan or an OpenAI API key - no key needed for output shaping.",
-    fullOptimizationNote: "Add an OpenAI API key (Gateway route) for full optimization: deterministic input compaction on supported requests.",
-    supportsFullOptimization: true
+    title: "Codex",
+    selectionSummary: "Input + output token reduction · Subscription or API key · Results: Compaction hook",
+    supportsInputCompaction: true
   },
   {
     key: "cursor",
     title: "Cursor",
-    availabilityTag: "output only · local estimate",
-    capability: "Shorter responses via a session-level instruction; Compaction records a content-free local estimate.",
-    fullOptimizationNote:
-      "Input compaction and per-turn control are not available for Cursor because Compaction has no verified Cursor Gateway route. Output effect is not yet measured on Cursor.",
-    supportsFullOptimization: false
+    selectionSummary: "Output token reduction · Session-level hook · No input reduction",
+    supportsInputCompaction: false
   }
 ];
 
@@ -1295,153 +1301,10 @@ export function onboardingUncoveredWorkflowsLine(
 }
 
 /** The header shown above the target picker. */
-export const ONBOARDING_TARGET_HEADER = "Choose the workflows you want to connect.";
+export const ONBOARDING_TARGET_HEADER = "Choose your tools";
 /** The read-only, honest sub-line under the target header (the caller injects the real detected list). */
 export const ONBOARDING_TARGET_READONLY =
-  "All detected tools are selected by default. Discovery is read-only; confirmation is the first write.";
-
-/**
- * The "limited" screen copy for a non-Claude tool: an honest per-tool + per-auth summary before the
- * user commits, and the exact honest note about what an API key would add. Pure; derived from the
- * per-tool copy so there is no second source of truth. Availability is INJECTED, like the mode
- * options — this module does no probing.
- *
- * `fullOptimizationReachable` false replaces the "add an API key for full optimization" note with the
- * reason it would not help: with no engine running, a key buys output shaping and nothing on the
- * input side, and telling the user otherwise sends them to fetch a key for a capability that will
- * pass their requests straight through.
- *
- * Cursor is unaffected either way: its note is already a vendor-gap statement, not an offer.
- */
-export function onboardingLimitedLines(key: ReadyToolKey, fullOptimizationReachable = true): string[] {
-  const tool = findOnboardingTool(key);
-  if (!tool) return [];
-  if (fullOptimizationReachable || !tool.supportsFullOptimization) return [tool.capability, tool.fullOptimizationNote];
-  return [
-    tool.capability,
-    "Input compaction needs the adaptive engine, which is not released yet - an API key would add " +
-      "nothing on the input side today. Output shaping works now, on your plan, with no key."
-  ];
-}
-
-/**
- * The two optimization modes shown for Claude Code, mapped to the existing `OptimizationModeKey`
- * values so persistence stays on the ONE existing enum/writer (no new preference type):
- *  - `full`   → `cache-context-optimize`: output shaping + deterministic input compaction on
- *               supported requests (input side needs the Gateway/API-key route); approval-gated,
- *               original retained + recoverable.
- *  - `output` → `cache-optimize`: shorter responses only; input is sent exactly as written; works
- *               on the subscription with no model-visible change.
- * The reframed titles are the product vocabulary; the mapped key is what is persisted.
- */
-export interface OnboardingModeOption {
-  /** The reframed product key shown in the flow. */
-  key: "full" | "output";
-  title: string;
-  description: string;
-  /** The existing persisted optimization-mode key this maps to (no new enum introduced). */
-  mapsToModeKey: OptimizationModeKey;
-  recommended: boolean;
-  /**
-   * Whether this build can actually deliver the mode. Set by `onboardingModeOptions`; absent on the
-   * raw `ONBOARDING_MODE_OPTIONS` constant, which describes the modes as designed, not as shipped.
-   * A renderer MUST NOT let the user select an option with `available: false`.
-   */
-  available?: boolean;
-}
-
-export const ONBOARDING_MODE_OPTIONS: OnboardingModeOption[] = [
-  {
-    key: "output",
-    title: "Output only",
-    description: "Asks for shorter responses; your input is sent exactly as written - works on your subscription, no API key.",
-    mapsToModeKey: "cache-optimize",
-    recommended: true
-  },
-  {
-    key: "full",
-    title: "Full optimization",
-    description: "Shorter responses, plus input compaction on supported requests. Needs an API key (the Gateway route); approval-gated, and the original is always recoverable.",
-    mapsToModeKey: "cache-context-optimize",
-    recommended: false
-  }
-];
-
-/**
- * The mode options as this build can actually deliver them. Callers pass the answer from
- * `core/engine-availability.ts` (`fullOptimizationReachable`) — this module stays pure and does no
- * filesystem probing of its own.
- *
- * When the engine is unreachable — the published package excludes `dist/engine/**`, so a device
- * that has not installed a signed release has nothing to run — "Full optimization" is marked
- * UNAVAILABLE rather than offered: selecting it would take a real authorization for input
- * compaction that then never runs, and the user's requests would pass through while the flow said
- * otherwise.
- *
- * The REASON shown changed when the production release was published. "No signed engine has been
- * distributed yet" was a claim about the world; it is now false, and the true statement is about
- * THIS DEVICE — the engine is delivered separately and is not installed here yet. The predicate
- * (`fullOptimizationReachable`, which is `"present"`-only) is unchanged; only the explanation is.
- *
- * The option is still SHOWN, with the reason, rather than hidden — a user comparing modes should see
- * that the capability exists and is not released, not silently get a one-option picker.
- */
-export function onboardingModeOptions(fullOptimizationReachable: boolean): OnboardingModeOption[] {
-  if (fullOptimizationReachable) return ONBOARDING_MODE_OPTIONS.map((option) => ({ ...option, available: true }));
-  return ONBOARDING_MODE_OPTIONS.map((option) =>
-    option.key === "full"
-      ? {
-          ...option,
-          available: false,
-          description:
-            "Shorter responses, plus input compaction on supported requests - not available on this device yet, " +
-            "because the adaptive engine that performs it is delivered separately and is not installed here. " +
-            "Activating Community installs it for you. Selecting it today would change nothing about your requests."
-        }
-      : { ...option, available: true }
-  );
-}
-
-/** The header shown above the Claude Code mode picker (kept for the Claude Code default). */
-export const ONBOARDING_MODE_HEADER = "Choose how Compaction should optimize Claude Code.";
-/** The honest sub-lines under the Claude Code mode header (auth stays the user's; Compaction runs locally). */
-export const ONBOARDING_MODE_SUBLINES = [
-  "Your Claude subscription (or API key) remains how Claude Code authenticates.",
-  "Compaction runs locally between the Claude launcher and supported traffic."
-] as const;
-
-/**
- * The mode screen is reachable for every tool that HAS two modes, so its copy must name the tool the
- * user is actually configuring and the credential that tool actually authenticates with. Hardcoding
- * Claude Code told a Codex user that a Claude subscription authenticates Codex, which is simply false.
- * Pure; derived per key so there is no second source of truth.
- */
-export function onboardingModeHeader(key: ReadyToolKey): string {
-  const title = findOnboardingTool(key)?.title ?? key;
-  return `Choose how Compaction should optimize ${title}.`;
-}
-
-/** The honest per-tool sub-lines under the mode header. Names the tool's OWN auth, never Claude's. */
-export function onboardingModeSublines(key: ReadyToolKey): readonly string[] {
-  if (key === "codex") {
-    return [
-      "Your ChatGPT plan (or OpenAI API key) remains how Codex authenticates.",
-      "Compaction runs locally between the Codex launcher and supported traffic."
-    ];
-  }
-  if (key === "cursor") {
-    return [
-      "Your Cursor plan (or API key) remains how Cursor authenticates.",
-      "Compaction runs locally alongside Cursor; it never proxies your Cursor session."
-    ];
-  }
-  return ONBOARDING_MODE_SUBLINES;
-}
-
-/** Map a reframed onboarding mode key to the existing persisted optimization-mode key. Pure. */
-export function onboardingModeToOptimizationKey(key: "full" | "output"): OptimizationModeKey {
-  return key === "full" ? "cache-context-optimize" : "cache-optimize";
-}
+  "Detected tools are selected. Nothing changes until you continue.";
 
 /**
  * ONE hook entry enabling will write, described content-free. INJECTED by init.ts from the REAL
@@ -1466,6 +1329,8 @@ export interface OnboardingReviewOptions {
    * COMPACTION_SHAPING_HOOKS=0), in which case the review says so rather than staying silent.
    */
   hooks?: OnboardingHookDisclosure;
+  /** Cursor desktop can use its native hook without installing a CLI capture launcher or editing PATH. */
+  desktopOnly?: boolean;
 }
 
 /** The review screen's three regions: the ask, the exact effects, and the honest closing boundaries. */
@@ -1491,45 +1356,26 @@ export function onboardingReviewContent(
   options: OnboardingReviewOptions = {}
 ): OnboardingReviewContent {
   const tool = findOnboardingTool(key);
-  const modeTitle = ONBOARDING_MODE_OPTIONS.find((m) => m.key === modeKey)?.title ?? "Output only";
-  const bullets = [
-    "  • install a reversible, fail-open launcher/shim (the real binary is never replaced)",
-    "  • add its launcher directory to your shell PATH (announced, backed up, reversible)"
-  ];
-  // Cursor has no Gateway route at all (no ROUTE_COMMANDS entry), so promising an on-demand Gateway
-  // there would describe routing that cannot happen.
-  if (key !== "cursor") {
-    bullets.push("  • start the local Gateway on demand when the workflow needs routing");
-  }
+  const bullets = options.desktopOnly
+    ? ["  • add Cursor's native sessionStart hook"]
+    : [`  • connect ${tool?.title ?? key} for normal use`];
   if (options.hooks) {
     bullets.push(
-      `  • write ${options.hooks.file} - MERGED, never replaced (any existing file is backed up to ${options.hooks.backupPath}):`
+      `  • merge hooks into ${options.hooks.file}`,
+      `  • back up the existing file to ${options.hooks.backupPath}`
     );
     for (const entry of options.hooks.entries) {
-      bullets.push(`      - ${entry.event}: \`${entry.command}\` - ${entry.effect}`);
+      bullets.push(`      ${entry.event}: \`${entry.command}\``);
     }
   }
-  // A mode the user never picked is stated as THE default, not as their choice (Cursor has one mode,
-  // so it gets no picker; claiming they chose it would assert a decision that never happened).
-  bullets.push(
-    tool?.supportsFullOptimization === false
-      ? modeKey === "full"
-        ? `  • effective mode for ${tool?.title ?? key}: "Output only"; the device-wide "${modeTitle}" preference is remembered for future runs and applies only where supported`
-        : `  • effective mode for ${tool?.title ?? key}: "Output only"; remember "${modeTitle}" as the device-wide preference for future runs`
-      : `  • remember "${modeTitle}" as your default for future runs`
-  );
-  if (options.plan) bullets.push(onboardingPlanReviewLine(options.plan));
+  if (options.plan && key === "claude-code") bullets.push(onboardingPlanReviewLine(options.plan));
 
-  const notes = ["No API key is requested for the subscription (output-shaping) path."];
+  const notes: string[] = [];
   if (!options.hooks && (key === "codex" || key === "cursor")) {
-    notes.push(
-      "Output shaping is currently switched off (`compaction stop` / COMPACTION_SHAPING_HOOKS=0), so no hook config will be written."
-    );
+    notes.push("Output shaping is off, so no hook file will be written.");
   }
-  notes.push(
-    "Disable anytime restores the previous PATH configuration; nothing model-visible changes without approval."
-  );
-  return { headline: `Enable Compaction for ${tool?.title ?? key}? Compaction will:`, bullets, notes };
+  void modeKey;
+  return { headline: "Review your setup", bullets, notes };
 }
 
 /** The review content as flat lines (headline, then effects, then the closing boundaries). Pure. */
@@ -1600,9 +1446,8 @@ export interface OnboardingPlanOption {
   title: string;
   /** One-line summary shown next to the title. */
   summary: string;
-  /** The exact effects, stated BEFORE anything is persisted. */
-  effects: readonly string[];
-  recommended: boolean;
+  /** Optional aligned continuation lines for value terms that must stay readable at terminal width. */
+  details?: readonly string[];
 }
 
 /**
@@ -1622,33 +1467,13 @@ export const ONBOARDING_PLAN_OPTIONS: readonly OnboardingPlanOption[] = [
   {
     key: "open",
     title: "Open",
-    summary: "no account, works offline",
-    effects: [
-      "Asks for shorter answers: a concise-response instruction is attached to supported requests before they are generated.",
-      // "Never changes the input you wrote" is true and, on its own, misleading:
-      // an instruction block IS added to what the model sees. Saying both halves is the honest form.
-      "Adds that instruction to what the model sees; your own words are never edited, nothing is uploaded, and no network call is made.",
-      // THE OFF SWITCH MUST BE ONE THAT WORKS. This line used to say
-      // "Turn it off anytime with `compaction mode observe`". It is false: `decideShaping` reads only
-      // the kill switch and the persisted stop-state, and NOTHING in the hook path reads `product_mode`
-      // (grep: zero references). Telling a user in the consent screen that a command turns shaping off
-      // when it does not is a defect, not a wording preference — so it is corrected rather than
-      // referred. `compaction stop` is the switch that actually works, and it stays true whichever way
-      // open decision D2 goes.
-      "Your per-turn line will read `basic shaping` on turns that are shaped. Turn shaping off anytime with `compaction stop`."
-    ],
-    recommended: true
+    summary: "No account · Output token reduction · Local · Nothing metered"
   },
   {
     key: "community",
     title: "Community",
-    summary: "free account, 1 device",
-    effects: [
-      "Everything in Open, plus this device is registered to a free Community account and gets its entitlement.",
-      "One browser confirmation now — you come back already signed in, with nothing left to run.",
-      "Free, 1 device, no card and no payment. Community adds the private adaptive engine where it is available to you; until then you stay on Open shaping and this screen says so."
-    ],
-    recommended: false
+    summary: "Free account · Input + output token reduction · 2M optimized input/month",
+    details: ["Existing subscription or API key · estimated minutes or $ saved"]
   },
   {
     // THE HONEST SHAPE OF THIS OPTION: it sets the device up as Open and opens a waitlist. Every
@@ -1656,13 +1481,7 @@ export const ONBOARDING_PLAN_OPTIONS: readonly OnboardingPlanOption[] = [
     // did not — the failure mode a selectable-but-unpurchasable entry invites.
     key: "pro",
     title: "Pro",
-    summary: "waitlist — not yet purchasable",
-    effects: [
-      "Sets this device up exactly like Open (basic shaping). Pro is not enabled here and no Pro entitlement is created.",
-      "Opens your browser once to join the Pro waitlist. Nothing is purchased, no card is asked for, and no payment details are collected.",
-      "You stay on Open shaping until Pro is available and you are invited. Want the free account and its entitlement now? Choose Community instead."
-    ],
-    recommended: false
+    summary: "Input + output token reduction · 500M optimized input/month · up to 3 devices"
   }
 ] as const;
 
@@ -1671,14 +1490,49 @@ export const ONBOARDING_PLAN_OPTIONS: readonly OnboardingPlanOption[] = [
  * three, so it names which ones are free rather than dropping the fact — Pro's price is not the point
  * here, its unavailability is.
  */
-export const ONBOARDING_PLAN_HEADER =
-  "Choose how Compaction runs for you. Open and Community are free; Pro is a waitlist.";
+export const ONBOARDING_PLAN_HEADER = "Choose your plan";
 
 /** The honest sub-lines under the plan header. */
 export const ONBOARDING_PLAN_SUBLINES = [
-  "Nothing is written until you confirm on the next screen.",
-  "You can change this later with `compaction mode`."
+  "Use your existing provider login."
 ] as const;
+
+/** The one native Codex action after its verified hook bundle is first written. */
+export const CODEX_TRUST_ONBOARDING_INSTRUCTION =
+  "Run codex. At “Hooks need review,” choose “Trust all and continue”.";
+
+/**
+ * One verified completion line. `fullOptimizationActive` is the mode that actually persisted after
+ * Community setup, never the plan the user originally selected. `shapingReady` comes from a re-read
+ * of the tool's hook state after setup (or from the verified discovery state for an existing tool).
+ */
+export function onboardingReadyToolLine(
+  key: ReadyToolKey,
+  fullOptimizationActive: boolean,
+  shapingReady: boolean,
+  codexShapingState?: "active" | "configured" | "not-installed"
+): string {
+  const title = findOnboardingTool(key)?.title ?? key;
+
+  if (key === "codex" && codexShapingState === "configured") {
+    return `${title}   Output token reduction · one step remaining`;
+  }
+
+  if (!shapingReady) {
+    return `${title}   Output token reduction not verified`;
+  }
+  if (key === "cursor") {
+    return `${title}   Output token reduction · Session hook`;
+  }
+  const resultLocation = key === "claude-code" ? "Claude status line" : "Compaction hook";
+  const capability = fullOptimizationActive ? "Input + output token reduction" : "Output token reduction";
+  return `${title}   ${capability} · Results: ${resultLocation}`;
+}
+
+/** Fresh default: Community when any selected workflow supports input compaction, otherwise Open. */
+export function recommendedOnboardingPlan(selected: readonly ReadyToolKey[]): OnboardingPlanKey {
+  return selected.some((key) => findOnboardingTool(key)?.supportsInputCompaction === true) ? "community" : "open";
+}
 
 /** Look up a plan option by key. Pure. */
 export function findOnboardingPlan(key: OnboardingPlanKey): OnboardingPlanOption | undefined {
@@ -1691,14 +1545,12 @@ export function findOnboardingPlan(key: OnboardingPlanKey): OnboardingPlanOption
  */
 export function onboardingPlanReviewLine(plan: OnboardingPlanKey): string {
   if (plan === "community") {
-    return "  • set your mode to basic shaping, then open your browser once to activate your free Community account";
+    return "  • activate Community in your browser; Open remains available if activation does not finish";
   }
   if (plan === "pro") {
-    // Names the write AND the non-write. The consent gate is the last screen before anything lands on
-    // disk, so "no Pro entitlement is created" belongs here and not only on the picker.
-    return "  • set your mode to basic shaping, then open your browser once to join the Pro waitlist (nothing is purchased and no Pro entitlement is created)";
+    return "  • configure Open, then open the Pro waitlist; nothing is purchased";
   }
-  return "  • set your mode to basic shaping (concise-response instruction attached before generation)";
+  return "  • enable output shaping with Open";
 }
 
 /**
@@ -1721,13 +1573,11 @@ export const ONBOARDING_PRO_WAITLIST_HEADLINE = "Join the Pro waitlist";
 /** The handoff body. `url` is the resolved canonical waitlist URL. Pure. */
 export function onboardingProWaitlistLines(url: string): readonly string[] {
   return [
-    "Your setup is already complete and this device is on Open shaping — that does not depend on the waitlist.",
+    "Your setup is complete and this device has Open output token reduction. The waitlist does not affect it.",
     "No Pro entitlement was created, nothing was purchased, and no payment details were collected.",
     "",
     `Opening: ${url}`,
-    "If your browser did not open, use that link.",
-    "",
-    "1  open it again   ·   2  continue"
+    "If your browser did not open, use that link."
   ];
 }
 
@@ -1853,7 +1703,7 @@ export type CommunityAuthFn = (
  * Fixed, content-free strings: they name a setting, never a path, an id, or a count.
  */
 export const FULL_APPLY_PENDING_REASONS = {
-  /** The persisted optimization mode is `cache` — the stepper's recommended "Output only". */
+  /** The persisted optimization mode is `cache` — the Open/Pro "Output only" posture. */
   optimizationMode: "the optimization mode is Output only",
   /** No stored `auto-when-gates-pass` authorization covers an enabled workflow. */
   applyAuthorization: "no apply authorization for this workflow yet"
@@ -1865,8 +1715,7 @@ export function isLocalFullApplyGateReason(reason: string | undefined): boolean 
 }
 
 /**
- * The ONE sentence the Ready screen adds when only a local gate is missing — a statement of what full
- * apply requires, in the same words the stepper's own mode picker used ("Full optimization").
+ * The Ready screen's content-free statement of the local full-apply requirements.
  *
  * Deliberately NOT a call to action: no imperative, no command, no price, no URL. The user is already
  * on Community and owes nothing; what they lack is information about their own earlier choice, and
@@ -1914,7 +1763,7 @@ export function onboardingAuthFailureLines(
     case "unreachable":
       return {
         headline: "Could not reach the Compaction service.",
-        detail: "This is a connection problem, not a rejection — the service may be offline, or this machine may be.",
+        detail: "This is a connection problem, not a rejection. The service or this machine may be offline.",
         retryable: true
       };
     case "endpoint_not_found":
@@ -1927,7 +1776,7 @@ export function onboardingAuthFailureLines(
           serviceStatus === undefined ? "" : ` (HTTP ${serviceStatus})`
         }.`,
         detail:
-          "Nothing was created. Check the service URL — COMPACTION_API_URL, or `compaction login --api-url <url>`.",
+          "Nothing was created. Check COMPACTION_API_URL or run `compaction login --api-url <url>`.",
         retryable: true
       };
     case "service_error":
@@ -1956,7 +1805,7 @@ export function onboardingAuthFailureLines(
  * either without the finishing command leaves the user with no way back.
  */
 export const ONBOARDING_AUTH_FALLBACK_LINES = [
-  "Open is active and saved — your setup works right now.",
+  "Open is active and saved. Your setup works right now.",
   "Community was NOT activated: no account was created and no device was registered.",
   "To finish Community later, run `compaction` again and choose Community."
 ] as const;

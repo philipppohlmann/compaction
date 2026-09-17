@@ -62,7 +62,7 @@ describe("compaction init - connect-once install onboarding", () => {
     // OpenAI Agents + Browser are NOT discovery rows on Page 1 (dropped this cycle).
     expect(stdout).not.toContain("OpenAI Agents");
     expect(stdout).not.toMatch(/\[[ x~]\] Browser\b/);
-    expect(stdout).toContain("local-estimate only");
+    expect(stdout).toContain("native session hook; CLI capture when available");
     expect(stdout).not.toContain("recommended first run");
     expect(stdout).not.toContain("Start here");
     // `found` must never claim active; only `ready` means active-for-recording.
@@ -85,16 +85,10 @@ describe("compaction init - connect-once install onboarding", () => {
     expect(stdout).toContain("After connect: supported runs route or capture automatically; only recorded evidence is reported.");
     expect(stdout).toContain("Manual tools: capture · import · analyze · spend · feedback --redact");
 
-    // Optimization mode (Page 3) - the two honest modes + exact commands, mode 1 recommended/default.
-    expect(stdout).toContain("Optimization mode (how context is handled for supported runs):");
-    expect(stdout).toContain("[1] Output only");
-    expect(stdout).toContain("(recommended · default)");
-    expect(stdout).toContain("Asks for shorter responses. Your input is sent exactly as written.");
-    expect(stdout).toContain("[2] Full optimization");
-    expect(stdout).toContain("Compact input and shape output on supported requests. Confirm once for selected workflows.");
-    expect(stdout).toContain("compaction gateway proof --proof-run <id>");
-    expect(stdout).toContain("compaction init --connect <workflow> --mode cache-plus-context");
-    expect(stdout).toContain("This read-only screen writes nothing.");
+    // The normal static screen does not ask for an optimization mode after the plan decision.
+    expect(stdout).not.toContain("Optimization mode (how context is handled for supported runs):");
+    expect(stdout).not.toContain("[1] Output only");
+    expect(stdout).not.toContain("[2] Full optimization");
 
     // Engine commands absent; no overclaim.
     for (const eng of ENGINE_COMMANDS) expect(stdout).not.toContain(`compaction ${eng}`);

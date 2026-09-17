@@ -67,7 +67,7 @@ describe("tests 8/9 - wiring did not leak the custom app or a provider into onbo
   const det: ConnectDetection = {
     claude: { detected: true },
     codex: "found",
-    cursor: "found"
+    cursor: { desktopDetected: false, hookReady: false, cli: "found" }
   };
 
   it("Page-1 discovery stays exactly Codex, Claude Code, Cursor", () => {

@@ -1,8 +1,8 @@
 {
   "name": "@compaction/cli",
-  "version": "0.6.8",
+  "version": "0.6.9",
   "compactionRelease": {
-    "cliVersion": "0.6.8",
+    "cliVersion": "0.6.9",
     "launcherProtocol": 1,
     "integrationProtocol": 1,
     "gatewayProtocol": 1,

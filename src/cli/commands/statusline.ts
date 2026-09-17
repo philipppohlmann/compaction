@@ -111,6 +111,11 @@ interface StatusLineStdin {
   cost?: { total_tokens?: unknown; output_tokens?: unknown } | unknown;
   usage?: { output_tokens?: unknown; provider_reported?: unknown } | unknown;
   output_tokens?: unknown;
+  /** Current Claude Code payload (2.1.x): usage for the latest API response is nested here. */
+  context_window?: {
+    total_output_tokens?: unknown;
+    current_usage?: { output_tokens?: unknown } | null | unknown;
+  } | unknown;
 }
 
 function asNumber(value: unknown): number | undefined {
@@ -137,10 +142,21 @@ function parseStatusLineStdin(raw: string): StatusLineStdin {
 function outputTokensFromStdin(stdin: StatusLineStdin): number | undefined {
   const cost = stdin.cost as { output_tokens?: unknown } | undefined;
   const usage = stdin.usage as { output_tokens?: unknown } | undefined;
+  const contextWindow = stdin.context_window as {
+    total_output_tokens?: unknown;
+    current_usage?: { output_tokens?: unknown } | null;
+  } | undefined;
+  const currentUsage = contextWindow?.current_usage;
+  const contextOutput = asNumber(currentUsage?.output_tokens);
+  const contextTotal = asNumber(contextWindow?.total_output_tokens);
   return (
     asNumber(stdin.output_tokens) ??
     asNumber(usage?.output_tokens) ??
-    asNumber(cost?.output_tokens)
+    asNumber(cost?.output_tokens) ??
+    contextOutput ??
+    // Claude reports zero with `current_usage: null` before the first completed response. That is not
+    // completed-turn evidence, so keep the quiet placeholder until a positive total exists.
+    (contextTotal !== undefined && contextTotal > 0 ? contextTotal : undefined)
   );
 }
 
@@ -573,12 +589,16 @@ export async function computeStatusLine(rawStdin: string, deps: StatusLineDeps =
       // The stdin count is provider-reported ONLY when the payload says so; default to local-estimate.
       const usage = stdin.usage as { provider_reported?: unknown } | undefined;
       const providerReported = usage?.provider_reported === true;
-      const shapingActive = isShapingHooksActivated(env);
+      // The installed/active hook is not evidence that THIS turn was shaped. Only the same-session
+      // decision record may add the shaping label or estimated axis. With no record, retain the output
+      // count without inventing a turn posture; an explicitly disabled install may still say apply off.
+      const shapingActive = hookShapedTurn;
+      const outputTier = shapingActive ? "basic" : isShapingHooksActivated(env) ? undefined : "observe";
       const line = receiptLineOutputOnly({
         outputTokens,
         providerReported,
         shapingActive,
-        tier: shapingActive ? "basic" : "observe",
+        ...(outputTier ? { tier: outputTier } : {}),
         ...(reduction ? { estimatedSaved: estimatePerTurnOutputSaved(reduction, outputTokens) } : {}),
         // Carried on this path too: a Community user at the ceiling gets the same explanation whether
         // or not a gateway receipt existed this turn.

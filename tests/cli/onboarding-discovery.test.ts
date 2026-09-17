@@ -30,7 +30,7 @@ function det(overrides: Partial<ConnectDetection> = {}): ConnectDetection {
   return {
     claude: { detected: false, sessionCount: 0 },
     codex: "absent",
-    cursor: "absent",
+    cursor: { desktopDetected: false, hookReady: false, cli: "absent" },
     ...overrides
   };
 }
@@ -50,7 +50,7 @@ describe("deriveDiscovery - order and membership", () => {
 
   it("never includes OpenAI Agents, Browser, or Gateway as a discovery row", () => {
     const rows = deriveDiscovery(
-      det({ claude: { detected: true, sessionCount: 5, hookReady: true }, codex: "active", cursor: "active" })
+      det({ claude: { detected: true, sessionCount: 5, hookReady: true }, codex: "active", cursor: { desktopDetected: false, hookReady: true, cli: "active" } })
     );
     const keys = rows.map((r) => r.key);
     expect(keys).not.toContain("openai-agents");
@@ -60,28 +60,78 @@ describe("deriveDiscovery - order and membership", () => {
   });
 });
 
+describe("deriveDiscovery - presence and readiness stay separate", () => {
+  it("requires each tool's verified integration facts before rendering ready", () => {
+    const rows = (detection: ConnectDetection): Record<WorkflowDiscovery["key"], DiscoveryState> =>
+      Object.fromEntries(deriveDiscovery(detection).map((row) => [row.key, row.state])) as Record<
+        WorkflowDiscovery["key"],
+        DiscoveryState
+      >;
+
+    expect(rows(det({ claude: { detected: true, sessionCount: 1, hookReady: true } }))["claude-code"]).toBe("ready");
+    expect(rows(det({ claude: { detected: true, sessionCount: 1, hookReady: false } }))["claude-code"]).toBe("found");
+
+    expect(rows(det({ codex: "active", codexHooksInstalled: true, codexHookReady: true })).codex).toBe("ready");
+    expect(rows(det({ codex: "active", codexHooksInstalled: false, codexHookReady: false })).codex).toBe("found");
+
+    expect(rows(det({ cursor: { desktopDetected: true, hookReady: true, cli: "absent" } })).cursor).toBe("ready");
+    expect(rows(det({ cursor: { desktopDetected: true, hookReady: false, cli: "absent" } })).cursor).toBe("found");
+    expect(rows(det()).cursor).toBe("not-found");
+  });
+});
+
 describe("deriveDiscovery - Codex states", () => {
   for (const v of CODEX_CURSOR_VALUES) {
-    it(`codex=${v} -> ${expectedShimState(v)}`, () => {
-      const row = byKey(deriveDiscovery(det({ codex: v })), "codex");
-      expect(row.state).toBe(expectedShimState(v));
+    const expected = v === "active" ? "ready" : expectedShimState(v);
+    it(`codex=${v} with the native hook bundle -> ${expected}`, () => {
+      const row = byKey(deriveDiscovery(det({ codex: v, codexHooksInstalled: true })), "codex");
+      expect(row.state).toBe(expected);
       expect(row.foundMeaning).toBe(CODEX_DISCOVERY_COPY.foundMeaning);
       expect(row.readyMeaning).toBe(CODEX_DISCOVERY_COPY.readyMeaning);
       expect(row.enableAction).toBe(CODEX_DISCOVERY_COPY.enableAction);
     });
   }
+
+  it("keeps an active routing shim in found when the native hook bundle is missing", () => {
+    expect(byKey(deriveDiscovery(det({ codex: "active", codexHooksInstalled: false })), "codex").state).toBe("found");
+  });
+
+  it("treats an omitted hook-bundle result conservatively", () => {
+    expect(byKey(deriveDiscovery(det({ codex: "active" })), "codex").state).toBe("found");
+  });
 });
 
-describe("deriveDiscovery - Cursor states", () => {
-  for (const v of CODEX_CURSOR_VALUES) {
-    it(`cursor=${v} -> ${expectedShimState(v)}`, () => {
-      const row = byKey(deriveDiscovery(det({ cursor: v })), "cursor");
-      expect(row.state).toBe(expectedShimState(v));
-      expect(row.foundMeaning).toBe(CURSOR_DISCOVERY_COPY.foundMeaning);
-      expect(row.readyMeaning).toBe(CURSOR_DISCOVERY_COPY.readyMeaning);
-      expect(row.enableAction).toBe(CURSOR_DISCOVERY_COPY.enableAction);
-    });
-  }
+describe("deriveDiscovery - Cursor desktop, hook, and optional CLI axes", () => {
+  it("finds desktop-only Cursor without a CLI", () => {
+    const row = byKey(deriveDiscovery(det({
+      cursor: { desktopDetected: true, hookReady: false, cli: "absent" }
+    })), "cursor");
+    expect(row.state).toBe("found");
+  });
+
+  it("is ready only when the native hook is verified", () => {
+    const row = byKey(deriveDiscovery(det({
+      cursor: { desktopDetected: true, hookReady: true, cli: "absent" }
+    })), "cursor");
+    expect(row.state).toBe("ready");
+  });
+
+  it("keeps CLI-only Cursor found until its hook is verified", () => {
+    expect(byKey(deriveDiscovery(det({
+      cursor: { desktopDetected: false, hookReady: false, cli: "active" }
+    })), "cursor").state).toBe("found");
+    expect(byKey(deriveDiscovery(det({
+      cursor: { desktopDetected: false, hookReady: true, cli: "active" }
+    })), "cursor").state).toBe("ready");
+  });
+
+  it("is not found when desktop and CLI are both absent", () => {
+    const row = byKey(deriveDiscovery(det()), "cursor");
+    expect(row.state).toBe("not-found");
+    expect(row.foundMeaning).toBe(CURSOR_DISCOVERY_COPY.foundMeaning);
+    expect(row.readyMeaning).toBe(CURSOR_DISCOVERY_COPY.readyMeaning);
+    expect(row.enableAction).toBe(CURSOR_DISCOVERY_COPY.enableAction);
+  });
 });
 
 describe("deriveDiscovery - Claude Code states (detected x hookReady x sessionCount)", () => {
@@ -143,7 +193,7 @@ describe("discoveryNeedsEnable", () => {
 
   it("false when nothing is found (all ready and/or not-found)", () => {
     const allReady = deriveDiscovery(
-      det({ claude: { detected: true, sessionCount: 1, hookReady: true }, codex: "active", cursor: "active" })
+      det({ claude: { detected: true, sessionCount: 1, hookReady: true }, codex: "active", codexHooksInstalled: true, cursor: { desktopDetected: false, hookReady: true, cli: "active" } })
     );
     expect(discoveryNeedsEnable(allReady)).toBe(false);
 
@@ -151,7 +201,7 @@ describe("discoveryNeedsEnable", () => {
     expect(discoveryNeedsEnable(allAbsent)).toBe(false);
 
     const mixedReadyAndNotFound = deriveDiscovery(
-      det({ claude: { detected: false, sessionCount: 0 }, codex: "active", cursor: "absent" })
+      det({ claude: { detected: false, sessionCount: 0 }, codex: "active", codexHooksInstalled: true, cursor: { desktopDetected: false, hookReady: false, cli: "absent" } })
     );
     expect(discoveryNeedsEnable(mixedReadyAndNotFound)).toBe(false);
   });

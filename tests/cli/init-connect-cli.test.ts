@@ -234,7 +234,7 @@ describe("compaction init --connect", () => {
     expect(discovery).not.toContain("not installed");
     // Codex/Cursor stubs are on the controlled PATH but the shim is not active yet -> `found` row.
     expect(stdout).toMatch(/\[x\] Codex\s+installed · enable Compaction/);
-    expect(stdout).toMatch(/\[x\] Cursor\s+installed · enable Compaction/);
+    expect(stdout).toMatch(/\[x\] Cursor\s+detected · enable Compaction/);
     // the shim files were installed and PATH set-up ran for all three (asserted before any string
     // pin, so a copy change can never leave these silently untested)
     expect(existsSync(shimPath("codex"))).toBe(true);
@@ -292,6 +292,25 @@ describe("compaction init --connect", () => {
     expect(stdout).not.toContain("▸ Codex");
   });
 
+  it("desktop-only Cursor installs and verifies the native hook without a shim or shell PATH write", async () => {
+    const pathWithoutCursorCli = `${NODE_DIR}${delimiter}/usr/bin${delimiter}/bin`;
+    const { stdout, stderr, code } = await runInitWithPath(
+      ["--connect", "cursor"],
+      pathWithoutCursorCli,
+      { TERM_PROGRAM: "cursor" }
+    );
+    expect(code, stderr).toBe(0);
+    expect(stdout).toContain("Cursor desktop app detected");
+    expect(stdout).toContain("Output shaping: on for cursor");
+    expect(stdout).toContain("Cursor desktop app (native session hook)");
+    expect(existsSync(join(dir, ".cursor", "hooks.json"))).toBe(true);
+    expect(existsSync(shimPath("cursor-agent"))).toBe(false);
+    expect(existsSync(join(dir, ".bashrc"))).toBe(false);
+    expect(existsSync(join(dir, ".zshrc"))).toBe(false);
+    expect(stdout).not.toContain("export PATH=");
+    expect(stdout).not.toContain("Cursor → ✓ Enabled (plan-auth, default):  cursor-agent");
+  });
+
   it("--connect 5 (skip) installs nothing", async () => {
     const { stdout, code } = await runInit(["--connect", "5"]);
     expect(code).toBe(0);
@@ -303,8 +322,7 @@ describe("compaction init --connect", () => {
   it("Cursor is listed/assessed in the menu even when a DIFFERENT choice is selected", async () => {
     const { stdout } = await runInit(["--connect", "1"]);
     expect(stdout).toContain("compaction init --connect cursor");
-    // The detection row reflects the honest current connect mechanism for Cursor.
-    expect(stdout).toContain("local-estimate only");
+    expect(stdout).toContain("native session hook; CLI capture when available");
   });
 
   it("an unknown --connect value is a clean one-line error (exit 1)", async () => {
