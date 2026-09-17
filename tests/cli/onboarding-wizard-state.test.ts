@@ -21,16 +21,16 @@ import {
  */
 
 function det(overrides: Partial<ConnectDetection> = {}): ConnectDetection {
-  return { claude: { detected: false, sessionCount: 0 }, codex: "absent", cursor: "absent", ...overrides };
+  return { claude: { detected: false, sessionCount: 0 }, codex: "absent", cursor: { desktopDetected: false, hookReady: false, cli: "absent" }, ...overrides };
 }
 
 // All three FOUND (discovered-but-not-ready): codex binary on PATH, claude sessions no hook, cursor binary.
-const allFound = deriveDiscovery(det({ claude: { detected: true, sessionCount: 3 }, codex: "found", cursor: "found" }));
+const allFound = deriveDiscovery(det({ claude: { detected: true, sessionCount: 3 }, codex: "found", cursor: { desktopDetected: false, hookReady: false, cli: "found" } }));
 // Mixed: codex ACTIVE (ready), claude FOUND, cursor ABSENT (not-found).
-const mixed = deriveDiscovery(det({ claude: { detected: true, sessionCount: 1 }, codex: "active", cursor: "absent" }));
+const mixed = deriveDiscovery(det({ claude: { detected: true, sessionCount: 1 }, codex: "active", codexHooksInstalled: true, cursor: { desktopDetected: false, hookReady: false, cli: "absent" } }));
 // Ready-only selection source: codex active (ready), claude ready (verified hook), cursor absent.
 const allReady = deriveDiscovery(
-  det({ claude: { detected: true, sessionCount: 1, hookReady: true }, codex: "active", cursor: "absent" })
+  det({ claude: { detected: true, sessionCount: 1, hookReady: true }, codex: "active", codexHooksInstalled: true, cursor: { desktopDetected: false, hookReady: false, cli: "absent" } })
 );
 
 describe("initialSelection - preselect found + ready, never not-found (tests 2/3/4)", () => {

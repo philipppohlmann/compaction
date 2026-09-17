@@ -22,22 +22,16 @@ import {
   type ConnectStatusLineResult
 } from "../../core/claude-code-connect.js";
 import { isShapingHooksActivated } from "../../core/output-shaping-hook-activation.js";
+import { detectCursorDesktop } from "../../core/cursor-desktop-detection.js";
 import {
   areSubscriptionHooksInstalled,
   installSubscriptionHooks,
-  subscriptionHookConfigPath,
-  subscriptionHookEntries,
   uninstallSubscriptionHooks,
   type SubscriptionHookInstallOutcome,
   type SubscriptionHookTool,
   type SubscriptionHookUninstallOutcome
 } from "../../core/subscription-hooks-install.js";
-import {
-  CODEX_TRUST_ACTION_COMMAND,
-  CODEX_TRUST_ACTION_CONTROL,
-  CODEX_TRUST_ACTION_HEADING,
-  codexShapingHookTrust
-} from "../../core/codex-hook-trust.js";
+import { codexShapingHookTrust } from "../../core/codex-hook-trust.js";
 import { isShapingTaskClassifierPresent } from "../../core/gateway/task-awareness-seam.js";
 import { fullOptimizationReachable } from "../../core/engine-availability.js";
 import {
@@ -87,31 +81,25 @@ import {
   DISCOVERY_FOUND_LABEL,
   DISCOVERY_READ_ONLY_LINE,
   DISCOVERY_HEADER,
-  OPTIMIZATION_MODES,
-  OPTIMIZATION_MODE_HEADER,
-  OPTIMIZATION_MODE_FOOTER,
   READY_HEADER,
+  READY_ENABLED_HEADER,
   READY_TOOL_COPY,
+  CODEX_TRUST_ONBOARDING_INSTRUCTION,
   buildReadySummaryLines,
+  findOnboardingTool,
   deriveReadyRouting,
   type ConnectDetection,
   type WorkflowDiscovery,
-  type OptimizationMode,
   type OptimizationModeKey,
   type ReadyToolKey,
   type EnableResult,
   type ReadyRoutingInputs
 } from "../onboarding/model.js";
 import { decideInteractiveTuiFromProcess } from "../onboarding/should-use-tui.js";
-import { deriveReadyMetric, READY_METRIC_SURFACES, readyPerTurnLinesForTools, type ReadyMetric } from "../onboarding/ready-metrics.js";
-import { readActivityEvents } from "../../core/activity-store.js";
-import { buildActivityRows } from "../../core/activity-view.js";
 import { getGatewayStatus } from "../../core/gateway/status.js";
 import { READY_ROUTE_PROVIDER, type OnboardingReadyStatus } from "../onboarding/model.js";
 import {
   ONBOARDING_AUTH_FALLBACK_LINES,
-  FULL_APPLY_REQUIREMENT_LINE,
-  isLocalFullApplyGateReason,
   onboardingAuthFailureLines,
   type OnboardingAuthOutcome,
   type OnboardingAuthProgress
@@ -125,6 +113,9 @@ import { planGatewayConfigure, formatConfigurePlan } from "../../core/gateway/co
 import {
   isOptimizationModePreference,
   writeOptimizationMode,
+  readOptimizationMode,
+  readProductMode,
+  toModelOptimizationModeKey,
   fromModelOptimizationModeKey,
   preferencesPath,
   addConnectedWorkflows,
@@ -256,10 +247,6 @@ function buildStaticScreen(version: string, focus: string | undefined, detection
   lines.push(`  ${chalk.dim(AFTER_CONNECT_LINE)}`);
   lines.push(`  ${chalk.dim(MANUAL_TOOLS_LINE)}`);
 
-  // 3b. Optimization mode (Page 3) - the two honest context-handling modes + exact commands (informational).
-  lines.push("");
-  lines.push(...optimizationModeBlock());
-
   // Optional --path focus: the one manual capture/import command for that surface.
   if (focus) {
     const p = focus === "claude-code" ? PRIMARY : SECONDARY.find((s) => s.key === focus);
@@ -373,7 +360,7 @@ function connectDetectionBlock(detection: ConnectDetection): string[] {
     "",
     ...deriveDiscovery(detection).map(discoveryRow),
     "",
-    chalk.dim("  Codex and Cursor enable via a reversible Compaction-owned PATH shim (verified by resolving the tool name)."),
+    chalk.dim("  Codex uses a reversible PATH shim. Cursor uses its native session hook; CLI capture is added only when available."),
     chalk.dim("  Custom OpenAI-compatible apps: use the Gateway below (Advanced). Compaction never scans your browser.")
   ];
 }
@@ -384,37 +371,6 @@ function connectMenuBlock(): string[] {
     "",
     ...CONNECT_MENU.map((m) => `    ${ACCENT(m.command)}   ${chalk.dim(`# ${m.label}`)}`)
   ];
-}
-
-/**
- * Optimization-mode section - informational on both surfaces; rendering it writes nothing.
- * The modes map to existing capabilities (record+proof / deterministic apply); running the
- * Mode-2 command is the explicit consent that stores narrow authorization.
- */
-function optimizationModeRow(m: OptimizationMode, i: number): string[] {
-  const tag = m.recommended ? chalk.green("  (recommended · default)") : chalk.dim("  (opt-in)");
-  // INPUT axis, stated as such. "model-visible bytes changed: no" was an axis error: output shaping
-  // attaches an instruction to what the model sees on both modes, so only the input claim is true.
-  const inputAxis = m.meaning.inputBytesChanged
-    ? "your input is compacted before sending: yes (deterministic dedupe)"
-    : "your input is compacted or edited: no";
-  const approval = m.meaning.approvalRequired ? "approval required: yes" : "approval required: no";
-  return [
-    `    ${chalk.bold(`[${i + 1}] ${m.title}`)}${tag}`,
-    `        ${m.oneLine}`,
-    `        ${chalk.dim(`${inputAxis}   ·   ${approval}`)}`,
-    ...m.meaning.mapsTo.map((l) => `        ${chalk.dim(l)}`),
-    `        ${chalk.dim("Run:")}  ${ACCENT(m.command)}`
-  ];
-}
-
-function optimizationModeBlock(): string[] {
-  const lines: string[] = [header(OPTIMIZATION_MODE_HEADER), ""];
-  for (const [i, m] of OPTIMIZATION_MODES.entries()) {
-    lines.push(...optimizationModeRow(m, i), "");
-  }
-  lines.push(chalk.dim(`  ${OPTIMIZATION_MODE_FOOTER}`));
-  return lines;
 }
 
 function shimInstallVerified(result: InstallShimResult): boolean {
@@ -1027,7 +983,7 @@ function claudeShapingHookBlock(result: ConnectShapingHookResult, perTurnHold: b
  * workflows: the PATH shim only CAPTURES a batch run, the hooks are the lever that actually shapes what
  * the model is asked to produce. Naming the target file, the backup, and each entry is not decoration -
  * onboarding must never write a file it did not disclose, and this block is that disclosure on the
- * non-interactive surface (the TUI review screen carries the same list before the write).
+ * non-interactive surface.
  *
  * Honest boundaries, per tool:
  *  - Codex: per-prompt shaping + a `Stop` per-turn line whose RENDERING is unproven (the schema accepts
@@ -1056,15 +1012,8 @@ function claudeShapingHookBlock(result: ConnectShapingHookResult, perTurnHold: b
  */
 export function codexTrustContinuationLines(indent: string): string[] {
   return [
-    chalk.yellow(
-      `${indent}Output shaping: configured for codex, NOT yet running - this hook is new to Codex, and Codex does not run a hook until you approve it once.`
-    ),
-    chalk.cyan(
-      `${indent}One time, to finish: run \`${CODEX_TRUST_ACTION_COMMAND}\`, and at "${CODEX_TRUST_ACTION_HEADING}" choose "${CODEX_TRUST_ACTION_CONTROL}".`
-    ),
-    chalk.dim(
-      `${indent}After that, normal \`codex\` use is shaped automatically - no per-session or per-turn Compaction command. Check with: compaction status`
-    )
+    chalk.yellow(`${indent}Codex   Output shaping · one step remaining`),
+    chalk.cyan(`${indent}${CODEX_TRUST_ONBOARDING_INSTRUCTION}`)
   ];
 }
 
@@ -1188,7 +1137,8 @@ function activationCopyBlock(): string[] {
 export async function readySummaryBlock(
   enabled: readonly ReadyToolKey[],
   modeKey?: OptimizationModeKey,
-  routingInputs?: ReadyRoutingInputs
+  routingInputs?: ReadyRoutingInputs,
+  options: { cursorDesktopOnly?: boolean } = {}
 ): Promise<string[]> {
   const refreshed = routingInputs
     ? {
@@ -1199,7 +1149,47 @@ export async function readySummaryBlock(
       }
     : undefined;
   const routing = refreshed ? deriveReadyRouting(enabled, refreshed) : undefined;
-  return buildReadySummaryLines(enabled, modeKey, routing).map((l) => (l === READY_HEADER ? chalk.bold(l) : l));
+  return buildReadySummaryLines(enabled, modeKey, routing, options).map((l) => (l === READY_HEADER ? chalk.bold(l) : l));
+}
+
+/**
+ * Render the Ready summary from the detected launch surface. Keeping the Cursor desktop-only
+ * decision here means the headless and durable post-TUI summaries cannot silently choose different
+ * run commands for the same detection result.
+ */
+export async function readySummaryBlockForDetection(
+  enabled: readonly ReadyToolKey[],
+  detection: ConnectDetection,
+  modeKey?: OptimizationModeKey,
+  routingInputs?: ReadyRoutingInputs
+): Promise<string[]> {
+  return readySummaryBlock(enabled, modeKey, routingInputs, {
+    cursorDesktopOnly: detection.cursor.desktopDetected && detection.cursor.cli === "absent"
+  });
+}
+
+/** Compact durable completion left behind after the interactive alternate screen closes. */
+export function onboardingCompletionBlock(
+  enabled: readonly ReadyToolKey[],
+  failed: readonly ReadyToolKey[]
+): string[] {
+  const titleFor = (key: ReadyToolKey): string => findOnboardingTool(key)?.title ?? key;
+  const lines = [failed.length > 0 ? "! Setup incomplete" : "✓ Compaction is ready"];
+  lines.push(`Configured: ${enabled.length > 0 ? enabled.map(titleFor).join(", ") : "none"}`);
+  if (failed.length > 0) {
+    lines.push("Failed:");
+    for (const key of failed) {
+      lines.push(`  ${titleFor(key)}: retry with \`compaction init --connect ${key}\``);
+    }
+  }
+  lines.push(
+    "Use your tools normally.",
+    "compaction status     Check setup",
+    "compaction activity   See recent results",
+    "compaction init       Reconfigure",
+    "compaction stop       Disable"
+  );
+  return lines;
 }
 
 /**
@@ -1238,24 +1228,6 @@ async function computeReadyRoutingInputs(): Promise<ReadyRoutingInputs> {
   };
 }
 
-/**
- * The HONEST ready-screen metric, read from the local, content-free activity receipts. At first
- * install there is no data, so the state is `no-data` (the "unavailable until measured" line) -
- * never a simulated number. Read-only; a missing store is "no activity yet" (not an error).
- */
-async function computeReadyMetric(): Promise<ReadyMetric> {
-  try {
-    const { events } = await readActivityEvents();
-    // Only count onboarding-tool surfaces; the ready screen is about the connected workflows.
-    const relevant = events.filter((e) => (READY_METRIC_SURFACES as readonly string[]).includes(e.surface));
-    const rows = buildActivityRows(relevant);
-    return deriveReadyMetric(rows);
-  } catch {
-    // Fail-open to the honest no-data state - never fabricate a number when the read fails.
-    return deriveReadyMetric([]);
-  }
-}
-
 /** True when SOME provider key is present in the environment (the VALUE is never read). Read-only. */
 function providerKeyPresent(provider: string | undefined, env: NodeJS.ProcessEnv = process.env): boolean {
   if (provider === "anthropic") return Boolean(env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim());
@@ -1281,13 +1253,16 @@ export async function computeOnboardingReadyStatus(
   mode: OptimizationModePreference
 ): Promise<OnboardingReadyStatus> {
   const primary = enabled[0];
+  const cursorHookReady = primary === "cursor" && (await areSubscriptionHooksInstalled("cursor"));
   // Launcher verification: Claude Code and Codex use their routing shim; Cursor uses its capture shim.
   const shimTool: ShimTool | undefined = primary === undefined ? undefined : (primary as ShimTool);
   const launcherState = shimTool ? verifyShimActive(shimTool) : undefined;
-  const launcherActive = launcherState?.active === true;
-  const launcherInstalled = launcherState?.installed === true;
+  const launcherActive = cursorHookReady || launcherState?.active === true;
+  const launcherInstalled = cursorHookReady || launcherState?.installed === true;
   const launcher = !shimTool
     ? "not installed (no workflow enabled)"
+    : cursorHookReady
+      ? "native sessionStart hook verified"
     : launcherActive
       ? "active · fail-open"
       : launcherInstalled
@@ -1295,7 +1270,9 @@ export async function computeOnboardingReadyStatus(
         : "not active";
 
   const gw = await getGatewayStatus(process.cwd());
-  const gateway = gw.running
+  const gateway = primary === "cursor"
+    ? "not used by the Cursor desktop hook"
+    : gw.running
     ? `running (${gw.base ?? "127.0.0.1"})`
     : "starts on demand when the workflow needs routing";
 
@@ -1306,7 +1283,9 @@ export async function computeOnboardingReadyStatus(
   // device. (This used to read "with no signed engine distributed" — a claim about the world that a
   // published release made false, while the device-level statement stayed true.)
   const engineReachable = await fullOptimizationReachable();
-  const auth = hasKey
+  const auth = primary === "cursor"
+    ? "Cursor app auth (session-level output shaping; local estimate only)"
+    : hasKey
     ? engineReachable
       ? "API key present (full optimization available on supported requests)"
       : "API key present (output shaping; input compaction needs the engine, not installed on this device yet)"
@@ -1407,13 +1386,13 @@ export async function runCommunityActivation(
   );
   const leaseReason = runtime.lease === "unavailable" ? (runtime.reason ?? "entitlement service unreachable") : undefined;
 
-  // ENGINE FIRST, exactly as `compaction mode full` does. The
-  // picker has already removed "Full optimization" on an engine-free build, and the plan step has
-  // persisted `basic`. Calling `applyModeSelection("full")` anyway would overwrite that `basic` the
+  // ENGINE FIRST, exactly as `compaction mode full` does. The plan step has persisted the Open
+  // fallback. Calling `applyModeSelection("full")` before engine verification would overwrite it the
   // moment a valid lease arrives, so `effectiveOpenTier()` would resolve `full` and the gateway would
-  // take the full-tier path — for a user the review screen just promised basic shaping. A valid lease
+  // take the full-tier path before Community setup completed. A valid lease
   // is exactly the case where this bites, which is why the lease gate below is not enough on its own.
   if (!(await fullOptimizationReachable(process.env))) {
+    writeOptimizationMode("cache");
     writeProductMode("basic", process.env);
     return {
       ok: true,
@@ -1427,9 +1406,11 @@ export async function runCommunityActivation(
     };
   }
 
-  // THE SEAM: `applyModeSelection` already encodes the lease gate — it persists `full` only against a
-  // lease that actually verifies, and preserves the Open mode otherwise. Re-deriving that decision
-  // here would be a second copy of the rule that could disagree with the gate.
+  // Community upgrades the Open fallback only after login, runtime, and engine checks succeed.
+  await saveModeAuthorizations(workflows);
+  writeOptimizationMode("cache-plus-context");
+
+  // Reuse the mode command's lease gate so onboarding and manual selection cannot diverge.
   const outcome = applyModeSelection("full", process.env);
   if (outcome.persisted && outcome.effective === "full") {
     // The entitlement is real, so `full` persisted above. Whether the NEXT TURN is a full apply is a
@@ -1453,6 +1434,7 @@ export async function runCommunityActivation(
     // run nowhere. The entitlement is not lost — it is on disk in the lease, so `compaction mode full`
     // enables it the moment the user actually asks for it.
     writeProductMode("basic", process.env);
+    writeOptimizationMode("cache");
     return {
       ok: true,
       alreadyLoggedIn: login.alreadyLoggedIn,
@@ -1466,6 +1448,7 @@ export async function runCommunityActivation(
   // wrote `basic` — but a user who chose Community must not end up at `observe` under any ordering, so
   // this asserts the floor rather than assuming it.
   if (outcome.effective !== "basic") writeProductMode("basic", process.env);
+  writeOptimizationMode("cache");
   return {
     ok: true,
     alreadyLoggedIn: login.alreadyLoggedIn,
@@ -1508,12 +1491,15 @@ async function computeConnectDetection(det: DetectionState): Promise<ConnectDete
     return real ? "found" : "absent";
   };
   const claudeStatus = shimStatus("claude-code");
+  const cursorCli = shimStatus("cursor");
   // Same resolver as every write path and as readiness, so the onboarding TUI can never disagree
   // with `compaction status` about where the integration lives. Also covers `settings.local.json`,
   // which the previous hand-rolled pair missed: Claude Code fires a hook installed there.
   const stopHookChecks = await Promise.all(claudeSettingsReadPaths().map((file) => isStopHookInstalled(file)));
   const stopHookReady = stopHookChecks.some(Boolean);
   const hookReady = stopHookReady && (await isClaudeShapingActive()) && verifyShimActive("claude-code").active;
+  const cursorHookReady = await areSubscriptionHooksInstalled("cursor");
+  const codexShapingState = await codexReadyShapingState();
   return {
     claude: {
       detected: det.claudeDetected || claudeStatus !== "absent",
@@ -1521,7 +1507,13 @@ async function computeConnectDetection(det: DetectionState): Promise<ConnectDete
       hookReady
     },
     codex: shimStatus("codex"),
-    cursor: shimStatus("cursor")
+    codexHooksInstalled: codexShapingState !== "not-installed",
+    codexHookReady: codexShapingState === "active",
+    cursor: {
+      desktopDetected: detectCursorDesktop().detected,
+      hookReady: cursorHookReady,
+      cli: cursorCli
+    }
   };
 }
 
@@ -1845,6 +1837,33 @@ async function enableWorkflowSelection(
         };
         if (shim.status === "verify-failed") process.exitCode = 1;
       }
+    } else if (
+      key === "cursor" &&
+      detectCursorDesktop().detected &&
+      resolveExecutableOnPath(SHIM_TOOLS.cursor.shimName, process.env, [verifyShimActive("cursor").shimDir]) === undefined
+    ) {
+      // Cursor desktop has its own native sessionStart hook and does not need a headless CLI,
+      // capture shim, or shell PATH edit. Keep the CLI path unchanged when a real CLI is present.
+      actionLines.push(
+        chalk.green("  ▸ Cursor desktop app detected"),
+        chalk.dim("    Native session hook only; no launcher installed and no shell PATH changed."),
+        ""
+      );
+      if (!isShapingHooksActivated()) {
+        actionLines.push(
+          chalk.dim("    Output shaping is switched off, so the Cursor sessionStart hook was not installed."),
+          ""
+        );
+        continue;
+      }
+      const hooks = await installSubscriptionHooks("cursor", { ...(options.dryRun ? { dryRun: true } : {}) });
+      actionLines.push(...subscriptionHooksBlock(hooks, false), "");
+      if (!options.dryRun && await areSubscriptionHooksInstalled("cursor")) {
+        connected.push("cursor");
+      } else if (hooks.status === "verify-failed" || hooks.status === "error") {
+        failed.push("cursor");
+        process.exitCode = 1;
+      }
     } else {
       const shimTool = key as ShimTool;
       // --DRY-RUN WRITES NOTHING HERE EITHER. `--dry-run` promises "write nothing", and the Claude Code
@@ -1861,9 +1880,7 @@ async function enableWorkflowSelection(
       // It used to be opt-IN here while Claude Code's was opt-OUT, and on a fresh machine that
       // asymmetry was the whole failure: the shim landed `installed-not-on-path`, the rc line that
       // would activate it was never written, and the flow had no way to reach an active state from
-      // inside itself. The review screen has always disclosed this write for EVERY workflow ("add
-      // its launcher directory to your shell PATH"), so for Codex/Cursor that promise was simply
-      // never kept. Fail-open like Claude Code's: an rc write that throws leaves the manual
+      // inside itself. Fail-open like Claude Code's: an rc write that throws leaves the manual
       // one-line instruction as the printed fallback rather than failing the enable.
       const shimOptedOut = options.writeShellConfig === false;
       // ONLY WRITE A STARTUP FILE THE SHELL WILL ACTUALLY LOAD. The rc resolver falls back to
@@ -1900,6 +1917,7 @@ async function enableWorkflowSelection(
       // `no-real-binary` is skipped deliberately - that block says "Nothing was written", and writing a
       // hook config for a tool that is not installed would make that line false.
       const hookTool: SubscriptionHookTool | undefined = key === "codex" || key === "cursor" ? key : undefined;
+      let codexHookSetupFailed = false;
       // Under --dry-run there is no install result to consult; the installer is dry-run aware and writes
       // nothing, so the preview still runs (that is the whole point of the flag).
       if (hookTool && isShapingHooksActivated() && install?.status !== "no-real-binary") {
@@ -1909,8 +1927,12 @@ async function enableWorkflowSelection(
             ...subscriptionHooksBlock(hooks, hookTool === "codex" && (await isShapingTaskClassifierPresent()))
           );
           if (hookTool === "codex" && hooks.status === "installed") codexHookNewlyInstalled = true;
+          if (hookTool === "codex" && (hooks.status === "error" || hooks.status === "verify-failed")) {
+            codexHookSetupFailed = true;
+          }
         } catch {
           /* fail-open: a hook-install failure never breaks or un-connects the rest of the connect */
+          if (hookTool === "codex") codexHookSetupFailed = true;
         }
       }
       actionLines.push("");
@@ -1941,6 +1963,12 @@ async function enableWorkflowSelection(
       }
       if (install?.status === "verify-failed") {
         failed.push(shimTool);
+        process.exitCode = 1;
+      }
+      if (codexHookSetupFailed && !failed.includes("codex")) {
+        // Keep the working routing shim in `connected`, but make the incomplete native setup visible
+        // to the TUI completion contract instead of reporting the whole Codex integration as ready.
+        failed.push("codex");
         process.exitCode = 1;
       }
     }
@@ -1992,7 +2020,7 @@ async function enableWorkflowSelection(
 
 /**
  * The TUI's injected enable callback - a thin wrapper over `enableWorkflowSelection` returning
- * only the content-free `EnableResult`; the TUI renders Page-2/Page-4 from that actual state.
+ * only the content-free `EnableResult`; the TUI renders setup and completion from that actual state.
  */
 async function tuiEnable(
   enableKeys: readonly ReadyToolKey[],
@@ -2023,6 +2051,7 @@ async function runConnectSelection(
 ): Promise<void> {
   let actionLines: string[] = [];
   let connected: ReadyToolKey[] = [];
+  let failed: ReadyToolKey[] = [];
   let countedReadyClaudeStatus = false;
   if (selection.skip) {
     actionLines = [...skipBlock()];
@@ -2030,6 +2059,7 @@ async function runConnectSelection(
     const enabled = await enableWorkflowSelection(selection.enableKeys, options, mode);
     actionLines = enabled.actionLines;
     connected = enabled.connected;
+    failed = enabled.failed;
     // Already-connected Claude Code (counted ready, not re-enabled) still shows the honest routing +
     // PATH status (read-only). Its block is rendered BELOW, after this run's authorizations persist,
     // so its apply-routing posture line is resolved against the state the next `claude` run will read.
@@ -2076,8 +2106,34 @@ async function runConnectSelection(
   }
   // The ready summary describes state AFTER this run's installs; `readySummaryBlock` re-reads the
   // shim and hook axes itself, so the pre-connect `routingInputs` are passed through as-is.
-  const readyLines =
-    readySet.length > 0 ? ["", RULE, "", ...(await readySummaryBlock(readySet, undefined, routingInputs))] : [];
+  let completionLines: string[] = [];
+  if (readySet.length > 0) {
+    completionLines = await readySummaryBlockForDetection(readySet, detection, undefined, routingInputs);
+    if (failed.length > 0) {
+      const failedConnected = failed.filter((key) => readySet.includes(key));
+      const body = completionLines.slice(1).map((line) => {
+        if (line === `  ${READY_ENABLED_HEADER}`) return "  Working connections:";
+        for (const key of failedConnected) {
+          const label = READY_TOOL_COPY[key].label;
+          if (line === `    ✓ ${label}`) return `    ✓ ${label} routing shim`;
+          if (line.startsWith(`    ${label} → ✓ Enabled`)) {
+            return line.replace(`${label} → ✓ Enabled`, `${label} routing shim → ✓ Enabled`);
+          }
+        }
+        return line;
+      });
+      completionLines = [
+        chalk.yellow(chalk.bold("Setup incomplete")),
+        "",
+        "  Incomplete:",
+        ...failed.map((key) =>
+          `    ${READY_TOOL_COPY[key].label} ${key === "codex" ? "native hooks" : "setup"} · retry: compaction init --connect ${key}`
+        ),
+        ...body
+      ];
+    }
+  }
+  const readyLines = completionLines.length > 0 ? ["", RULE, "", ...completionLines] : [];
   console.log(
     [
       ...connectHeaderLines(detection),
@@ -2632,14 +2688,10 @@ export function registerInitCommand(program: Command): void {
 
         if (wantTui) {
           // Dynamic import keeps Ink/React off non-TTY paths. The production onboarding flow drives
-          // the SAME real enable engine via injected callbacks (`onEnable` is the only write, on the
-          // review Enable consent); `onPersistMode` persists the chosen mode + any narrow apply
-          // authorization. The ready screen shows the REAL verified status and the HONEST metric
-          // (from local receipts, or "unavailable until measured" at first install) - never a
-          // simulated number. The durable Ready summary is re-printed here because the alt-screen is
-          // wiped on exit.
+          // the SAME real enable engine via injected callbacks (`onEnable` starts after the plan
+          // confirmation); `onPersistMode` persists the chosen mode + any narrow apply
+          // authorization. A compact durable completion is printed after the alternate screen exits.
           const { runOnboardingTui } = await import("../onboarding/OnboardingTui.js");
-          const readyMetric = await computeReadyMetric();
           // Captured so the recovery guidance can be RE-PRINTED to normal scrollback below: the
           // alt screen is wiped on exit, so anything the activation screen said is gone by then.
           let communityOutcome: OnboardingAuthOutcome | undefined;
@@ -2670,11 +2722,17 @@ export function registerInitCommand(program: Command): void {
             }
           }
           const { hasValidFullApplyLease } = await import("../../core/entitlement/lease-store.js");
+          const communityAuthorized = hasValidFullApplyLease(process.env);
+          const initialProductMode = readProductMode(process.env);
+          const initialOptimizationMode = toModelOptimizationModeKey(readOptimizationMode(process.env));
+          const initialPlan = initialProductMode === "full" || initialOptimizationMode === "cache-context-optimize"
+            ? "community" as const
+            : initialProductMode === "basic"
+              ? "open" as const
+              : undefined;
           const result = await runOnboardingTui({
             version,
             detection,
-            readyRouting: readyRoutingInputs,
-            readyMetric,
             readyStatusFor: (enabled, modeKey) =>
               computeOnboardingReadyStatus(enabled, fromModelOptimizationModeKey(modeKey)),
             onEnable: async (keys) => {
@@ -2708,7 +2766,6 @@ export function registerInitCommand(program: Command): void {
               void plan;
               return "basic";
             },
-            fullOptimizationReachable: await fullOptimizationReachable(),
             onCommunityAuth: async (onProgress, signal) => {
               const outcome = await runCommunityActivation(onProgress, signal, enabledWorkflows);
               communityOutcome = outcome;
@@ -2727,21 +2784,10 @@ export function registerInitCommand(program: Command): void {
             // Identity vs authorization: credentials prove signed-in; a verified lease proves Community.
             // The stepper uses signedIn only to skip a second browser round trip; it must never see credentials.
             signedIn: readStoredCredentials(process.env) !== undefined,
-            communityAuthorized: hasValidFullApplyLease(process.env),
-            // THE FIRST-WRITE DISCLOSURE. The review screen is the consent gate, so it must name every
-            // file the enable touches - including the tool's own hooks config, which is what actually
-            // attaches an instruction to what the model sees. Resolved HERE from the real installer
-            // (path + entry list), so the screen can never describe a different write than the one that
-            // runs. Returns undefined when nothing will be written: the tool has no hook config, or
-            // shaping is switched off (`compaction stop` / COMPACTION_SHAPING_HOOKS=0) and the same
-            // gate below will skip the install. Read fresh per render so a switch flipped mid-flow is
-            // honored by the screen, not just by the installer.
-            hookDisclosure: (key) => {
-              if (key !== "codex" && key !== "cursor") return undefined;
-              if (!isShapingHooksActivated()) return undefined;
-              const file = subscriptionHookConfigPath(key);
-              return { file, backupPath: `${file}.compaction.bak`, entries: subscriptionHookEntries(key) };
-            }
+            communityAuthorized,
+            ...(initialPlan ? { initialPlan } : {}),
+            initialOptimizationMode,
+            initialProductMode
           });
           // Re-print the Community outcome to durable scrollback. The alt screen took the activation
           // screen with it, so a user whose confirmation failed would otherwise be left with a
@@ -2755,16 +2801,6 @@ export function registerInitCommand(program: Command): void {
               ["", chalk.yellow(`Community was not activated: ${headline}`), chalk.dim(`  ${detail}`),
                 ...ONBOARDING_AUTH_FALLBACK_LINES.map((l) => chalk.dim(`  ${l}`))].join("\n")
             );
-          } else if (communityOutcome && communityOutcome.ok && communityOutcome.effectiveMode !== "full") {
-            console.log(
-              ["", chalk.dim(`Community account active. Full apply is not enabled on this device yet ` +
-                `(${communityOutcome.fullApplyPendingReason ?? "no entitlement lease"}); you are on Open basic shaping.`),
-                // Only when the entitlement is fine and the gap is the user's own local configuration:
-                // state what full apply requires, once. Never an instruction, a price, or a URL.
-                ...(isLocalFullApplyGateReason(communityOutcome.fullApplyPendingReason)
-                  ? [chalk.dim(FULL_APPLY_REQUIREMENT_LINE)]
-                  : [])].join("\n")
-            );
           }
           // THE PRO RETRY PATH, in durable scrollback. The waitlist screen carried the link and the
           // alt screen took it away on exit. This is the whole recovery for "the browser never
@@ -2777,22 +2813,14 @@ export function registerInitCommand(program: Command): void {
               ].join("\n")
             );
           }
-          if (result.enabled.length > 0) {
-            // POST-INSTALL truth, re-read here. `readyRoutingInputs` was computed before the enable
-            // ran, so both halves of this durable summary resolve the hook axis from the tool's own
-            // config now: the summary block does it internally, and the per-turn block is given the
-            // same `confirmedShapingHooks` answer. Anything else re-prints the machine as it was.
-            const confirmedHooks = await confirmedShapingHooks(result.enabled);
+          if (result.enabled.length > 0 || result.failed.length > 0) {
             console.log(
               [
                 "",
                 RULE,
                 "",
-                ...(await readySummaryBlock(result.enabled, result.mode, readyRoutingInputs)),
-                "",
-                ...readyPerTurnLinesForTools(result.enabled, confirmedHooks).map((l) => chalk.dim(l)),
-                // Directly after the Codex per-turn line, which says "hook installed" - true, and not yet
-                // sufficient. This is the last thing printed because it is the only thing left to do.
+                ...onboardingCompletionBlock(result.enabled, result.failed),
+                // Codex trust is the only remaining action after a successful hook write.
                 ...(codexTrustPending ? ["", ...codexTrustContinuationLines("  ")] : []),
                 ""
               ].join("\n")

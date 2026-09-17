@@ -19,11 +19,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { readySummaryBlock } from "../../src/cli/commands/init.js";
+import {
+  onboardingCompletionBlock,
+  readySummaryBlock,
+  readySummaryBlockForDetection
+} from "../../src/cli/commands/init.js";
 import { computeCapabilityMatrix, deriveProviderCapabilities } from "../../src/core/gateway/capability-matrix.js";
 import { ADAPTERS } from "../../src/core/gateway/provider-adapter.js";
 import { ROUTE_COMMANDS } from "../../src/cli/commands/dev.js";
 import type { ReadyRoutingInputs } from "../../src/cli/onboarding/model.js";
+import type { ConnectDetection } from "../../src/cli/onboarding/model.js";
 
 let root: string;
 let home: string;
@@ -78,6 +83,18 @@ afterEach(() => {
 });
 
 describe("readySummaryBlock resolves the shaping-hook axis itself", () => {
+  it("durable mixed completion never claims ready and preserves successful tools", () => {
+    const text = onboardingCompletionBlock(["claude-code"], ["codex"]).join("\n");
+    expect(text).toContain("Setup incomplete");
+    expect(text).not.toContain("Compaction is ready");
+    expect(text).toContain("Configured: Claude Code");
+    expect(text).toContain("Codex: retry with `compaction init --connect codex`");
+    expect(text).toContain("compaction status     Check setup");
+    expect(text).toContain("compaction activity   See recent results");
+    expect(text).toContain("compaction init       Reconfigure");
+    expect(text).toContain("compaction stop       Disable");
+  });
+
   it("PRE-INSTALL inputs + hooks now on disk ⇒ configured stays distinct from native-active", async () => {
     writeInstalledCodexHooks();
     const text = (await readySummaryBlock(["codex"], undefined, preInstallRoutingInputs())).join("\n");
@@ -112,6 +129,28 @@ describe("readySummaryBlock resolves the shaping-hook axis itself", () => {
     const text = (await readySummaryBlock(["cursor"], undefined, preInstallRoutingInputs())).join("\n");
     expect(text).not.toContain("output shaping is NOT active for Cursor");
     expect(text).toContain("ONE session-level instruction per session");
+  });
+
+  it("the production summary path keeps a desktop-only Cursor install on its native hook", async () => {
+    mkdirSync(path.join(home, ".cursor"), { recursive: true });
+    writeFileSync(
+      path.join(home, ".cursor", "hooks.json"),
+      JSON.stringify({ version: 1, hooks: { sessionStart: [{ command: "compaction hooks shape cursor" }] } }),
+      "utf8"
+    );
+    const detection: ConnectDetection = {
+      claude: { detected: false, sessionCount: 0 },
+      codex: "absent",
+      cursor: { desktopDetected: true, hookReady: false, cli: "absent" }
+    };
+
+    const text = (
+      await readySummaryBlockForDetection(["cursor"], detection, undefined, preInstallRoutingInputs())
+    ).join("\n");
+
+    expect(text).toContain("Cursor desktop app (native session hook)");
+    expect(text).toContain("Cursor → ✓ Enabled (plan-auth, default):  native sessionStart hook");
+    expect(text).not.toContain("cursor-agent");
   });
 
   it("a HALF-installed Codex config (shaping entry only) is not claimed as installed", async () => {

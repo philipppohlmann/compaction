@@ -46,14 +46,23 @@ function baseEnv(pathValue: string, extra: NodeJS.ProcessEnv = {}): NodeJS.Proce
   };
 }
 
-async function runCli(args: string[], pathValue: string, extra: NodeJS.ProcessEnv = {}): Promise<string> {
+async function runCliResult(
+  args: string[],
+  pathValue: string,
+  extra: NodeJS.ProcessEnv = {}
+): Promise<{ stdout: string; code: number }> {
   try {
     const { stdout } = await execFileAsync(TSX, [CLI_ENTRY, ...args], { env: baseEnv(pathValue, extra) });
-    return stdout;
+    return { stdout, code: 0 };
   } catch (error) {
     // init exits non-zero only on verify-failed; still capture stdout for assertions.
-    return (error as { stdout?: string }).stdout ?? "";
+    const failure = error as { stdout?: string; code?: number };
+    return { stdout: failure.stdout ?? "", code: typeof failure.code === "number" ? failure.code : 1 };
   }
+}
+
+async function runCli(args: string[], pathValue: string, extra: NodeJS.ProcessEnv = {}): Promise<string> {
+  return (await runCliResult(args, pathValue, extra)).stdout;
 }
 
 function fakeBin(name: string): void {
@@ -107,8 +116,8 @@ describe("init --connect codex installs the native hooks, not just the PATH shim
   it("does NOT claim Codex shaping is on: a freshly written hook is awaiting Codex's own approval", async () => {
     const out = await runCli(["init", "--connect", "codex", "--static"], installPath());
     expect(out).not.toContain("Output shaping: on for codex");
-    expect(out).toContain("NOT yet running");
-    expect(out).toContain("this hook is new to Codex");
+    expect(out).toContain("Codex   Output shaping · one step remaining");
+    expect(out).toContain("Run codex. At “Hooks need review,” choose “Trust all and continue”.");
     expect(out).toContain("Trust all and continue");
   });
 
@@ -148,6 +157,24 @@ describe("init --connect codex installs the native hooks, not just the PATH shim
     expect(commands.filter((c) => c === "compaction hooks shape codex")).toHaveLength(1);
     // The backup of the pre-existing file is written and named.
     expect(existsSync(`${codexHooks()}.compaction.bak`)).toBe(true);
+  });
+
+  it("repairs missing native hooks when the Codex routing shim is already active", async () => {
+    await runCli(["init", "--connect", "codex", "--static"], installPath());
+    rmSync(codexHooks(), { force: true });
+    writeFileSync(
+      codexHooks(),
+      JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "other-tool --keep" }] }] } }),
+      "utf8"
+    );
+
+    await runCli(["init", "--connect", "codex", "--static"], activePath());
+    await runCli(["init", "--connect", "codex", "--static"], activePath());
+
+    const config = JSON.parse(readFileSync(codexHooks(), "utf8"));
+    expect(codexCommands(config, "UserPromptSubmit")).toEqual(["compaction hooks shape codex"]);
+    expect(codexCommands(config, "Stop")).toContain("other-tool --keep");
+    expect(codexCommands(config, "Stop").filter((command) => command === "compaction hooks line codex")).toHaveLength(1);
   });
 });
 
@@ -224,7 +251,8 @@ describe("a hand-written config the parser rejects survives `init --connect` unt
     ].join("\n");
     writeFileSync(codexHooks(), handWritten, "utf8");
 
-    const out = await runCli(["init", "--connect", "codex", "--static"], installPath());
+    const result = await runCliResult(["init", "--connect", "codex", "--static"], installPath());
+    const out = result.stdout;
     expect(readFileSync(codexHooks(), "utf8"), "the user's config was overwritten").toBe(handWritten);
     expect(existsSync(`${codexHooks()}.compaction.bak`)).toBe(false);
     // And the output must NOT show the green "on" claim for a hook that was never installed.
@@ -232,6 +260,7 @@ describe("a hand-written config the parser rejects survives `init --connect` unt
     expect(out).toContain("Output shaping: not installed for codex");
     // The shim half still connected - a hook refusal is additive, never a disconnect.
     expect(existsSync(path.join(shimDir, "codex"))).toBe(true);
+    expect(result.code).toBe(1);
   });
 });
 
@@ -246,9 +275,15 @@ describe("ready summary follows the hook state that is actually on disk", () => 
     writeFileSync(codexHooks(), JSON.stringify({ hooks: "not-an-object" }), "utf8");
     // Install once so the shim is on PATH, then re-run with it active so the Ready summary renders.
     await runCli(["init", "--connect", "codex", "--static"], installPath());
-    const out = await runCli(["init", "--connect", "codex", "--static"], activePath());
-    const ready = out.slice(out.indexOf("Compaction is ready."));
-    expect(ready).toContain("Codex → ✓ Enabled");
+    const result = await runCliResult(["init", "--connect", "codex", "--static"], activePath());
+    const out = result.stdout;
+    const ready = out.slice(out.indexOf("Setup incomplete"));
+    expect(result.code).toBe(1);
+    expect(out).not.toContain("Compaction is ready.");
+    expect(ready).toContain("Setup incomplete");
+    expect(ready).toContain("✓ Codex routing shim");
+    expect(ready).toContain("Codex routing shim → ✓ Enabled");
+    expect(ready).toContain("Codex native hooks · retry: compaction init --connect codex");
     expect(ready).toContain("output shaping is NOT active for Codex");
     expect(ready).not.toContain("a concise-response instruction is attached before generation");
     // The failure was already stated above; the two halves of the run now agree.
@@ -348,20 +383,19 @@ describe("init --disconnect removes the hooks it installed", () => {
    *
    * The requirement has two halves and the second one is the easy one to break: tell the user the
    * one-time Codex step when it is outstanding, and then STOP. A run that changed no hook hash cannot
-   * know whether Codex's per-hash trust was granted in between, so repeating "One time, to finish"
+   * know whether Codex's per-hash trust was granted in between, so repeating the launch instruction
    * there turns a continuation into a nag on every `compaction init`. This pins both frames of the
    * transition against the same HOME, in order, so a regression on either side is visible.
    */
   it("says the one-time Codex step on the run that WRITES the hook, and stops saying it afterwards", async () => {
     const first = await runCli(["init", "--connect", "codex", "--static"], installPath());
-    expect(first).toContain("One time, to finish");
-    expect(first).toContain("Trust all and continue");
+    expect(first).toContain("Codex   Output shaping · one step remaining");
+    expect(first).toContain("Run codex. At “Hooks need review,” choose “Trust all and continue”.");
 
     // Second run over the SAME config: nothing was written, so nothing is outstanding to announce.
     const second = await runCli(["init", "--connect", "codex", "--static"], activePath());
-    expect(second).not.toContain("One time, to finish");
-    expect(second).not.toContain("NOT yet running");
-    expect(second).not.toContain("this hook is new to Codex");
+    expect(second).not.toContain("one step remaining");
+    expect(second).not.toContain("Run codex. At “Hooks need review”");
     // It does not claim the opposite either. Trust is Codex's answer to give, and this run did not ask.
     expect(second).toContain("Whether Codex is running it depends on its one-time hook approval");
     expect(second).toContain("compaction status");
@@ -385,7 +419,7 @@ describe("init --disconnect removes the hooks it installed", () => {
     const out = await runCli(["init", "--connect", "codex", "--static"], installPath());
     const stripAnsi = (s: string): string => s.replace(/\u001B\[[0-9;]*m/g, "");
     const shared = codexTrustContinuationLines("    ").map(stripAnsi);
-    expect(shared).toHaveLength(3);
+    expect(shared).toHaveLength(2);
     for (const line of shared) expect(stripAnsi(out)).toContain(line);
   });
 
@@ -397,10 +431,10 @@ describe("init --disconnect removes the hooks it installed", () => {
    */
   it("names the native Codex step only - no per-session or per-check Compaction command", () => {
     const text = codexTrustContinuationLines("  ").join("\n").replace(/\u001B\[[0-9;]*m/g, "");
-    expect(text).toContain("run `codex`");
+    expect(text).toContain("Run codex.");
     expect(text).toContain("Hooks need review");
     expect(text).toContain("Trust all and continue");
-    expect(text).toContain("no per-session or per-turn Compaction command");
+    expect(text).not.toMatch(/compaction\s+(status|hooks|init)/i);
     expect(text).not.toContain("--check-codex");
   });
 

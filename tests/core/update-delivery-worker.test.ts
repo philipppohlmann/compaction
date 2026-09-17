@@ -47,14 +47,18 @@ describe("update worker acquisition and coordinator handoff (controlled I/O seam
     } finally { log.mockRestore(); }
   });
   it("stages a coherent Basic pair with CAS, never promotes independently", async () => {
+    expect(loadManagedInstallation(root).state.current.cli.version).toBe("0.6.8");
     expect(await stageLatestUpdate(root, "preview", env)).toMatchObject({ status: "staged", engineMode: "basic", reason: "no-account" });
     expect(discoverVersion).toHaveBeenCalledWith("preview");
+    expect(stageRegistryPackage).toHaveBeenCalledWith(root, registryRelease({ version: "0.6.9" }));
     expect(stagePair).toHaveBeenCalledWith(root, expect.objectContaining({ engine: { mode: "basic" }, cli: expect.objectContaining({ version: "0.6.9" }) }), "explicit", 3, undefined);
+    expect(loadManagedInstallation(root).state.current.cli.version).toBe("0.6.8");
   });
   it.each(["offline", "integrity mismatch", "smoke failed", "incompatible metadata"])("keeps active pair and stays quiet when acquisition fails: %s", async message => {
     vi.mocked(stageRegistryPackage).mockRejectedValueOnce(new Error(message));
     await expect(runUpdateWorker(root, env)).resolves.toBeUndefined();
     expect(stagePair).not.toHaveBeenCalled(); expect(selectCandidateEngine).not.toHaveBeenCalled();
+    expect(loadManagedInstallation(root).state.current.cli.version).toBe("0.6.8");
   });
   it.each(["opt-out", "channel-change"])("rechecks %s at the coordinator write boundary after deferred acquisition", async kind => {
     vi.mocked(selectCandidateEngine).mockImplementationOnce(async () => {

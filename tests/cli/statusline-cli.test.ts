@@ -104,9 +104,9 @@ describe("computeStatusLine", () => {
       readReceipt: async () => undefined,
       env: ISOLATED
     });
-    // Open-core grammar: on the hook-only fallback, shaping is active by default (no kill switch), so the
-    // honest per-turn label is `basic shaping`. The source label is not rendered.
-    expect(line).toBe("compaction · output 88 · basic shaping");
+    // A configured hook is not evidence that this exact turn was shaped. Without a same-session
+    // decision record the count remains useful, but the shaping label is withheld.
+    expect(line).toBe("compaction · output 88");
   });
 
   it("labels the stdin fallback local-estimate unless the payload says provider_reported", async () => {
@@ -114,7 +114,73 @@ describe("computeStatusLine", () => {
       readReceipt: async () => undefined,
       env: ISOLATED
     });
-    expect(line).toBe("compaction · output 50 · basic shaping");
+    expect(line).toBe("compaction · output 50");
+  });
+
+  it("reads current Claude statusLine usage and renders a completed shaped turn", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "statusline-current-claude-"));
+    const env = { COMPACTION_CONFIG_DIR: dir };
+    const sessionId = "current-claude-session";
+    try {
+      await recordShapingOutcome({ tool: "claude-code", sessionId }, "shape", env);
+
+      const line = await computeStatusLine(JSON.stringify({
+        cwd: "/x",
+        session_id: sessionId,
+        context_window: {
+          total_output_tokens: 88,
+          current_usage: {
+            input_tokens: 1200,
+            output_tokens: 88,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 900
+          }
+        }
+      }), { readReceipt: async () => undefined, env });
+
+      expect(line).not.toBe(STATUS_LINE_PLACEHOLDER);
+      expect(line).toContain("output N/A→88 (N/A%, est.)");
+      expect(line).toContain("basic shaping");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the placeholder for Claude's pre-turn context-window payload", async () => {
+    const line = await computeStatusLine(JSON.stringify({
+      cwd: "/x",
+      session_id: "pre-turn-session",
+      context_window: {
+        total_output_tokens: 0,
+        current_usage: null
+      }
+    }), { readReceipt: async () => undefined, env: ISOLATED });
+
+    expect(line).toBe(STATUS_LINE_PLACEHOLDER);
+  });
+
+  it("does not claim shaping for an unshaped Claude turn", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "statusline-unshaped-claude-"));
+    const env = { COMPACTION_CONFIG_DIR: dir };
+    const sessionId = "unshaped-claude-session";
+    try {
+      await recordShapingOutcome({ tool: "claude-code", sessionId }, "hold-planning", env);
+
+      const line = await computeStatusLine(JSON.stringify({
+        cwd: "/x",
+        session_id: sessionId,
+        context_window: {
+          total_output_tokens: 61,
+          current_usage: { output_tokens: 61 }
+        }
+      }), { readReceipt: async () => undefined, env });
+
+      expect(line).toBe("compaction · output 61");
+      expect(line).not.toContain("basic shaping");
+      expect(line).not.toContain("→");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("hook-only fallback with shaping OFF (kill switch) → `apply off` label", async () => {

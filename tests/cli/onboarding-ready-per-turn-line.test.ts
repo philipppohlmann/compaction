@@ -335,27 +335,25 @@ describe("onboarding Ready - the per-turn header follows whether any enabled wor
 });
 
 /**
- * THE OFF SWITCH NAMED IN THE CONSENT SCREEN MUST ACTUALLY WORK.
+ * THE OFF SWITCH NAMED ON THE READY SCREEN MUST ACTUALLY WORK.
  *
- * Output shaping ships default-ON once a tool's hook is installed, so the onboarding screen that
- * describes it is a consent surface. It used to name `compaction mode observe` as the way to turn
+ * Output shaping ships default-ON once a tool's hook is installed. The Ready screen used to name
+ * `compaction mode observe` as the way to turn
  * shaping off. That is false — `decideShaping` consults only the `COMPACTION_SHAPING_HOOKS` kill
  * switch and the persisted `compaction stop` state, and nothing in the hook path reads `product_mode`.
- * A consent screen naming a switch that does nothing is worse than naming none.
+ * A Ready screen naming a switch that does nothing is worse than naming none.
  *
  * This is pinned rather than left to review because nothing caught it for the entire life of the copy.
  */
-import { ONBOARDING_PLAN_OPTIONS } from "../../src/cli/onboarding/model.js";
+import { onboardingCompletionBlock } from "../../src/cli/commands/init.js";
 import { decideShaping } from "../../src/core/subscription-shaping-runtime.js";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir as osTmpdir } from "node:os";
 import { join as joinPath } from "node:path";
 
 describe("onboarding names a shaping off switch that works", () => {
-  const openCard = ONBOARDING_PLAN_OPTIONS.find((c) => c.key === "open");
-
   it("names `compaction stop`, not `compaction mode observe`", () => {
-    const copy = (openCard?.effects ?? []).join(" ");
+    const copy = onboardingCompletionBlock(["claude-code"], []).join("\n");
     expect(copy).toContain("compaction stop");
     expect(copy, "the hook path never reads product_mode").not.toContain("compaction mode observe");
   });
