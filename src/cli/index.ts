@@ -50,6 +50,7 @@ import { registerUsageCommand } from "./commands/usage.js";
 import { registerUpdateCommand } from "./commands/update.js";
 import { redeemPendingConsentsQuietly } from "../core/pending-authorizations.js";
 import { compactMarkFor } from "./terminal-logo.js";
+import { convergeOfficialNpmGlobalInvocation } from "../core/update/npm-global-adoption.js";
 
 function cliPackageVersion(): string {
   // dist/cli/index.js -> ../../package.json (same layout init.ts relies on). Fallback keeps --version working.
@@ -191,7 +192,20 @@ for (const cmd of program.commands) {
   (cmd as unknown as { _hidden: boolean })._hidden = true;
 }
 
-program.parseAsync(process.argv).catch((error: unknown) => {
+async function main(): Promise<void> {
+  const convergence = await convergeOfficialNpmGlobalInvocation(process.argv[1], process.argv.slice(2), process.env,
+    { notice: process.stderr.isTTY ? (message) => process.stderr.write(`compaction: ${message}\n`) : undefined });
+  if (convergence.handled) {
+    if (convergence.signal) {
+      try { process.kill(process.pid, convergence.signal); }
+      catch { process.exitCode = convergence.signal === "SIGINT" ? 130 : convergence.signal === "SIGTERM" ? 143 : 1; }
+    } else process.exitCode = convergence.code ?? 1;
+    return;
+  }
+  await program.parseAsync(process.argv);
+}
+
+main().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
   console.error(message);
   process.exitCode = 1;

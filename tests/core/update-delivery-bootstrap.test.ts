@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { bootstrapManaged, isDirectBootstrapInvocation } from "../../src/core/update/bootstrap.js";
 import { currentReleaseCompatibility } from "../../src/core/update/compatibility.js";
-import { inventoryRelease, loadManagedInstallation } from "../../src/core/update/ownership.js";
+import { inventoryRelease, loadManagedInstallation, sha256 } from "../../src/core/update/ownership.js";
 import { stageLocalArtifact, stageRegistryPackage } from "../../src/core/update/package-stage.js";
-import { readUpdatePreferences } from "../../src/core/onboarding-preferences.js";
+import { addConnectedWorkflows, readUpdatePreferences, writeOptimizationMode, writeProductMode, writeUpdatePreferences } from "../../src/core/onboarding-preferences.js";
 import { hasUntrackedToolProcessesForLauncher } from "../../src/core/update/process-identity.js";
 import type { PairDescriptor } from "../../src/core/update/types.js";
 vi.mock("../../src/core/update/package-stage.js", () => ({ stageLocalArtifact: vi.fn(), stageRegistryPackage: vi.fn() }));
@@ -15,7 +15,7 @@ vi.mock("../../src/core/update/process-identity.js", async original => ({ ...awa
 const homes: string[] = [];
 afterEach(() => { vi.clearAllMocks(); for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true }); });
 function fixture() {
-  const home = mkdtempSync(path.join(tmpdir(), "compaction-bootstrap-test-")); homes.push(home);
+  const home = realpathSync(mkdtempSync(path.join(tmpdir(), "compaction-bootstrap-test-"))); homes.push(home);
   const env = { HOME: home, COMPACTION_CONFIG_DIR: path.join(home, "config"), COMPACTION_SHIM_DIR: path.join(home, "shims") };
   const root = path.join(env.COMPACTION_CONFIG_DIR, "managed"); const prefix = path.join(home, "prefix");
   const localArtifact = { artifactPath: path.join(home, "controlled.tgz"), expectedSha256: "a".repeat(64), expectedVersion: "0.6.8" };
@@ -30,7 +30,17 @@ function fixture() {
       files: inventoryRelease(installRoot), compatibility, source: "local-artifact", provenance: "local-artifact" };
   }
   vi.mocked(stageLocalArtifact).mockResolvedValue(cli());
-  return { home, env, root, prefix, localArtifact, cli };
+  function officialNpm(version = "0.6.8") {
+    const pkg = path.join(prefix, "lib/node_modules/@compaction/cli"), entry = path.join(pkg, "dist/cli/index.js");
+    const launcher = path.join(prefix, "bin/compaction");
+    mkdirSync(path.dirname(entry), { recursive: true }); mkdirSync(path.dirname(launcher), { recursive: true });
+    writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ name: "@compaction/cli", version, type: "module",
+      bin: { compaction: "dist/cli/index.js" }, compactionRelease: currentReleaseCompatibility(version) }));
+    writeFileSync(entry, `console.log(${JSON.stringify(version)});`);
+    symlinkSync(path.relative(path.dirname(launcher), entry), launcher);
+    return { pkg, entry, launcher };
+  }
+  return { home, env, root, prefix, localArtifact, cli, officialNpm };
 }
 describe("managed bootstrap coordinator (controlled acquisition, real files and locks)", () => {
   it("recognizes the direct entrypoint through a canonical path alias", () => {
@@ -73,13 +83,53 @@ describe("managed bootstrap coordinator (controlled acquisition, real files and 
     await expect(bootstrapManaged(f)).rejects.toThrow("unknown launcher"); expect(stageLocalArtifact).not.toHaveBeenCalled();
   });
   it("defers explicit recognized legacy adoption while old integration sessions may remain", async () => {
-    const f = fixture(); const pkg = path.join(f.prefix, "lib/node_modules/@compaction/cli");
-    mkdirSync(path.join(pkg, "dist/cli"), { recursive: true }); mkdirSync(path.join(f.prefix, "bin"), { recursive: true });
-    writeFileSync(path.join(pkg, "package.json"), JSON.stringify({ name: "@compaction/cli", bin: { compaction: "dist/cli/index.js" } }));
-    writeFileSync(path.join(pkg, "dist/cli/index.js"), "// Controlled legacy launcher fixture");
-    symlinkSync(path.join(pkg, "dist/cli/index.js"), path.join(f.prefix, "bin/compaction"));
+    const f = fixture(); f.officialNpm();
     vi.mocked(hasUntrackedToolProcessesForLauncher).mockReturnValueOnce(true);
     await expect(bootstrapManaged({ ...f, adoptSelectedNpmPrefix: true })).rejects.toThrow("sessions may still be active");
     expect(stageLocalArtifact).not.toHaveBeenCalled(); expect(existsSync(path.join(f.root, "install.json"))).toBe(false);
+  });
+
+  it("adopts the exact official npm launcher while preserving user state and explicit automatic-update choice", async () => {
+    const f = fixture(); const npm = f.officialNpm();
+    writeOptimizationMode("cache-plus-context", f.env); writeProductMode("full", f.env);
+    addConnectedWorkflows(["claude-code", "codex"], f.env); writeUpdatePreferences({ autoUpdates: true, channel: "stable" }, f.env);
+    const protectedFiles = [path.join(f.env.COMPACTION_CONFIG_DIR, "preferences.json"),
+      path.join(f.env.COMPACTION_CONFIG_DIR, "credentials.json"), path.join(f.env.COMPACTION_CONFIG_DIR, "authorizations.json"),
+      path.join(f.env.COMPACTION_CONFIG_DIR, "config.json"), path.join(f.home, ".claude/settings.json"),
+      path.join(f.home, ".codex/hooks.json"), path.join(f.home, ".cursor/hooks.json")];
+    for (const [index, file] of protectedFiles.slice(1).entries()) { mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, `foreign-config-${index}\n`); }
+    const before = protectedFiles.map(file => readFileSync(file));
+    const result = await bootstrapManaged({ ...f, adoptSelectedNpmPrefix: true, automaticUpdates: true });
+    expect(loadManagedInstallation(f.root).state.current.cli.version).toBe("0.6.8");
+    expect(readUpdatePreferences(f.env).autoUpdates).toBe(true);
+    expect(lstatSync(result.launcherPath).isSymbolicLink()).toBe(false);
+    expect(result.backup && lstatSync(result.backup).isSymbolicLink()).toBe(true);
+    expect(result.backup && path.resolve(path.dirname(result.backup), readlinkSync(result.backup))).toBe(npm.entry);
+    protectedFiles.forEach((file, index) => expect(readFileSync(file)).toEqual(before[index]));
+  });
+
+  it("serializes concurrent adoption so the managed launcher is never renamed as legacy", async () => {
+    const f = fixture(); f.officialNpm();
+    const options = { ...f, adoptSelectedNpmPrefix: true, automaticUpdates: true };
+    const [first, second] = await Promise.all([bootstrapManaged(options), bootstrapManaged(options)]);
+    expect(loadManagedInstallation(f.root).state.current.cli.version).toBe("0.6.8");
+    expect(lstatSync(first.launcherPath).isSymbolicLink()).toBe(false);
+    expect([first.backup, second.backup].filter(Boolean)).toHaveLength(1);
+  });
+
+  it("restores the exact npm symlink after a verified managed launcher is published without a receipt", async () => {
+    const f = fixture(); const npm = f.officialNpm(); const originalLink = readlinkSync(npm.launcher);
+    const install = vi.fn(async (root: string, _pair: PairDescriptor, options: { launcherPath: string; beforeLauncherClaim?: () => void }) => {
+      options.beforeLauncherClaim?.();
+      const contents = "#!/usr/bin/env node\n// COMPACTION_MANAGED_LAUNCHER_V1\n";
+      writeFileSync(options.launcherPath, contents, { mode: 0o755 });
+      const receipt = { schema: 1, kind: "compaction-managed", packageName: "@compaction/cli", root,
+        launcherPath: options.launcherPath, launcherSha256: sha256(contents) };
+      writeFileSync(path.join(root, "bootstrap.json"), JSON.stringify({ schema: 1, receipt, pair: "fixture" }) + "\n");
+      throw new Error("injected receipt publication failure");
+    });
+    await expect(bootstrapManaged({ ...f, adoptSelectedNpmPrefix: true }, { install: install as never })).rejects.toThrow("receipt publication");
+    expect(lstatSync(npm.launcher).isSymbolicLink()).toBe(true); expect(readlinkSync(npm.launcher)).toBe(originalLink);
+    expect(existsSync(path.join(f.root, "install.json"))).toBe(false);
   });
 });
