@@ -209,9 +209,9 @@ function fixture(root: string, version: string): PairDescriptor {
   return { id: `pair-${version}`, cli: { root: packageRoot, installRoot, version, compatibility,
     integrity: "sha512-controlled-local-fixture", files: inventoryRelease(installRoot), source: "local-artifact", provenance: "local-artifact" }, engine: { mode: "basic" } };
 }
-async function installation() {
+async function installation(currentVersion = "0.6.8", candidateVersion = "0.6.9") {
   const home = temporary(); const root = path.join(home, "managed");
-  const a = fixture(root, "0.6.8"), b = fixture(root, "0.6.9");
+  const a = fixture(root, currentVersion), b = fixture(root, candidateVersion);
   const launcher = path.join(home, "bin/compaction");
   await bootstrapManagedInstall(root, a, { launcherPath: launcher });
   return { home, root, a, b, launcher };
@@ -317,6 +317,27 @@ describe("staged activation intent", () => {
 });
 
 describe("managed pair ownership and atomic selection (controlled local artifacts)", () => {
+  it("activates a verified 0.6.10 pair from 0.6.9 without changing local user state", async () => {
+    const { home, root, a, b, launcher } = await installation("0.6.9", "0.6.10");
+    const env = { ...process.env, HOME: home, COMPACTION_HOME: home, COMPACTION_CONFIG_DIR: home, COMPACTION_AUTO_UPDATE: "0" };
+    const protectedFiles = [
+      path.join(home, "preferences.json"), path.join(home, "credentials.json"),
+      path.join(home, "authorizations.json"), path.join(home, "config.json"),
+      path.join(home, ".claude/settings.json"), path.join(home, ".codex/hooks.json"), path.join(home, ".cursor/hooks.json")
+    ];
+    protectedFiles.forEach((file, index) => { mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, `protected-${index}\n`); });
+    const before = protectedFiles.map(file => readFileSync(file));
+    await stageManagedPair(root, b, "explicit");
+    expect(readState(root).current.cli.version).toBe("0.6.9");
+    const gatewayBarrier = vi.fn(barrier);
+    expect((await tryActivate(root, { gatewayBarrier, env })).status).toBe("active");
+    expect(gatewayBarrier).toHaveBeenCalledTimes(1);
+    expect(readState(root).current).toEqual(b); expect(readState(root).previous).toEqual(a);
+    expect(readState(root).current.engine).toEqual(b.engine);
+    protectedFiles.forEach((file, index) => expect(readFileSync(file)).toEqual(before[index]));
+    expect(execFileSync(launcher, ["--version"], { encoding: "utf8", env })).toBe("0.6.10\n");
+  });
+
   it("gives hook administration a short command lease while real hook events retain their parent lease", async () => {
     const { home, root, a, b, launcher } = await installation();
     await stagePair(root, b);

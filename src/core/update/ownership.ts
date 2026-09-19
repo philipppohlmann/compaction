@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -8,6 +8,7 @@ import { atomicWrite, readState, syncDirectory, withManagedLock, writeState } fr
 import type { InstallationReceipt, ManagedState, PairDescriptor } from "./types.js";
 import { parseReleaseCompatibility } from "./compatibility.js";
 import { resolveSessionPin, SESSION_PIN_ENV } from "./sessions.js";
+import { classifyOfficialNpmGlobalEntry, type OfficialNpmGlobalInstallation } from "./npm-global-ownership.js";
 
 export function defaultManagedRoot(env: NodeJS.ProcessEnv = process.env): string {
   return path.resolve(env.COMPACTION_HOME || env.COMPACTION_CONFIG_DIR || path.join(env.HOME || homedir(), ".compaction"), "managed");
@@ -162,22 +163,8 @@ export function loadExecutingManagedInstallation(env: NodeJS.ProcessEnv = proces
   } catch { throw new Error("Managed execution ownership or session reference cannot be verified"); }
 }
 
-export async function bootstrapManagedInstall(root: string, pair: PairDescriptor, options: { launcherPath: string }): Promise<{ receipt: InstallationReceipt; state: ManagedState }> {
-  mkdirSync(root, { recursive: true, mode: 0o700 });
-  validateStorage(root);
-  root = realpathSync(root);
-  return withManagedLock(root, () => {
-    if (existsSync(path.join(root, "install.json"))) return loadManagedInstallation(root);
-    assertEmptyUnclaimedGatewayRegistry(root);
-    validatePair(root, pair);
-    const launcherPath = path.resolve(options.launcherPath);
-    mkdirSync(path.dirname(launcherPath), { recursive: true, mode: 0o700 });
-    assertOwnedDirectory(path.dirname(launcherPath));
-    const runtimeUrl = pathToFileURL(path.join(pair.cli.root, "dist/core/update/launcher.js")).href;
-    const manifestPath = path.join(root, "bootstrap-runtime.json");
-    const runtimeManifest = JSON.stringify({ installRoot: realpathSync(pair.cli.installRoot),
-      staticFiles: bootstrapStaticFiles(pair), files: pair.cli.files });
-    const contents = `#!/usr/bin/env node
+function managedLauncherContents(root: string, launcherPath: string, runtimeUrl: string, manifestPath: string, runtimeManifest: string): string {
+  return `#!/usr/bin/env node
 // COMPACTION_MANAGED_LAUNCHER_V1
 Promise.all([import('node:fs'), import('node:crypto'), import('node:path')]).then(async ([fs, crypto, path]) => {
   for (const directory of ${JSON.stringify([root, path.dirname(launcherPath)])}) {
@@ -221,6 +208,75 @@ Promise.all([import('node:fs'), import('node:crypto'), import('node:path')]).the
   process.exitCode = await runtime.launchManaged(${JSON.stringify(root)}, args);
 }).catch(() => { process.stderr.write('compaction: managed launcher integrity could not be verified\\n'); process.exitCode = 125; });
 `;
+}
+
+/** Reclaim only a previously receipted launcher that an exact official npm reinstall replaced. */
+export async function reclaimManagedLauncherAfterNpmReplacement(
+  root: string,
+  adoption: OfficialNpmGlobalInstallation
+): Promise<{ receipt: InstallationReceipt; state: ManagedState }> {
+  validateStorage(root); root = realpathSync(root);
+  return withManagedLock(root, () => {
+    const current = classifyOfficialNpmGlobalEntry(adoption.entryPath);
+    if (current.kind !== "official-npm-global" || current.prefix !== adoption.prefix
+      || current.launcherPath !== adoption.launcherPath || current.entryPath !== adoption.entryPath
+      || current.version !== adoption.version || JSON.stringify(current.compatibility) !== JSON.stringify(adoption.compatibility)) {
+      throw new Error("The replacement npm installation could not be verified.");
+    }
+    const receipt = JSON.parse(readFileSync(path.join(root, "install.json"), "utf8")) as InstallationReceipt;
+    const state = readState(root);
+    for (const pair of [state.current, state.previous, state.staged]) if (pair) validatePair(root, pair);
+    const launcherPath = path.resolve(adoption.launcherPath);
+    if (receipt.schema !== 1 || receipt.kind !== "compaction-managed" || receipt.packageName !== "@compaction/cli"
+      || receipt.root !== root || receipt.launcherPath !== launcherPath || !/^[a-f0-9]{64}$/.test(receipt.launcherSha256)
+      || !receipt.bootstrapInstallRoot) throw new Error("Existing managed ownership metadata could not be verified.");
+    assertOwnedDirectory(path.dirname(launcherPath));
+    const manifestPath = path.join(root, "bootstrap-runtime.json");
+    const runtimeManifest = readFileSync(manifestPath, "utf8");
+    const manifest = JSON.parse(runtimeManifest) as { installRoot?: unknown };
+    if (typeof manifest.installRoot !== "string" || realpathSync(manifest.installRoot) !== receipt.bootstrapInstallRoot
+      || !containedPath(path.join(root, "releases"), receipt.bootstrapInstallRoot)) {
+      throw new Error("Existing managed runtime metadata could not be verified.");
+    }
+    const runtimeUrl = pathToFileURL(path.join(receipt.bootstrapInstallRoot, "node_modules/@compaction/cli/dist/core/update/launcher.js")).href;
+    const contents = managedLauncherContents(root, launcherPath, runtimeUrl, manifestPath, runtimeManifest);
+    if (sha256(contents) !== receipt.launcherSha256) throw new Error("Existing managed launcher receipt could not be reproduced.");
+    const backup = `${launcherPath}.npm-replacement-${randomUUID()}`;
+    renameSync(launcherPath, backup);
+    try {
+      atomicWrite(launcherPath, contents, 0o755);
+      const recovered = loadManagedInstallation(root);
+      unlinkSync(backup);
+      return recovered;
+    } catch (error) {
+      if (existsSync(launcherPath)) unlinkSync(launcherPath);
+      renameSync(backup, launcherPath);
+      throw error;
+    }
+  });
+}
+
+export async function bootstrapManagedInstall(root: string, pair: PairDescriptor, options: {
+  launcherPath: string;
+  /** Runs under the managed lock, after an existing receipt check and before launcher ownership is claimed. */
+  beforeLauncherClaim?: () => void;
+}): Promise<{ receipt: InstallationReceipt; state: ManagedState }> {
+  mkdirSync(root, { recursive: true, mode: 0o700 });
+  validateStorage(root);
+  root = realpathSync(root);
+  return withManagedLock(root, () => {
+    if (existsSync(path.join(root, "install.json"))) return loadManagedInstallation(root);
+    assertEmptyUnclaimedGatewayRegistry(root);
+    validatePair(root, pair);
+    const launcherPath = path.resolve(options.launcherPath);
+    mkdirSync(path.dirname(launcherPath), { recursive: true, mode: 0o700 });
+    assertOwnedDirectory(path.dirname(launcherPath));
+    options.beforeLauncherClaim?.();
+    const runtimeUrl = pathToFileURL(path.join(pair.cli.root, "dist/core/update/launcher.js")).href;
+    const manifestPath = path.join(root, "bootstrap-runtime.json");
+    const runtimeManifest = JSON.stringify({ installRoot: realpathSync(pair.cli.installRoot),
+      staticFiles: bootstrapStaticFiles(pair), files: pair.cli.files });
+    const contents = managedLauncherContents(root, launcherPath, runtimeUrl, manifestPath, runtimeManifest);
     const receipt: InstallationReceipt = { schema: 1, kind: "compaction-managed", packageName: "@compaction/cli", root,
       launcherPath, launcherSha256: sha256(contents), bootstrapInstallRoot: realpathSync(pair.cli.installRoot) };
     const state: ManagedState = { schema: 1, revision: 0, current: pair, rejectedPairIds: [], integrationSchema: 1 };

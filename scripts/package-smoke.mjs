@@ -259,6 +259,7 @@ if (!binPath) {
   fail(`installed binary not found. Looked in:\n  ${binCandidates.join("\n  ")}`);
 }
 log("install", `installed binary: ${binPath}`);
+process.env.COMPACTION_PACKAGE_SMOKE = "1";
 
 // Run from OUTSIDE the repo so any repo-relative path assumptions surface, with a scratch config dir
 // so nothing here can read or write the operator's real ~/.compaction.
