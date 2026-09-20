@@ -87,6 +87,43 @@
       "status": "public_harness_shipped_sufficiency_validation_separate"
     },
     {
+      "id": "request-input-census-reproducibility-v1",
+      "name": "Request input census reproducibility oracle",
+      "evidence_type": "synthetic_fixture",
+      "proves": [
+        "deterministic_reproduction_over_six_fixed_synthetic_fixtures_only"
+      ],
+      "does_not_prove": [
+        "provider_prompt_construction",
+        "provider_token_counts",
+        "native_provider_runtime_behavior",
+        "request_input_reduction",
+        "savings",
+        "semantic_preservation",
+        "generalization_beyond_six_registered_synthetic_fixtures"
+      ],
+      "implementation": [
+        "src/core/request-input-census.ts"
+      ],
+      "tests": [
+        "tests/core/request-input-census.test.ts",
+        "tests/core/request-input-census-benchmark.test.ts",
+        "tests/security/public-eval-registry-closure.test.ts"
+      ],
+      "fixtures": [
+        "tests/fixtures/request-input-census/anthropic-messages.json",
+        "tests/fixtures/request-input-census/openai-chat.json",
+        "tests/fixtures/request-input-census/openai-responses-custom-tool-output.json",
+        "tests/fixtures/request-input-census/openai-responses-native-discovery.json",
+        "tests/fixtures/request-input-census/openai-responses-opaque-result.json",
+        "tests/fixtures/request-input-census/openai-responses.json"
+      ],
+      "artifacts": [
+        "evals/request-input-census/benchmark-report-v1.json"
+      ],
+      "status": "synthetic_fixture_reproducibility_oracle"
+    },
+    {
       "id": "claims-guards",
       "name": "Public evidence-label guards",
       "proves": [
