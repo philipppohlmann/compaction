@@ -83,6 +83,147 @@ describe("censusRequestInput", () => {
     expect(result.components.some((component) => component.category === "unclassified")).toBe(false);
   });
 
+  it("distinguishes direct, deferred, namespaced, and discovered tool components without overlap", () => {
+    const body = fixture("openai-responses-native-discovery.json");
+    const parsed = JSON.parse(body) as {
+      input: Array<{ tools: unknown[] }>;
+    };
+    const result = censusRequestInput("/v1/responses", body);
+    expect(result.basis).toBe("canonical_component_values_v1");
+    expectPartitioned(result);
+
+    const direct = result.components.filter((component) => component.type === "tool_definition_direct");
+    const deferred = result.components.filter((component) => component.type === "tool_definition_deferred");
+    expect(direct).toHaveLength(4);
+    expect(deferred).toHaveLength(1);
+    expect(result.components.filter((component) => component.type.startsWith("tool_namespace_"))).toHaveLength(2);
+    expect(result.components.some((component) => component.path === "$.input[0].tools[0]")).toBe(false);
+
+    const nestedDirect = result.components.find(
+      (component) => component.path === "$.input[0].tools[0].tools[0]"
+    );
+    const nestedValue = (parsed.input[0]?.tools[0] as { tools: unknown[] }).tools[0];
+    const canonical = JSON.stringify(nestedValue);
+    expect(nestedDirect).toMatchObject({
+      category: "tool_definition",
+      type: "tool_definition_direct",
+      exact: {
+        utf8Bytes: Buffer.byteLength(canonical, "utf8"),
+        unicodeCodePoints: Array.from(canonical).length
+      }
+    });
+
+    expect(result.components.find((component) => component.path === "$.input[1].tools")).toMatchObject({
+      category: "tool_result",
+      type: "tool_search_result",
+      promptDisposition: "included",
+      estimate: { kind: "local_estimate" }
+    });
+  });
+
+  it("treats missing or false defer_loading as direct and bounds non-boolean values", () => {
+    const marker = "PRIVATE_DEFER_MARKER";
+    const result = censusRequestInput(
+      "/v1/responses",
+      JSON.stringify({
+        input: "task",
+        tools: [
+          { name: "missing" },
+          { name: "false", defer_loading: false },
+          { name: "true", defer_loading: true },
+          { name: marker, defer_loading: marker },
+          { name: "null", defer_loading: null },
+          { name: "number", defer_loading: 0 },
+          { name: "object", defer_loading: {} }
+        ]
+      })
+    );
+    expect(result.components.filter((component) => component.type === "tool_definition_direct")).toHaveLength(2);
+    expect(result.components.filter((component) => component.type === "tool_definition_deferred")).toHaveLength(1);
+    expect(result.components.filter((component) => component.type === "invalid_tool_defer_loading")).toHaveLength(4);
+    expect(JSON.stringify(result)).not.toContain(marker);
+    expectPartitioned(result);
+  });
+
+  it.each([
+    ["wrong role", { type: "additional_tools", role: "user", tools: [] }],
+    ["non-array tools", { type: "additional_tools", role: "developer", tools: {} }],
+    ["carrier extra field", { type: "additional_tools", role: "developer", tools: [], extra: true }],
+    [
+      "namespace missing name",
+      {
+        type: "additional_tools",
+        role: "developer",
+        tools: [{ type: "namespace", tools: [] }]
+      }
+    ],
+    [
+      "namespace extra field",
+      {
+        type: "additional_tools",
+        role: "developer",
+        tools: [{ type: "namespace", name: "n", description: "d", tools: [], extra: true }]
+      }
+    ],
+    [
+      "nested namespace depth",
+      {
+        type: "additional_tools",
+        role: "developer",
+        tools: [
+          {
+            type: "namespace",
+            name: "outer",
+            description: "d",
+            tools: [{ type: "namespace", name: "inner", description: "d", tools: [] }]
+          }
+        ]
+      }
+    ]
+  ])("fails a malformed additional_tools %s variant as one bounded subtree", (_label, item) => {
+    const result = censusRequestInput("/v1/responses", JSON.stringify({ input: [item] }));
+    expect(result.components).toHaveLength(1);
+    expect(result.components[0]).toMatchObject({
+      path: "$.input[0]",
+      category: "unclassified",
+      type: "malformed_additional_tools",
+      promptDisposition: "unknown",
+      estimate: { kind: "unavailable", reason: "unclassified" }
+    });
+    expectPartitioned(result);
+  });
+
+  it("keeps malformed additional_tools values and unknown keys out of serialized census metadata", () => {
+    const keyMarker = "PRIVATE_ADDITIONAL_KEY";
+    const valueMarker = "PRIVATE_ADDITIONAL_VALUE";
+    const result = censusRequestInput(
+      "/v1/responses",
+      JSON.stringify({
+        input: [{ type: "additional_tools", role: valueMarker, tools: [], [keyMarker]: valueMarker }]
+      })
+    );
+    expect(result.components).toHaveLength(1);
+    expect(result.components[0]?.type).toBe("malformed_additional_tools");
+    expect(JSON.stringify(result)).not.toContain(keyMarker);
+    expect(JSON.stringify(result)).not.toContain(valueMarker);
+  });
+
+  it.each([
+    ["missing tools", { type: "tool_search_output", execution: "search", status: "completed" }],
+    ["non-array tools", { type: "tool_search_output", execution: "search", status: "completed", tools: {} }],
+    ["extra field", { type: "tool_search_output", execution: "search", status: "completed", tools: [], extra: true }],
+    ["invalid execution", { type: "tool_search_output", execution: 1, status: "completed", tools: [] }]
+  ])("fails malformed tool_search_output %s as one bounded subtree", (_label, item) => {
+    const result = censusRequestInput("/v1/responses", JSON.stringify({ input: [item] }));
+    expect(result.components).toHaveLength(1);
+    expect(result.components[0]).toMatchObject({
+      path: "$.input[0]",
+      category: "unclassified",
+      type: "malformed_tool_search_output"
+    });
+    expectPartitioned(result);
+  });
+
   it("marks active input only from an explicit component boundary", () => {
     const body = JSON.stringify({ messages: [{ role: "user", content: "old" }, { role: "user", content: "new" }] });
     const implicit = censusRequestInput("/v1/chat/completions", body);
