@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "updated": "2026-09-05",
+  "updated": "2026-09-20",
   "description": "Public registry for synthetic eval fixtures and content-free A/B harnesses. Engine-backed validation is delivered separately.",
   "eval_gates": {
     "context_preservation": {
@@ -122,6 +122,53 @@
         "evals/request-input-census/benchmark-report-v1.json"
       ],
       "status": "synthetic_fixture_reproducibility_oracle"
+    },
+    {
+      "id": "tool-result-fixture-census-reproducibility-v1",
+      "name": "Tool-result fixture census reproducibility oracle",
+      "evidence_type": "synthetic_fixture",
+      "proves": [
+        "deterministic_reproduction_over_exact_eleven_registered_synthetic_fixtures_only",
+        "current_detect_waste_behavior_on_five_registered_synthetic_trace_fixtures_only"
+      ],
+      "does_not_prove": [
+        "real_trace_prevalence",
+        "provider_prompt_construction",
+        "provider_token_counts",
+        "reducibility",
+        "achievable_reduction",
+        "semantic_preservation",
+        "context_preservation",
+        "policy_safety",
+        "apply_safety",
+        "savings",
+        "generalization_beyond_eleven_registered_synthetic_fixtures"
+      ],
+      "implementation": [
+        "src/core/request-input-census.ts",
+        "src/core/waste-detector.ts"
+      ],
+      "tests": [
+        "tests/core/tool-result-fixture-census-benchmark.test.ts",
+        "tests/security/public-eval-registry-closure.test.ts"
+      ],
+      "fixtures": [
+        "src/examples/demo-coding-trace.json",
+        "src/examples/demo-rag-trace.json",
+        "src/examples/demo-support-trace.json",
+        "src/examples/demo-trace.json",
+        "tests/fixtures/request-input-census/anthropic-messages.json",
+        "tests/fixtures/request-input-census/openai-chat.json",
+        "tests/fixtures/request-input-census/openai-responses-custom-tool-output.json",
+        "tests/fixtures/request-input-census/openai-responses-native-discovery.json",
+        "tests/fixtures/request-input-census/openai-responses-opaque-result.json",
+        "tests/fixtures/request-input-census/openai-responses.json",
+        "tests/fixtures/superseded-same-source-read.json"
+      ],
+      "artifacts": [
+        "evals/tool-result-fixture-census/benchmark-report-v1.json"
+      ],
+      "status": "synthetic_fixture_census_reproducibility_oracle"
     },
     {
       "id": "claims-guards",

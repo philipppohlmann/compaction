@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "tool-result-fixture-census-reproducibility-v1",
+  "evidence_type": "synthetic_fixture",
+  "measurement_bases": {
+    "request_projection": "censusRequestInput canonical component values: decoded text values and JSON.stringify for structured or opaque values; excludes surrounding request-envelope bytes",
+    "trace_tool_content": "exact UTF-8 bytes of role=tool message content",
+    "detector_reported_local_estimate_tokens": "sum of current detectWaste finding estimatedTokens; current estimator is max(1, ceil(JavaScript string length / 4))"
+  },
+  "request_projection": {
+    "source_benchmark_id": "request-input-census-reproducibility-v1",
+    "fixture_count": 6,
+    "buckets": {
+      "tool_result_text": {
+        "component_count": 5,
+        "utf8_bytes": 56,
+        "unicode_code_points": 56
+      },
+      "structured_tool_search_result": {
+        "component_count": 1,
+        "utf8_bytes": 97,
+        "unicode_code_points": 94
+      },
+      "opaque_nontext": {
+        "component_count": 1,
+        "utf8_bytes": 61,
+        "unicode_code_points": 61
+      }
+    },
+    "total": {
+      "component_count": 7,
+      "utf8_bytes": 214,
+      "unicode_code_points": 211
+    }
+  },
+  "detector_census": {
+    "fixture_count": 5,
+    "cases": [
+      {
+        "fixture_id": "demo_coding_trace",
+        "tool_message_count": 5,
+        "exact_tool_content_utf8_bytes": 5043,
+        "detector_findings_by_category": {
+          "repeated_tool_output": 2,
+          "superseded_same_source_read": 0
+        },
+        "unique_candidate_count": 2,
+        "detector_reported_local_estimate_tokens": 800
+      },
+      {
+        "fixture_id": "demo_rag_trace",
+        "tool_message_count": 4,
+        "exact_tool_content_utf8_bytes": 5768,
+        "detector_findings_by_category": {
+          "repeated_tool_output": 2,
+          "superseded_same_source_read": 0
+        },
+        "unique_candidate_count": 2,
+        "detector_reported_local_estimate_tokens": 932
+      },
+      {
+        "fixture_id": "demo_support_trace",
+        "tool_message_count": 4,
+        "exact_tool_content_utf8_bytes": 6682,
+        "detector_findings_by_category": {
+          "repeated_tool_output": 2,
+          "superseded_same_source_read": 0
+        },
+        "unique_candidate_count": 2,
+        "detector_reported_local_estimate_tokens": 1092
+      },
+      {
+        "fixture_id": "demo_trace",
+        "tool_message_count": 6,
+        "exact_tool_content_utf8_bytes": 17678,
+        "detector_findings_by_category": {
+          "repeated_tool_output": 1,
+          "superseded_same_source_read": 0
+        },
+        "unique_candidate_count": 1,
+        "detector_reported_local_estimate_tokens": 2117
+      },
+      {
+        "fixture_id": "superseded_same_source_read",
+        "tool_message_count": 3,
+        "exact_tool_content_utf8_bytes": 4589,
+        "detector_findings_by_category": {
+          "repeated_tool_output": 0,
+          "superseded_same_source_read": 1
+        },
+        "unique_candidate_count": 1,
+        "detector_reported_local_estimate_tokens": 563
+      }
+    ],
+    "aggregate": {
+      "tool_message_count": 22,
+      "exact_tool_content_utf8_bytes": 39760,
+      "detector_findings_by_category": {
+        "repeated_tool_output": 7,
+        "superseded_same_source_read": 1
+      },
+      "detector_finding_count": 8,
+      "unique_candidate_count": 8,
+      "detector_reported_local_estimate_tokens": 5504
+    }
+  }
+}
