@@ -299,7 +299,58 @@ export function censusRequestInput(
       add(path, value, "unclassified", "malformed_tools", "unknown", "unclassified");
       return;
     }
-    value.forEach((tool, index) => add(pathIndex(path, index), tool, "tool_definition", "tool_definition", "included"));
+    value.forEach((tool, index) => addToolDefinition(pathIndex(path, index), tool));
+  };
+
+  const addToolDefinition = (path: string, tool: unknown): void => {
+    if (!isRecord(tool)) {
+      add(path, tool, "unclassified", "malformed_tool_definition", "unknown", "unclassified");
+      return;
+    }
+    const deferred = tool.defer_loading;
+    if (deferred !== undefined && typeof deferred !== "boolean") {
+      add(path, tool, "unclassified", "invalid_tool_defer_loading", "unknown", "unclassified");
+      return;
+    }
+    add(
+      path,
+      tool,
+      "tool_definition",
+      deferred === true ? "tool_definition_deferred" : "tool_definition_direct",
+      "included"
+    );
+  };
+
+  const addAdditionalTools = (path: string, item: Record<string, unknown>): void => {
+    if (!isStrictAdditionalTools(item)) {
+      add(path, item, "unclassified", "malformed_additional_tools", "unknown", "unclassified");
+      return;
+    }
+    addControl(pathKey(path, "type"), item.type, "item_type");
+    addControl(pathKey(path, "role"), item.role, "role");
+    if ("id" in item) addControl(pathKey(path, "id"), item.id, "tool_definition_metadata");
+    item.tools.forEach((tool, index) => {
+      const toolPath = pathIndex(pathKey(path, "tools"), index);
+      add(pathKey(toolPath, "type"), tool.type, "tool_definition", "tool_namespace_type", "included");
+      add(pathKey(toolPath, "name"), tool.name, "tool_definition", "tool_namespace_name", "included");
+      if (tool.description !== undefined) {
+        add(pathKey(toolPath, "description"), tool.description, "tool_definition", "tool_namespace_description", "included");
+      }
+      tool.tools.forEach((nested, nestedIndex) =>
+        addToolDefinition(pathIndex(pathKey(toolPath, "tools"), nestedIndex), nested)
+      );
+    });
+  };
+
+  const addToolSearchOutput = (path: string, item: Record<string, unknown>): void => {
+    if (!isStrictToolSearchOutput(item)) {
+      add(path, item, "unclassified", "malformed_tool_search_output", "unknown", "unclassified");
+      return;
+    }
+    for (const key of ["type", "execution", "status", "call_id", "id", "internal_chat_message_metadata_passthrough"] as const) {
+      if (key in item) addControl(pathKey(path, key), item[key], key === "type" ? "item_type" : "tool_result_metadata");
+    }
+    add(pathKey(path, "tools"), item.tools, "tool_result", "tool_search_result", "included");
   };
 
   const addControl = (path: string, value: unknown, type = "control"): void =>
@@ -332,7 +383,18 @@ export function censusRequestInput(
       if (typeof parsed.input === "string") addText("$.input", parsed.input, "user");
       else if (Array.isArray(parsed.input)) {
         parsed.input.forEach((item, index) =>
-          censusResponsesItem(item, pathIndex("$.input", index), add, addContent, addText, addControl, addToolCall, addToolResultBlock)
+          censusResponsesItem(
+            item,
+            pathIndex("$.input", index),
+            add,
+            addContent,
+            addText,
+            addControl,
+            addToolCall,
+            addToolResultBlock,
+            addAdditionalTools,
+            addToolSearchOutput
+          )
         );
       } else add("$.input", parsed.input, "unclassified", "malformed_input", "unknown", "unclassified");
     }
@@ -434,7 +496,9 @@ function censusResponsesItem(
   addText: (path: string, value: unknown, role: string) => void,
   addControl: (path: string, value: unknown, type?: string) => void,
   addToolCall: (path: string, value: unknown, type: string) => void,
-  addToolResultBlock: (path: string, block: Record<string, unknown>, contentKey: "content" | "output") => void
+  addToolResultBlock: (path: string, block: Record<string, unknown>, contentKey: "content" | "output") => void,
+  addAdditionalTools: (path: string, item: Record<string, unknown>) => void,
+  addToolSearchOutput: (path: string, item: Record<string, unknown>) => void
 ): void {
   if (!isRecord(item) || typeof item.type !== "string") {
     add(path, item, "unclassified", "malformed_input_item", "unknown", "unclassified");
@@ -458,6 +522,10 @@ function censusResponsesItem(
     addToolCall(path, item, item.type);
   } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
     addToolResultBlock(path, item, "output");
+  } else if (item.type === "additional_tools") {
+    addAdditionalTools(path, item);
+  } else if (item.type === "tool_search_output") {
+    addToolSearchOutput(path, item);
   } else if (MEDIA_TYPES.has(item.type) || item.type.startsWith("server_")) {
     add(path, item, "opaque_nontext", item.type.startsWith("server_") ? "server_reference" : item.type, "included", "opaque");
   } else if (item.type === "input_text") {
@@ -494,6 +562,94 @@ const TOOL_CALL_TYPES = new Set([
   "web_search_call",
   "tool_search_call",
   "image_generation_call"
+]);
+
+type StrictNamespaceLeafTool = Record<string, unknown> & {
+  type: "custom" | "function";
+  name: string;
+};
+
+type StrictDynamicNamespaceTool = Record<string, unknown> & {
+  type: "namespace";
+  name: string;
+  description?: string;
+  tools: StrictNamespaceLeafTool[];
+};
+
+type StrictAdditionalTools = Record<string, unknown> & {
+  type: "additional_tools";
+  id?: string | null;
+  role: "developer";
+  tools: StrictDynamicNamespaceTool[];
+};
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function isStrictNamespaceLeafTool(value: unknown): value is StrictNamespaceLeafTool {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, NAMESPACE_LEAF_KEYS) &&
+    (value.type === "custom" || value.type === "function") &&
+    typeof value.name === "string"
+  );
+}
+
+function isStrictDynamicNamespaceTool(value: unknown): value is StrictDynamicNamespaceTool {
+  if (!isRecord(value) || !hasOnlyKeys(value, NAMESPACE_TOOL_KEYS)) return false;
+  return (
+    value.type === "namespace" &&
+    typeof value.name === "string" &&
+    (value.description === undefined || typeof value.description === "string") &&
+    Array.isArray(value.tools) &&
+    value.tools.every(isStrictNamespaceLeafTool)
+  );
+}
+
+function isStrictAdditionalTools(value: Record<string, unknown>): value is StrictAdditionalTools {
+  return (
+    hasOnlyKeys(value, ADDITIONAL_TOOLS_KEYS) &&
+    value.type === "additional_tools" &&
+    (value.id === undefined || value.id === null || typeof value.id === "string") &&
+    value.role === "developer" &&
+    Array.isArray(value.tools) &&
+    value.tools.every(isStrictDynamicNamespaceTool)
+  );
+}
+
+function isStrictToolSearchOutput(value: Record<string, unknown>): value is Record<string, unknown> & {
+  type: "tool_search_output";
+  execution: string;
+  status: string;
+  tools: unknown[];
+} {
+  if (!hasOnlyKeys(value, TOOL_SEARCH_OUTPUT_KEYS)) return false;
+  if (value.type !== "tool_search_output" || typeof value.execution !== "string" || typeof value.status !== "string") {
+    return false;
+  }
+  if (!Array.isArray(value.tools)) return false;
+  for (const key of ["call_id", "id"] as const) {
+    if (key in value && value[key] !== null && typeof value[key] !== "string") return false;
+  }
+  return (
+    !("internal_chat_message_metadata_passthrough" in value) ||
+    value.internal_chat_message_metadata_passthrough === null ||
+    isRecord(value.internal_chat_message_metadata_passthrough)
+  );
+}
+
+const NAMESPACE_TOOL_KEYS = new Set(["type", "name", "description", "tools"]);
+const NAMESPACE_LEAF_KEYS = new Set(["type", "name"]);
+const ADDITIONAL_TOOLS_KEYS = new Set(["type", "id", "role", "tools"]);
+const TOOL_SEARCH_OUTPUT_KEYS = new Set([
+  "type",
+  "execution",
+  "status",
+  "tools",
+  "call_id",
+  "id",
+  "internal_chat_message_metadata_passthrough"
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -1,0 +1,30 @@
+{
+  "tools": [
+    { "type": "function", "name": "direct_missing", "description": "Direct 🌍", "parameters": { "type": "object" } },
+    { "type": "function", "name": "direct_false", "description": "Direct false", "parameters": { "type": "object" }, "defer_loading": false },
+    { "type": "function", "name": "deferred", "description": "Deferred", "parameters": { "type": "object" }, "defer_loading": true }
+  ],
+  "input": [
+    {
+      "type": "additional_tools",
+      "id": "additional_tools_1",
+      "role": "developer",
+      "tools": [
+        {
+          "type": "namespace",
+          "name": "workspace_☕",
+          "tools": [
+            { "type": "custom", "name": "exec_🌍" },
+            { "type": "function", "name": "wait" }
+          ]
+        }
+      ]
+    },
+    {
+      "type": "tool_search_output",
+      "execution": "search workspace",
+      "status": "completed",
+      "tools": [{ "type": "function", "name": "read", "description": "Read café ☕", "parameters": { "type": "object" } }]
+    }
+  ]
+}
