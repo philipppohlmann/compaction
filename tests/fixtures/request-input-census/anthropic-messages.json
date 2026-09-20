@@ -1,0 +1,11 @@
+{
+  "model": "claude-test",
+  "max_tokens": 64,
+  "system": [{ "type": "text", "text": "Follow the request." }],
+  "tools": [{ "name": "lookup", "description": "Look up a value", "input_schema": { "type": "object" } }],
+  "messages": [
+    { "role": "user", "content": [{ "type": "text", "text": "Earlier question" }] },
+    { "role": "assistant", "content": [{ "type": "tool_use", "id": "call_1", "name": "lookup", "input": { "key": "alpha" } }] },
+    { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "call_1", "content": [{ "type": "text", "text": "nested result" }] }, { "type": "text", "text": "Current question 🌍" }] }
+  ]
+}

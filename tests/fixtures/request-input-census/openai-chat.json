@@ -1,0 +1,11 @@
+{
+  "model": "test-model",
+  "messages": [
+    { "role": "developer", "content": "Be concise." },
+    { "role": "user", "content": "Question" },
+    { "role": "assistant", "content": null, "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": "lookup", "arguments": "{\"key\":\"alpha\"}" } }] },
+    { "role": "tool", "tool_call_id": "call_1", "content": "Result" }
+  ],
+  "tools": [{ "type": "function", "function": { "name": "lookup", "parameters": { "type": "object" } } }],
+  "stream": true
+}

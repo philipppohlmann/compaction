@@ -1,0 +1,9 @@
+{
+  "input": [
+    {
+      "type": "custom_tool_call_output",
+      "call_id": "custom_call_1",
+      "output": "custom tool result"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "input": [
+    {
+      "type": "function_call_output",
+      "call_id": "call_opaque",
+      "output": [
+        { "type": "output_text", "text": "visible result" },
+        { "type": "input_image", "image_url": "synthetic://opaque-image" }
+      ]
+    },
+    { "type": "reasoning", "encrypted_content": "synthetic-ciphertext" }
+  ]
+}

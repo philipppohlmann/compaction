@@ -1,0 +1,11 @@
+{
+  "model": "test-model",
+  "instructions": "Use the available tool.",
+  "input": [
+    { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "Find alpha" }] },
+    { "type": "function_call", "call_id": "call_1", "name": "lookup", "arguments": "{\"key\":\"alpha\"}" },
+    { "type": "function_call_output", "call_id": "call_1", "output": [{ "type": "output_text", "text": "Found" }] }
+  ],
+  "tools": [{ "type": "function", "name": "lookup", "parameters": { "type": "object" } }],
+  "store": false
+}
