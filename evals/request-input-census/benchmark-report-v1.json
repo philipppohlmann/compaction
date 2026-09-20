@@ -1,0 +1,607 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "request-input-census-reproducibility-v1",
+  "evidence_type": "synthetic_fixture",
+  "cases": [
+    {
+      "case_id": "anthropic_messages",
+      "protocol": "anthropic-messages",
+      "parsed": true,
+      "measurement_basis": "canonical_component_values_v1",
+      "raw_request_source": {
+        "utf8_bytes": 655,
+        "unicode_code_points": 652
+      },
+      "canonical_component_values": {
+        "utf8_bytes": 287,
+        "unicode_code_points": 284
+      },
+      "category_totals": {
+        "instructions": {
+          "utf8_bytes": 19,
+          "unicode_code_points": 19
+        },
+        "conversation": {
+          "utf8_bytes": 37,
+          "unicode_code_points": 34
+        },
+        "active_input": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_definition": {
+          "utf8_bytes": 82,
+          "unicode_code_points": 82
+        },
+        "tool_call": {
+          "utf8_bytes": 73,
+          "unicode_code_points": 73
+        },
+        "tool_result": {
+          "utf8_bytes": 13,
+          "unicode_code_points": 13
+        },
+        "other_prompt": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "opaque_nontext": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "transport_control": {
+          "utf8_bytes": 63,
+          "unicode_code_points": 63
+        },
+        "unclassified": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "disposition_totals": {
+        "included": {
+          "utf8_bytes": 224,
+          "unicode_code_points": 221
+        },
+        "excluded": {
+          "utf8_bytes": 63,
+          "unicode_code_points": 63
+        },
+        "unknown": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "local_estimate": {
+        "tokens": 56,
+        "estimator": "unicode-code-points-div-4-v1",
+        "covered_code_points": 221,
+        "eligible_code_points": 221,
+        "coverage": 1
+      },
+      "native_discovery": {
+        "direct": {
+          "utf8_bytes": 82,
+          "unicode_code_points": 82
+        },
+        "deferred": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "namespace": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "discovered": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "scope_total": {
+          "utf8_bytes": 82,
+          "unicode_code_points": 82
+        }
+      },
+      "partition_status": "closed"
+    },
+    {
+      "case_id": "openai_chat",
+      "protocol": "openai-chat",
+      "parsed": true,
+      "measurement_basis": "canonical_component_values_v1",
+      "raw_request_source": {
+        "utf8_bytes": 518,
+        "unicode_code_points": 518
+      },
+      "canonical_component_values": {
+        "utf8_bytes": 250,
+        "unicode_code_points": 250
+      },
+      "category_totals": {
+        "instructions": {
+          "utf8_bytes": 11,
+          "unicode_code_points": 11
+        },
+        "conversation": {
+          "utf8_bytes": 8,
+          "unicode_code_points": 8
+        },
+        "active_input": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_definition": {
+          "utf8_bytes": 79,
+          "unicode_code_points": 79
+        },
+        "tool_call": {
+          "utf8_bytes": 96,
+          "unicode_code_points": 96
+        },
+        "tool_result": {
+          "utf8_bytes": 6,
+          "unicode_code_points": 6
+        },
+        "other_prompt": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "opaque_nontext": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "transport_control": {
+          "utf8_bytes": 50,
+          "unicode_code_points": 50
+        },
+        "unclassified": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "disposition_totals": {
+        "included": {
+          "utf8_bytes": 200,
+          "unicode_code_points": 200
+        },
+        "excluded": {
+          "utf8_bytes": 50,
+          "unicode_code_points": 50
+        },
+        "unknown": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "local_estimate": {
+        "tokens": 51,
+        "estimator": "unicode-code-points-div-4-v1",
+        "covered_code_points": 200,
+        "eligible_code_points": 200,
+        "coverage": 1
+      },
+      "native_discovery": {
+        "direct": {
+          "utf8_bytes": 79,
+          "unicode_code_points": 79
+        },
+        "deferred": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "namespace": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "discovered": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "scope_total": {
+          "utf8_bytes": 79,
+          "unicode_code_points": 79
+        }
+      },
+      "partition_status": "closed"
+    },
+    {
+      "case_id": "openai_responses",
+      "protocol": "openai-responses",
+      "parsed": true,
+      "measurement_basis": "canonical_component_values_v1",
+      "raw_request_source": {
+        "utf8_bytes": 528,
+        "unicode_code_points": 528
+      },
+      "canonical_component_values": {
+        "utf8_bytes": 270,
+        "unicode_code_points": 270
+      },
+      "category_totals": {
+        "instructions": {
+          "utf8_bytes": 23,
+          "unicode_code_points": 23
+        },
+        "conversation": {
+          "utf8_bytes": 10,
+          "unicode_code_points": 10
+        },
+        "active_input": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_definition": {
+          "utf8_bytes": 66,
+          "unicode_code_points": 66
+        },
+        "tool_call": {
+          "utf8_bytes": 93,
+          "unicode_code_points": 93
+        },
+        "tool_result": {
+          "utf8_bytes": 5,
+          "unicode_code_points": 5
+        },
+        "other_prompt": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "opaque_nontext": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "transport_control": {
+          "utf8_bytes": 73,
+          "unicode_code_points": 73
+        },
+        "unclassified": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "disposition_totals": {
+        "included": {
+          "utf8_bytes": 197,
+          "unicode_code_points": 197
+        },
+        "excluded": {
+          "utf8_bytes": 73,
+          "unicode_code_points": 73
+        },
+        "unknown": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "local_estimate": {
+        "tokens": 50,
+        "estimator": "unicode-code-points-div-4-v1",
+        "covered_code_points": 197,
+        "eligible_code_points": 197,
+        "coverage": 1
+      },
+      "native_discovery": {
+        "direct": {
+          "utf8_bytes": 66,
+          "unicode_code_points": 66
+        },
+        "deferred": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "namespace": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "discovered": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "scope_total": {
+          "utf8_bytes": 66,
+          "unicode_code_points": 66
+        }
+      },
+      "partition_status": "closed"
+    },
+    {
+      "case_id": "openai_responses_custom_tool_output",
+      "protocol": "openai-responses",
+      "parsed": true,
+      "measurement_basis": "canonical_component_values_v1",
+      "raw_request_source": {
+        "utf8_bytes": 145,
+        "unicode_code_points": 145
+      },
+      "canonical_component_values": {
+        "utf8_bytes": 54,
+        "unicode_code_points": 54
+      },
+      "category_totals": {
+        "instructions": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "conversation": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "active_input": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_definition": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_call": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_result": {
+          "utf8_bytes": 18,
+          "unicode_code_points": 18
+        },
+        "other_prompt": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "opaque_nontext": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "transport_control": {
+          "utf8_bytes": 36,
+          "unicode_code_points": 36
+        },
+        "unclassified": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "disposition_totals": {
+        "included": {
+          "utf8_bytes": 18,
+          "unicode_code_points": 18
+        },
+        "excluded": {
+          "utf8_bytes": 36,
+          "unicode_code_points": 36
+        },
+        "unknown": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "local_estimate": {
+        "tokens": 5,
+        "estimator": "unicode-code-points-div-4-v1",
+        "covered_code_points": 18,
+        "eligible_code_points": 18,
+        "coverage": 1
+      },
+      "native_discovery": {
+        "direct": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "deferred": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "namespace": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "discovered": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "scope_total": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "partition_status": "closed"
+    },
+    {
+      "case_id": "openai_responses_native_discovery",
+      "protocol": "openai-responses",
+      "parsed": true,
+      "measurement_basis": "canonical_component_values_v1",
+      "raw_request_source": {
+        "utf8_bytes": 1034,
+        "unicode_code_points": 1023
+      },
+      "canonical_component_values": {
+        "utf8_bytes": 613,
+        "unicode_code_points": 602
+      },
+      "category_totals": {
+        "instructions": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "conversation": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "active_input": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_definition": {
+          "utf8_bytes": 430,
+          "unicode_code_points": 422
+        },
+        "tool_call": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_result": {
+          "utf8_bytes": 97,
+          "unicode_code_points": 94
+        },
+        "other_prompt": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "opaque_nontext": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "transport_control": {
+          "utf8_bytes": 86,
+          "unicode_code_points": 86
+        },
+        "unclassified": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "disposition_totals": {
+        "included": {
+          "utf8_bytes": 527,
+          "unicode_code_points": 516
+        },
+        "excluded": {
+          "utf8_bytes": 86,
+          "unicode_code_points": 86
+        },
+        "unknown": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "local_estimate": {
+        "tokens": 130,
+        "estimator": "unicode-code-points-div-4-v1",
+        "covered_code_points": 516,
+        "eligible_code_points": 516,
+        "coverage": 1
+      },
+      "native_discovery": {
+        "direct": {
+          "utf8_bytes": 294,
+          "unicode_code_points": 288
+        },
+        "deferred": {
+          "utf8_bytes": 114,
+          "unicode_code_points": 114
+        },
+        "namespace": {
+          "utf8_bytes": 22,
+          "unicode_code_points": 20
+        },
+        "discovered": {
+          "utf8_bytes": 97,
+          "unicode_code_points": 94
+        },
+        "scope_total": {
+          "utf8_bytes": 527,
+          "unicode_code_points": 516
+        }
+      },
+      "partition_status": "closed"
+    },
+    {
+      "case_id": "openai_responses_opaque_result",
+      "protocol": "openai-responses",
+      "parsed": true,
+      "measurement_basis": "canonical_component_values_v1",
+      "raw_request_source": {
+        "utf8_bytes": 339,
+        "unicode_code_points": 339
+      },
+      "canonical_component_values": {
+        "utf8_bytes": 180,
+        "unicode_code_points": 180
+      },
+      "category_totals": {
+        "instructions": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "conversation": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "active_input": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_definition": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_call": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "tool_result": {
+          "utf8_bytes": 14,
+          "unicode_code_points": 14
+        },
+        "other_prompt": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "opaque_nontext": {
+          "utf8_bytes": 61,
+          "unicode_code_points": 61
+        },
+        "transport_control": {
+          "utf8_bytes": 42,
+          "unicode_code_points": 42
+        },
+        "unclassified": {
+          "utf8_bytes": 63,
+          "unicode_code_points": 63
+        }
+      },
+      "disposition_totals": {
+        "included": {
+          "utf8_bytes": 75,
+          "unicode_code_points": 75
+        },
+        "excluded": {
+          "utf8_bytes": 42,
+          "unicode_code_points": 42
+        },
+        "unknown": {
+          "utf8_bytes": 63,
+          "unicode_code_points": 63
+        }
+      },
+      "local_estimate": {
+        "tokens": 4,
+        "estimator": "unicode-code-points-div-4-v1",
+        "covered_code_points": 14,
+        "eligible_code_points": 138,
+        "coverage": 0.10144927536231885
+      },
+      "native_discovery": {
+        "direct": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "deferred": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "namespace": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "discovered": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        },
+        "scope_total": {
+          "utf8_bytes": 0,
+          "unicode_code_points": 0
+        }
+      },
+      "partition_status": "closed"
+    }
+  ]
+}
