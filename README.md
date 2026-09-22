@@ -1,34 +1,36 @@
 <div align="center">
 
-<!-- Banner hosted on the public R2 bucket so it renders on GitHub AND the npm package page (absolute URL; source file kept at docs/assets/brand/readme-soul.png, mirror-included). -->
+<!-- Banner hosted on the public R2 bucket so it renders on GitHub AND the npm package page. -->
 <img src="https://pub-cf9336d86d8140a5aaefd7412832adf7.r2.dev/brand/readme-soul.png" alt="Compaction" width="720" />
 
-### The local optimization layer for AI coding agents.
-
-Local token optimization, content-free receipts, and no prompt or code telemetry to Compaction.
+# Make coding agents resend less
 
 [![npm version](https://img.shields.io/npm/v/@compaction/cli)](https://www.npmjs.com/package/@compaction/cli)
 [![license: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-![updated August 2026](https://img.shields.io/badge/updated-August%202026-informational)
 
 [Install](#install) · [How it works](#how-it-works) · [What you get](#what-you-get) ·
-[Supported tools](#supported-tools) · [Contributing](#contributing) ·
+[Proof](#proof) · [Supported tools](#supported-tools) · [Plans](#open-and-community-plans) ·
 [Privacy](#privacy-and-security)
 
 </div>
 
 ---
 
-Compaction connects to **Claude Code, Codex, and Cursor** and optimizes eligible model calls from your
-own machine. Output shaping starts with the first eligible turn. Community adds model-visible input
-compaction on supported routes.
+**Compaction runs underneath Claude Code, Codex, and Cursor. No new editor. No new agent.**
 
-**Install once. Keep using Codex, Claude Code or Cursor normally.**
+It reduces eligible model visible input before it reaches the provider, shape unnecessary output before generation, and show the result inside the tools you already use.
 
-**Compaction makes your context and subscription go further. Runs locally. No prompt or code
-telemetry.**
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/compaction-terminal-dark.gif">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/compaction-terminal-light.gif">
+  <img
+    src="docs/assets/brand/compaction-terminal-light.gif"
+    alt="Compaction running locally with Codex and showing measured token reduction"
+    width="100%"
+  >
+</picture>
 
-This is a real Community acceptance run through a normal Codex ChatGPT-subscription session:
+This is a real acceptance run through a normal Codex subscription session:
 
 ```text
 $ codex
@@ -36,27 +38,13 @@ $ codex
 ↳ compaction · input 8,388,356→7,212,095 (−14%) · output 14,393→10,795 (−25%, est.) · +~3.08m · full apply
 ```
 
-The input arrow is measured apply evidence. The output before-value is an empirically calibrated
-counterfactual, so it remains marked `est.`. `+~3.08m` is estimated equivalent active-agent time
-preserved at the observed workload consumption rate, not a claim about a provider's hidden quota or
-rate-limit formula.
+The input arrow is measured before→after evidence. The output before value is a calibrated counterfactual, so it stays marked `est.`. `+~3.08m` is the estimated equivalent active agent time preserved at the observed workload consumption rate. This is not a claim about a provider's hidden quota or rate limit formula.
 
-- **Output shaping from the first eligible turn.** Compaction attaches the shipped policy before
-  generation, with no account required. A numerical output estimate appears only when applicable
-  empirical calibration exists; otherwise the result reports `output N/A→ACTUAL (N/A%, est.)`.
-- **~48-50% less billed input on uncached API sessions**, ~5-10% on cached sessions (real gateway
-  E2E, provider-reported). This runs in the adaptive engine, on the routed integrations that support
-  it (see [Supported tools](#supported-tools)). Community installs the engine for you.
+- **Output reduction is applied from the first eligible run.** No account required
+- **Input reduction is separately supported with a free account.** We have validated ~48–50% less billed input on uncached API sessions and ~5–10% on cached sessions (provider reported)
+- **Local by default.** Compaction processes request content on your machine and sends it only to the provider you already use. It does not upload prompts, code, or responses to any outside service, and never reads, stores, or logs your provider key
 
-Observed per-run counts come from content-free receipts. Input reductions use measured model-visible
-before/after states; output before-values are counterfactual estimates and appear only when applicable
-empirical calibration exists.
-
-Compaction processes request content locally and forwards it only to the provider you selected. It
-does not send prompts, code, or responses to Compaction services, and it never reads, stores, or logs
-your provider key.
-
-⭐ **If Compaction saves you tokens, star the repo.**
+⭐ **If Compaction saves you tokens, please star the repo.**
 
 ## Install
 
@@ -64,182 +52,139 @@ your provider key.
 curl -fsSL https://cli.compaction.dev/install | sh
 ```
 
-Then run `compaction` for guided onboarding. The installed binary is `compaction`; sanity-check with
-`compaction --version`.
-
-The hosted installer is served as `text/plain`. It verifies public npm packages and creates a
-user-writable managed launcher on macOS and Linux, without `sudo` or telemetry. Managed installs
-check public npm about daily and stage verified updates for a safe next session. An eligible account
-may also acquire the signed engine after accepting its exact EULA. Failures leave the active release selected.
+Then run:
 
 ```bash
-curl -fsSL https://cli.compaction.dev/install | less                 # read it first
-curl -fsSL https://cli.compaction.dev/install | sh -s -- --dry-run   # preview, install nothing
+compaction
 ```
 
-Or use npm directly:
+Guided onboarding detects Claude Code, Codex, and Cursor, shows what will change, and writes nothing until you confirm.
+
+Or install from npm:
 
 ```bash
-npm install -g @compaction/cli   # then: compaction
-npx @compaction/cli init         # no global install
-npx @compaction/cli --help       # no install at all
+npm install -g @compaction/cli
+compaction
 ```
 
-Use `compaction update --check`, `compaction update`, or `compaction update --rollback` to inspect,
-stage, or restore a verified pair. `--channel preview` selects npm's `next` tag; stable uses `latest`.
-Opt out with `compaction update --auto off` or `COMPACTION_AUTO_UPDATE=0`. Exact-version installs
-start pinned with automatic updates off. Direct npm/npx/source installs do not self-update; use their
-owning package manager. Installations predating this updater need one explicit upgrade or installer rerun.
+Supported persistent installs use managed updates to keep your version up to date.
 
-Local-first and file-based, with **no prompt or code telemetry**. Without an account, Compaction-service
-requests are absent; installation and update checks use public npm alongside your own provider traffic. With a free
-account, the client also exchanges content-free records with our service (see
-[Privacy](#privacy-and-security)).
+<details>
+<summary><strong>Other install and update paths</strong></summary>
+
+```bash
+curl -fsSL https://cli.compaction.dev/install | less
+curl -fsSL https://cli.compaction.dev/install | sh -s -- --dry-run
+
+npx @compaction/cli init
+npx @compaction/cli --help
+
+compaction update --check
+compaction update
+compaction update --rollback
+```
+
+`--channel preview` selects npm's `next` tag; stable uses `latest`. Opt out with `compaction update --auto off` or `COMPACTION_AUTO_UPDATE=0`.
+
+</details>
 
 ## How it works
 
-1. **Install once.** See [Install](#install), then run `compaction`.
-2. **Connect your tools.** Guided onboarding detects Claude Code, Codex, and Cursor and preselects
-   every detected supported tool. Detection is read-only: you can deselect any tool, and explicit
-   confirmation is the first write. Manual connections use names: `compaction init --connect claude-code`,
-   `--connect codex`, `--connect cursor`, or `--connect all`. Everything is reversible:
-   `compaction init --disconnect claude-code|codex|cursor` removes a connection, and
-   `compaction hooks uninstall --tool <tool>` removes only Compaction's own hooks.
-3. **Keep working exactly as before.** `claude`, `codex`, and Cursor run unchanged. Output shaping
-   is active from the first eligible turn wherever the connected integration exposes a shaping seam.
-   Live-history input compaction runs in the adaptive engine on the routed integrations that support
-   it (see [Supported tools](#supported-tools)). Tool connection and plan entitlement are separate:
-   upgrading this account/device from Open to Community does not reconnect or reinstall an already
-   ready tool, while a tool you left unconnected remains untouched.
-4. **Instrumented calls write a content-free receipt.** Token and cache counts plus structural
-   labels, never your prompt, your code, or the response. Local-only, gitignored. Gateway traffic,
-   Claude Code, and Codex are instrumented; Cursor shapes before generation and its turns surface at
-   session level.
-5. **Watch it happen.** `compaction watch` prints each turn's line the moment it lands, live, until
-   you stop it. It covers anything routed through the local Gateway, so one surface covers Claude
-   Code and Codex alike. `compaction watch --once` prints the last few and exits.
-6. **See the rollup.** `compaction status` shows your connected tools, gateway health, receipts,
-   measured reductions, and the exact next command. Share it content-free with
-   `compaction api export --json`.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/compaction-local-architecture-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/compaction-local-architecture-light.svg">
+  <img
+    src="docs/assets/brand/compaction-local-architecture-light.svg"
+    alt="Claude Code, Codex, and Cursor connect to Compaction on your machine. Compaction handles input, output, measurement, and recovery before the request goes directly to your provider."
+    width="100%"
+  >
+</picture>
+
+1. **Install once.** Run `compaction`
+2. **Connect your tools.** Detection is read-only; confirmation is the first write
+3. **Keep working exactly as before.** `claude`, `codex`, and Cursor continue to be the tools you use
+4. **Compaction optimizes locally.** Output reduction starts on eligible runs. Live history input compaction is supported with a free account
+5. **Compaction writes content free receipts.** Token/cache counts and structural labels only, never your prompt, code, or response
+6. **You can inspect the result live or later.**
+   - `compaction watch` follows new measurable turns live; `--once` shows the latest few and exits.
+   - `compaction activity` shows recent run history from the local metrics-only activity store, with filters and JSON output.
+   - `compaction status` shows setup/readiness state and includes a small recent-turn summary.
 
 ### Two ways to connect
 
-**API key, through the local Gateway.** Your tool's traffic routes through a local reverse proxy on
-your machine, with provider-reported token counts on every receipt. Output shaping reaches this route
-through your tool's own hook, the same as on a subscription. The Gateway's own shaping and hybrid
-live-history input compaction both ride the adaptive engine's apply path, which Community installs.
-Your key rides straight through to your provider and is never read, stored, or logged.
+**Subscription.** No API key needed. Claude Code and Codex keep using the subscription you already pay for. On supported runs, subscription sessions can use both input reduction and output reduction.
 
-**Subscription (Claude/ChatGPT plan), through native tool integration.** No API key needed.
-Compaction installs the tool's hook and attaches the shipped shaping policy before eligible
-generations. On **Claude Code and Codex**, subscription sessions also reach hybrid input compaction:
-`claude` and `codex` run through Compaction's transparent local routes, and a verified Community
-entitlement, not an API key, activates the apply path. These routes have been live-proven on Claude
-Max and ChatGPT subscriptions.
+**API-key.** Traffic goes through the local Gateway. Your key rides straight through to your provider and is never read, stored, or logged by Compaction.
 
-**Current behavior.** Output shaping is on by default once a tool is connected. Kill switches:
-`COMPACTION_SHAPING_HOOKS=0`, `compaction stop` (persisted, reversed by `compaction start`), or
-`compaction hooks uninstall --tool <tool>`. Gateway input compaction (apply) is explicit and gated:
-it runs only under an authorization you grant at onboarding, unsupported request shapes pass through
-unchanged, and the original request is always retained locally, recoverable byte-for-byte with
-`compaction gateway recover <id>`.
+Output shaping is on by default once a tool is connected. Input compaction is explicit and gated. Unsupported request shapes pass through unchanged, and the original request is retained locally for byte exact recovery.
 
 ## What you get
 
-- **Output shaping, on by default.** The shipped policy is attached before generation from the first
-  eligible turn. Where per-turn classification is available, planning and reasoning turns are held;
-  that turn-aware selection ships in both Open and Community. Eligibility follows the current
-  validated policy; calibration changes only whether output impact can be quantified. With applicable
-  empirical calibration the result may show `output ESTIMATED_BEFORE→ACTUAL (−N%, est.)`; without it
-  the result shows `output N/A→ACTUAL (N/A%, est.)`. Kill switch:
-  `COMPACTION_SHAPING_HOOKS=0`.
-- **Hybrid input compaction on supported routes, with Community.** Live session history is compacted
-  before it is re-sent: ~48-50% less billed input on uncached API sessions, ~5-10% on cached sessions
-  (provider-reported). The code that produces those numbers is the adaptive engine, delivered
-  separately from npm and installed when you activate Community (see
-  [The Hybrid Engine](#the-hybrid-engine)). A Community account includes a per-period allowance for
-  input compaction on every supported route. It pays for use of the engine, not for the billing route
-  your provider traffic takes. **Output shaping is never metered**, on any route. When the allowance
-  is spent, input optimization pauses, output shaping carries on, and your requests keep going
-  through. `compaction usage` shows where you stand.
-- **A content-free receipt for every instrumented call.** Counts and structural labels only, never
-  your prompt, your code, or the response. Receipts live in `.compaction/gateway/receipts.jsonl` on
-  your machine (gitignored, never uploaded). Gateway traffic, Claude Code, and Codex are
-  instrumented; Cursor's hook-shaped turns are recorded at session level.
-- **One rollup.** `compaction status` shows connected tools, requests observed, measured reductions,
-  and the exact next command. Figures are labeled by source (provider-reported or local estimate),
-  and a number is shown only at the strength the evidence supports.
+- **Output token reduction.** Compaction attaches the shaping policy before eligible generation. If applicable calibration exists, it shows `output ESTIMATED_BEFORE→ACTUAL (−N%, est.)`; otherwise we show `output N/A→ACTUAL (N/A%, est.)`
+- **Input token reduction with a free account.** Compaction compresses eligible older history before it is re-sent on supported runs. Output reduction is never metered
+- **Content free receipts.** Counts, structural labels, sources, and a short receipt id; never your prompt, code, or response
+- **Byte exact recovery.** Every mutated request retains the original locally
+- **One product surface.** We keep the user facing model simple: input reduction, output reduction, and evidence
 
-### What you see, one line per turn
+## Proof
 
-On an instrumented turn Compaction prints one content-free line: counts, labels, and a short receipt
-id. Never your prompt, your code, or the response.
+Compaction only shows a number when it has evidence for it.
 
-Capability decides which axes exist. Route decides whether a reduction can be priced. The three lines
-below are the same real turn under three configurations, which is why they share a receipt id.
+### How Compaction reports savings
 
-Open shapes output. The input is counted but never changed, so the input axis is a plain observed
-count:
+What appears depends on what Compaction could actually measure on that run.
 
-```
+Compaction can reduce output tokens but does not change the input:
+
+```text
 compaction · observed input 91,472 · output 857→463 (−46%, est.) · basic shaping · id 5f539978
 ```
 
-Community adds input compaction. The input axis becomes a real before→after, the label says what ran,
-and the line carries what is left of the period's optimized-input allowance:
+Compaction can also reduce model-visible input:
 
-```
+```text
 compaction · input 91,472→74,769 (−18%) · output 857→463 (−46%, est.) · full apply · 1.92M/2M left · id 5f539978
 ```
 
-On an **API-key route** the provider bills per token at a published rate, so that same reduction can
-also be priced:
+On an API-key, where the provider bills at a published per token rate, Compaction can also show the estimated price impact:
 
-```
+```text
 compaction · input 91,472→74,769 (−18%) · output 857→463 (−46%, est.) · −$0.05 (list price) · full apply · 1.92M/2M left · id 5f539978
 ```
 
-Those last two are the same turn, same tier, same model, and only the route differs. A subscription
-route carries no dollar clause: a plan does not bill per token, so pricing its reduction at a list
-rate would be a number with no basis.
+We use a simple evidence rule:
 
-Community runs on a subscription route as readily as on an API key, live-proven on Claude Code with a
-Claude Max plan. An API-key route without Community prints the Open line, dollars or not.
+- **Input before→after is measured.** Both values exist for the same request
+- **Actual output is measured.**
+- **Output before is estimated.** The same generation cannot simultaneously happen with and without Compaction, so the counterfactual remains marked `est.`
+- **If Compaction cannot support a number with evidence, it is shown `N/A`.**
 
-The input arrow is the only unlabeled `−PP%` on the line, because both of its endpoints were
-measured. The output side has no per-turn counterfactual — the unshaped twin of that exact generation
-was never produced — so its reduction is always labeled an estimate. `est.` means the unshaped output
-and the saving derived from it are **inferred from applicable empirical calibration**, not observed
-for that generation. The actual output count beside it is always observed.
+For example:
 
-Where no calibration applies to a turn, nothing is inferred and the axis says so:
-
-```
+```text
 compaction · observed input 91,472 · output N/A→463 (N/A%, est.) · basic shaping · id 5f539978
 ```
 
-Shaping still ran on that turn — `basic shaping` says so — and `463` is the provider's own count. What
-is absent is any applicable calibration for what shaping removed, and the `N/A` is that absence stated
-rather than filled in. Compaction ships a starting rate for its own internal estimates, and
-deliberately does not spend it here: a percentage with no empirical basis behind it is not put on
-your turn.
+Here `463` is the observed output. Compaction still reduced the output, but there is no applicable calibration for how large the reduction was, so we leave the missing value missing.
 
-An axis that is not available says `N/A` rather than being faked or quietly dropped. There is no
-fabricated `−$0`, and no percentage on an axis that was not measured.
+Compaction surfaces the same result in the workflow where possible:
 
-`compaction watch` (live) and `compaction watch --once` (the last few turns) show the line for every
-instrumented turn, whichever tool produced it. It also renders inline on the Claude Code status line
-and in the Gateway's own log, and Compaction emits it through Codex's post-turn hook. Cursor has a
-post-turn hook but no channel to display through: its `stop` response schema carries only a follow-up
-prompt, not a message. Cursor's numbers surface in `compaction watch` and `compaction status`
-instead. Silence the line with `COMPACTION_RECEIPT_LINE=0`; receipts are still written either way.
+- **Claude Code:** status line
+- **Codex:** post turn hook
+- **All measurable turns:** `compaction watch`
+- **Recent run history:** `compaction activity`
+- **Setup and readiness:** `compaction status`
+
+`compaction watch` is the live result feed. `compaction activity` is the historical run view. `compaction status` is the setup/readiness view and only includes a small recent turn summary.
+
+Cursor to our knowledge does not currently expose an inline channel for this result, so its measurable results appear through Compaction's local views.
+
+Set `COMPACTION_RECEIPT_LINE=0` if you want to hide the inline result. Receipts are still written locally.
 
 ### What a receipt looks like
 
-*Illustrative receipt. Synthetic values in the real receipt schema, showing an account-enabled
-gateway call where the hybrid compacted a long session's history before forwarding. The before/after
-model-visible reduction is a local estimate; the `tokens` block is read from the provider's own usage
-metadata. Your numbers come from your own runs.*
+<details>
+<summary><strong>Illustrative receipt in the real schema</strong></summary>
 
 ```json
 {
@@ -262,149 +207,144 @@ metadata. Your numbers come from your own runs.*
 }
 ```
 
-The original request behind every mutated call is retained locally and restored byte-for-byte with
-`compaction gateway recover <id>`. Without the engine the same request is forwarded **unchanged**,
-and the receipt records that honestly: `request_mutated: false`, with the reason. Compaction never
-describes a pass-through as an apply.
+</details>
+
+The original request behind every mutated call is retained locally and can be restored byte-for-byte with:
+
+```bash
+compaction gateway recover <id>
+```
+
+Without the engine, the same request passes through unchanged. We never describe a pass-through as an apply.
 
 ## Supported tools
 
-| Tool | Route | Output shaping | Input optimization | Token counts |
-|---|---|---|---|---|
-| **Claude Code** | transparent local route (subscription or API key) | eligible per-prompt turns; planning/reasoning held | Community, on both routes, live-proven on a Claude Max subscription | provider-reported |
-| **Codex** | transparent local route (ChatGPT subscription) or gateway (API key) | eligible per-prompt turns; planning/reasoning held | Community, on both routes, live-proven on a ChatGPT subscription | provider-reported |
-| **Cursor** | session-level instruction | session-level shaping; no per-turn selection | not available (the tool exposes no per-call route) | local estimate |
+<table width="100%">
+  <thead>
+    <tr>
+      <th width="18%" align="left">Tool</th>
+      <th width="27%" align="left">Route</th>
+      <th width="20%" align="left">Output reduction</th>
+      <th width="25%" align="left">Input reduction</th>
+      <th width="10%" align="left">Counts</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Claude Code</strong></td>
+      <td>transparent local route · subscription or API key</td>
+      <td>eligible per-prompt turns</td>
+      <td>Community · both routes</td>
+      <td>provider-reported</td>
+    </tr>
+    <tr>
+      <td><strong>Codex</strong></td>
+      <td>transparent local route · ChatGPT subscription or API key</td>
+      <td>eligible per-prompt turns</td>
+      <td>Community · both routes</td>
+      <td>provider-reported</td>
+    </tr>
+    <tr>
+      <td><strong>Cursor</strong></td>
+      <td>session-level instruction</td>
+      <td>session-level</td>
+      <td>not available on the current integration</td>
+      <td>local estimate</td>
+    </tr>
+  </tbody>
+</table>
 
-Input optimization is metered against your Community allowance wherever it runs, on any supported
-route. Output shaping is never metered.
+Input reduction is metered against the Community allowance wherever it runs. Output reduction is never metered.
 
-Also supported for measurement: OpenAI Agents SDK capture and offline trace import
-(`compaction capture`, `compaction import`). Captured traces can contain local file content, so
-review a trace before sharing one.
+Also supported for measurement: OpenAI Agents SDK capture and offline trace import (`compaction capture`, `compaction import`).
 
-## The Hybrid Engine
+## Hybrid Engine
 
-The adaptive engine performs input optimization. It is delivered separately from npm: **nothing below
-is in this package**. Activating Community installs the signed release, and the client verifies its
-signature against a trust root compiled into this package before it will run it. The input side is a
-hybrid: deterministic protection first, an adaptive model second.
+The adaptive engine performs input optimization. It is delivered separately from npm and verified by the public client before use.
 
-- **Deterministic protection keeps the load-bearing content byte-exact.** Code blocks, commands, file
-  paths, flags, and `file:line` references are extracted and locked verbatim before anything else
-  runs. They are never summarized or paraphrased.
-- **The adaptive step summarizes only obsolete history.** Old tool output, superseded discussion, and
-  dead ends are compressed; the current task state is preserved.
-- **It runs on your device.** The model is provisioned locally. No cloud model, and no traffic
-  through a hosted middleman.
-- **The original is always retained.** Every compacted request is recoverable byte-for-byte, so
-  compaction is never destructive.
-- **Quality is eval-gated.** Compaction and shaping ship behind evals that hold response quality;
-  effects are task-dependent and always measured on your own receipts.
-
-## Open and Community
-
-**Open** is this repository, and it needs no account. The Apache-2.0 CLI and core: the CLI, the local
-Gateway, the native tool hooks for all three tools, output shaping, content-free receipts, the apply
-gates, and byte-exact recovery. All of it runs on your machine.
-
-**Community** is a free account, and it adds the input side. Activating it registers this device and
-installs the signed Hybrid Engine for you. Set it up from the CLI:
-
-```bash
-compaction login      # free Community account, 1 device
-compaction mode full  # adaptive input optimization + output shaping
-```
+- **We protect load bearing content first.** Code blocks, commands, file paths, flags, and `file:line` references are locked byte-exact before anything else runs
+- **We compact eligible obsolete history.** Old tool output, superseded discussion, and dead ends can be reduced while current task state is preserved
+- **It runs on your device.** No Compaction hosted model sits between your agent and the provider
+- **You keep the original.** Every compacted request is recoverable byte-for-byte
+- **Quality is eval gated.** Effects are task dependent and measured on your own receipts
 
 ## Commands
 
+The common commands:
+
 ```bash
-compaction                                       # guided onboarding: detect tools, connect, authorize
-compaction init                                  # the same onboarding, explicitly
-compaction init --connect claude-code             # connect one detected tool by name
-compaction init --connect codex
-compaction init --connect cursor
-compaction init --connect all                     # connect every detected supported tool
-compaction status                                # connected tools, gateway health, receipts rollup, next commands
-compaction watch                                 # live per-turn receipt lines, any tool through the Gateway
-compaction watch --once                          # the last few lines, then exit
-compaction mode                                  # show or set the optimization mode for this device
-compaction stop / compaction start               # turn Compaction off / back on (persisted, reversible)
-
-# Community:
-compaction login                                 # connect this device to a free Community account
-compaction usage                                 # this device's optimized-input allowance for the period
-compaction engine status                         # the installed engine and its verified state
-compaction devices                               # list or revoke registered devices
-compaction logout                                # revoke this device and delete local credentials
-
-# Native hooks (subscription path):
-compaction hooks install --tool codex            # native output-shaping hook (default-on; kill switch: COMPACTION_SHAPING_HOOKS=0)
-compaction hooks install --tool cursor           # session-level shaping for Cursor
-compaction hooks status                          # content-free usage rollup from hook records
-compaction hooks uninstall --tool <tool>         # remove ONLY Compaction's hooks
-
-# Gateway (API-key path):
-compaction gateway start                         # start the local gateway
-compaction gateway run -- codex exec --json "…"  # route a Codex run through the gateway
-compaction gateway run --provider anthropic -- claude   # route Claude Code through the gateway
-compaction gateway status                        # requests observed + content-free receipts rollup
-compaction gateway verify-cache --provider <id>  # live provider-reported cache check (needs YOUR key)
-compaction gateway recover <recovery_id>         # byte-exact restore of an original request
-compaction gateway stop                          # stop a running local gateway
-
-# Local trace utilities:
-compaction capture claude-code --session <session.jsonl> --out <dir>
-compaction import <trace-file> --source <source> --out <dir>
-compaction analyze <trace-file>                  # tokens + estimated spend, labeled by source
-compaction context add <artifact>                # local memory from your own captured traces
-compaction api export --json                     # ONE content-free JSON doc; local-only, no upload
+compaction                                       # guided onboarding
+compaction status                                # setup/readiness + recent summary
+compaction activity                              # recent run history
+compaction watch                                 # live per-turn result feed
+compaction watch --once                          # latest few result lines, then exit
+compaction usage                                 # Community optimized-input allowance
+compaction stop / compaction start               # disable / enable Compaction
 ```
 
-`compaction --help` lists the primary commands. Commands that need the adaptive engine say so plainly and exit
-without doing anything when it is not installed. They never pretend to have optimized.
+<details>
+<summary><strong>Advanced commands</strong></summary>
+
+```bash
+compaction init --connect claude-code
+compaction init --connect codex
+compaction init --connect cursor
+compaction init --connect all
+
+compaction login
+compaction engine status
+compaction devices
+compaction logout
+
+compaction hooks install --tool codex
+compaction hooks install --tool cursor
+compaction hooks status
+compaction hooks uninstall --tool <tool>
+
+compaction gateway start
+compaction gateway run -- codex exec --json "…"
+compaction gateway run --provider anthropic -- claude
+compaction gateway status
+compaction gateway verify-cache --provider <id>
+compaction gateway recover <recovery_id>
+compaction gateway stop
+
+compaction capture claude-code --session <session.jsonl> --out <dir>
+compaction import <trace-file> --source <source> --out <dir>
+compaction analyze <trace-file>
+compaction context add <artifact>
+compaction api export --json
+```
+
+</details>
+
+`compaction --help` lists the full command reference. Commands that require the adaptive engine say so and exit without pretending to have optimized when it is unavailable.
 
 ## Privacy and security
 
-- **Your content is never sent to Compaction services.** Compaction processes request content locally
-  and forwards it only to the provider you selected. Prompts, code, and responses are never uploaded
-  to Compaction services. Receipts record token and cache counts and structural labels only, and stay
-  on your machine (gitignored).
-- **Without an account, nothing contacts Compaction services.** Managed installations make a public
-  npm update check at most once per 24 hours automatically (explicit checks are separate), and download
-  verified candidates. These requests contain no work content, account/device data, provider credentials,
-  receipts, or telemetry. Provider traffic still goes where it was already going.
-- **With a free account, four things talk to our service, all content free.** Activating a device,
-  getting the entitlement that unlocks the fuller optimization, syncing usage counts, and looking up
-  or downloading the engine release. What crosses is counts, identifiers, and status labels. There is
-  no field in any of them that can carry a prompt, a completion, or a line of your code.
-- **Your key never leaves your machine.** On the gateway route your provider key rides straight
-  through to your provider and is never read, stored, or logged.
-- **The gateway has exactly one destination: your provider.** Your traffic goes where it was already
-  going. The four account exchanges above are separate and content-free; they never carry
-  a request.
-- **Nothing is destructive.** Every mutated request retains its original locally (restrictive
-  permissions) for byte-exact recovery; hooks are merge-not-replace, idempotent, and removable with
-  one command.
-- **You can read the code.** The privacy and local-only claims above are verifiable in this
-  repository rather than taken on trust.
-- **Captured traces can contain local content.** Capturing a session may include local file content,
-  so review a trace before sharing. `compaction feedback --redact` produces a redacted, local-only
-  bundle (explicit `--yes` required, no upload path).
-- **No `sudo` by default** in the installer; it installs into a user-writable prefix.
+- **Compaction never sends your work content to any outside services.** Prompts, code, and responses stay local to Compaction and go only to the provider you selected
+- **Without an account, nothing contacts Compaction services.** Managed installs may check public npm for updates
+- **With a free account, only content free account/device/usage/release metadata is exchanged.**
+- **Compaction never reads, stores, or logs your provider key.**
+- **Nothing is destructive.** Mutated requests retain their original locally for byte exact recovery
+- **Hooks are merge not replace, idempotent, and removable.**
+- **No `sudo` by default.**
 
-## Contributing
-
-Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) and please read our
-[Code of Conduct](CODE_OF_CONDUCT.md).
+See [SECURITY.md](SECURITY.md) for detailed security information.
 
 ## Methodology
 
-Observed token counts are labeled by source: provider-reported counts come from provider usage
-metadata; local token estimates and costs derived from price tables are labeled as estimates. An
-output saving on a user run is a counterfactual estimate derived only from applicable empirical
-calibration, never an observed twin generation; without applicable calibration it remains `N/A`.
+Provider reported token counts come from provider usage metadata. Local estimates and costs derived from price tables are labeled as estimates.
+
+An output saving on a user run is a counterfactual estimate derived only from applicable empirical calibration, never an observed twin generation. Without applicable calibration it remains `N/A`.
+
 Effects are provider-, model-, policy-, and task-dependent.
+
+## Contributing
+
+Contributions are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) and please read our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
+
