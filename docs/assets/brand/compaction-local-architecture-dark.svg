@@ -1,0 +1,72 @@
+<svg width="1400" height="430" viewBox="0 0 1400 430" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">Compaction local architecture</title>
+  <desc id="desc">Claude Code, Codex, and Cursor connect to Compaction on your machine. Compaction handles input, output, measurement, and recovery. Requests then go directly to your provider, with code and provider keys staying local, content-free receipts, and byte-exact recovery.</desc>
+
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#9CA3AF"/>
+    </marker>
+    <style>
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+      .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    </style>
+  </defs>
+
+  <!-- Your machine boundary -->
+  <rect x="25" y="36" width="1050" height="250" rx="16" stroke="#4B5563" stroke-width="1.5" stroke-dasharray="6 6"/>
+  <rect x="52" y="22" width="130" height="28" rx="3" fill="#111827"/>
+  <text x="117" y="41" text-anchor="middle" class="mono" font-size="13" letter-spacing="2.2" fill="#9CA3AF">YOUR MACHINE</text>
+
+  <!-- Tools -->
+  <rect x="58" y="72" width="330" height="52" rx="10" fill="#111827" stroke="#374151"/>
+  <rect x="58" y="137" width="330" height="52" rx="10" fill="#111827" stroke="#374151"/>
+  <rect x="58" y="202" width="330" height="52" rx="10" fill="#111827" stroke="#374151"/>
+
+  <text x="223" y="104" text-anchor="middle" class="mono" font-size="17" fill="#F3F4F6">Claude Code</text>
+  <text x="223" y="169" text-anchor="middle" class="mono" font-size="17" fill="#F3F4F6">Codex</text>
+  <text x="223" y="234" text-anchor="middle" class="mono" font-size="17" fill="#F3F4F6">Cursor</text>
+
+  <!-- tools -> compaction -->
+  <line x1="410" y1="163" x2="518" y2="163" stroke="#4B5563" stroke-width="1.8"/>
+  <line x1="553" y1="163" x2="625" y2="163" stroke="#4B5563" stroke-width="1.8" marker-end="url(#arrow)"/>
+
+  <!-- Compaction block -->
+  <rect x="635" y="72" width="375" height="52" rx="10" fill="#26264A" fill-opacity="1" stroke="#8888FF" stroke-width="1.5"/>
+  <text x="822.5" y="104" text-anchor="middle" class="mono" font-size="17" fill="#8888FF">Compaction</text>
+
+  <rect x="635" y="138" width="181" height="40" rx="6" fill="#171923" stroke="#374151"/>
+  <rect x="829" y="138" width="181" height="40" rx="6" fill="#171923" stroke="#374151"/>
+  <rect x="635" y="188" width="181" height="40" rx="6" fill="#171923" stroke="#374151"/>
+  <rect x="829" y="188" width="181" height="40" rx="6" fill="#171923" stroke="#374151"/>
+
+  <text x="725.5" y="163" text-anchor="middle" class="mono" font-size="13" letter-spacing="2" fill="#9CA3AF">INPUT</text>
+  <text x="919.5" y="163" text-anchor="middle" class="mono" font-size="13" letter-spacing="2" fill="#9CA3AF">OUTPUT</text>
+  <text x="725.5" y="213" text-anchor="middle" class="mono" font-size="13" letter-spacing="2" fill="#9CA3AF">MEASURE</text>
+  <text x="919.5" y="213" text-anchor="middle" class="mono" font-size="13" letter-spacing="2" fill="#9CA3AF">RECOVER</text>
+
+  <!-- compaction -> provider -->
+  <line x1="1093" y1="163" x2="1160" y2="163" stroke="#8888FF" stroke-width="1.8" marker-end="url(#arrow)"/>
+
+  <!-- Provider -->
+  <rect x="1174" y="120" width="200" height="56" rx="10" fill="#111827" stroke="#374151"/>
+  <text x="1274" y="153" text-anchor="middle" class="mono" font-size="16" fill="#F3F4F6">Your provider</text>
+  <text x="1274" y="205" text-anchor="middle" class="mono" font-size="12" letter-spacing="2" fill="#9CA3AF">DIRECT · NO MIDDLEMAN</text>
+
+  <!-- Trust statements -->
+  <rect x="25" y="318" width="337.5" height="84" rx="8" fill="#111827" stroke="#374151"/>
+  <rect x="362.5" y="318" width="337.5" height="84" fill="#111827" stroke="#374151"/>
+  <rect x="700" y="318" width="337.5" height="84" fill="#111827" stroke="#374151"/>
+  <rect x="1037.5" y="318" width="337.5" height="84" rx="8" fill="#111827" stroke="#374151"/>
+
+  <text x="50" y="351" class="sans" font-size="17" font-weight="600" fill="#F3F4F6">Code stays local</text>
+  <text x="50" y="379" class="mono" font-size="12" letter-spacing="2" fill="#9CA3AF">NEVER UPLOADED</text>
+
+  <text x="387.5" y="351" class="sans" font-size="17" font-weight="600" fill="#F3F4F6">Provider key stays local</text>
+  <text x="387.5" y="379" class="mono" font-size="12" letter-spacing="2" fill="#9CA3AF">NEVER READ OR LOGGED</text>
+
+  <text x="725" y="351" class="sans" font-size="17" font-weight="600" fill="#F3F4F6">Content-free receipts</text>
+  <text x="725" y="379" class="mono" font-size="12" letter-spacing="2" fill="#9CA3AF">COUNTS AND LABELS ONLY</text>
+
+  <text x="1062.5" y="351" class="sans" font-size="17" font-weight="600" fill="#F3F4F6">Byte-exact recovery</text>
+  <text x="1062.5" y="379" class="mono" font-size="12" letter-spacing="2" fill="#9CA3AF">ORIGINALS RECOVERABLE</text>
+</svg>
