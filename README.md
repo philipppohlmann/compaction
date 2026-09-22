@@ -44,7 +44,7 @@ The input arrow is measured before→after evidence. The output before value is 
 - **Input reduction is separately supported with a free account.** We have validated ~48–50% less billed input on uncached API sessions and ~5–10% on cached sessions (provider reported)
 - **Local by default.** Compaction processes request content on your machine and sends it only to the provider you already use. It does not upload prompts, code, or responses to any outside service, and never reads, stores, or logs your provider key
 
-⭐ **If Compaction saves you tokens, please star the repo.**
+⭐ **If Compaction helps, give the repo a star.**
 
 ## Install
 
