@@ -1,0 +1,313 @@
+{
+  "schema_version": 1,
+  "benchmark_id": "output-shaping-treatment-input-overhead-reproducibility-v1",
+  "evidence_type": "synthetic_fixture",
+  "measurement_basis": {
+    "input_basis": "model_visible_treatment_carrier_values_only",
+    "utf8_bytes": "Buffer.byteLength(value, utf8)",
+    "unicode_code_points": "spread_iteration_length",
+    "javascript_string_units": "value.length",
+    "repository_local_estimate_tokens": "estimateTokens(javascript_string_units); local estimate only"
+  },
+  "proves": [
+    "deterministic_treatment_input_measurements_for_registered_synthetic_cases_only"
+  ],
+  "does_not_prove": [
+    "provider_prompt_construction",
+    "provider_token_counts",
+    "native_external_hook_application",
+    "output_reduction",
+    "output_sufficiency",
+    "savings",
+    "effectiveness",
+    "real_trace_prevalence",
+    "reducibility",
+    "generalization_beyond_registered_synthetic_cases"
+  ],
+  "default_policy": {
+    "policy_count": 4,
+    "line_count": 5,
+    "policy_version": "output-shaping.v1.sha256.d326ef20760ad30142e0b4bc37fcb55a4a8fade7c9964f90158fdbafb49e0f83",
+    "treatment_input": {
+      "utf8_bytes": 425,
+      "unicode_code_points": 425,
+      "javascript_string_units": 425,
+      "repository_local_estimate_tokens": 106
+    }
+  },
+  "command_attachments": {
+    "semantics": "each invocation prepends again; duplicate invocation is not idempotent",
+    "cases": [
+      {
+        "surface": "codex",
+        "first_invocation": {
+          "utf8_bytes": 427,
+          "unicode_code_points": 427,
+          "javascript_string_units": 427,
+          "repository_local_estimate_tokens": 107
+        },
+        "duplicate_second_invocation": {
+          "utf8_bytes": 427,
+          "unicode_code_points": 427,
+          "javascript_string_units": 427,
+          "repository_local_estimate_tokens": 107
+        }
+      },
+      {
+        "surface": "cursor",
+        "first_invocation": {
+          "utf8_bytes": 427,
+          "unicode_code_points": 427,
+          "javascript_string_units": 427,
+          "repository_local_estimate_tokens": 107
+        },
+        "duplicate_second_invocation": {
+          "utf8_bytes": 427,
+          "unicode_code_points": 427,
+          "javascript_string_units": 427,
+          "repository_local_estimate_tokens": 107
+        }
+      }
+    ]
+  },
+  "gateway_native_carriers": {
+    "idempotence_scope": "same native attach carrier only; cross-surface external application is not measured",
+    "cases": [
+      {
+        "case_id": "anthropic_absent_system",
+        "native_attach_carrier": "anthropic_system_string",
+        "first_pass": {
+          "planner_reported_addedInputCharacters": 425,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 425,
+            "unicode_code_points": 425,
+            "javascript_string_units": 425,
+            "repository_local_estimate_tokens": 106
+          }
+        },
+        "same_native_carrier_second_pass": {
+          "planner_reported_addedInputCharacters": 0,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 0,
+            "unicode_code_points": 0,
+            "javascript_string_units": 0,
+            "repository_local_estimate_tokens": 0
+          }
+        }
+      },
+      {
+        "case_id": "anthropic_block_array_system",
+        "native_attach_carrier": "anthropic_system_block_array",
+        "first_pass": {
+          "planner_reported_addedInputCharacters": 425,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 425,
+            "unicode_code_points": 425,
+            "javascript_string_units": 425,
+            "repository_local_estimate_tokens": 106
+          }
+        },
+        "same_native_carrier_second_pass": {
+          "planner_reported_addedInputCharacters": 0,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 0,
+            "unicode_code_points": 0,
+            "javascript_string_units": 0,
+            "repository_local_estimate_tokens": 0
+          }
+        }
+      },
+      {
+        "case_id": "anthropic_string_system",
+        "native_attach_carrier": "anthropic_system_string",
+        "first_pass": {
+          "planner_reported_addedInputCharacters": 427,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 427,
+            "unicode_code_points": 427,
+            "javascript_string_units": 427,
+            "repository_local_estimate_tokens": 107
+          }
+        },
+        "same_native_carrier_second_pass": {
+          "planner_reported_addedInputCharacters": 0,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 0,
+            "unicode_code_points": 0,
+            "javascript_string_units": 0,
+            "repository_local_estimate_tokens": 0
+          }
+        }
+      },
+      {
+        "case_id": "openai_chat_inserted_system",
+        "native_attach_carrier": "openai_chat_system_message",
+        "first_pass": {
+          "planner_reported_addedInputCharacters": 425,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 425,
+            "unicode_code_points": 425,
+            "javascript_string_units": 425,
+            "repository_local_estimate_tokens": 106
+          }
+        },
+        "same_native_carrier_second_pass": {
+          "planner_reported_addedInputCharacters": 0,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 0,
+            "unicode_code_points": 0,
+            "javascript_string_units": 0,
+            "repository_local_estimate_tokens": 0
+          }
+        }
+      },
+      {
+        "case_id": "openai_responses_absent_instructions",
+        "native_attach_carrier": "openai_responses_instructions",
+        "first_pass": {
+          "planner_reported_addedInputCharacters": 425,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 425,
+            "unicode_code_points": 425,
+            "javascript_string_units": 425,
+            "repository_local_estimate_tokens": 106
+          }
+        },
+        "same_native_carrier_second_pass": {
+          "planner_reported_addedInputCharacters": 0,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 0,
+            "unicode_code_points": 0,
+            "javascript_string_units": 0,
+            "repository_local_estimate_tokens": 0
+          }
+        }
+      },
+      {
+        "case_id": "openai_responses_nonempty_instructions",
+        "native_attach_carrier": "openai_responses_instructions",
+        "first_pass": {
+          "planner_reported_addedInputCharacters": 427,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 427,
+            "unicode_code_points": 427,
+            "javascript_string_units": 427,
+            "repository_local_estimate_tokens": 107
+          }
+        },
+        "same_native_carrier_second_pass": {
+          "planner_reported_addedInputCharacters": 0,
+          "independently_derived_carrier_value_delta": {
+            "utf8_bytes": 0,
+            "unicode_code_points": 0,
+            "javascript_string_units": 0,
+            "repository_local_estimate_tokens": 0
+          }
+        }
+      }
+    ],
+    "first_pass_matrix_closure": {
+      "case_count": 6,
+      "exact_input": {
+        "utf8_bytes": 2554,
+        "unicode_code_points": 2554,
+        "javascript_string_units": 2554,
+        "repository_local_estimate_tokens": 638
+      },
+      "interpretation": "matrix closure only"
+    }
+  },
+  "task_aware_gateway_holds": [
+    {
+      "case_id": "planning_request",
+      "changed": false,
+      "planner_reported_addedInputCharacters": 0,
+      "added_input": {
+        "utf8_bytes": 0,
+        "unicode_code_points": 0,
+        "javascript_string_units": 0,
+        "repository_local_estimate_tokens": 0
+      },
+      "task_signal": "planning-request"
+    },
+    {
+      "case_id": "extended_thinking",
+      "changed": false,
+      "planner_reported_addedInputCharacters": 0,
+      "added_input": {
+        "utf8_bytes": 0,
+        "unicode_code_points": 0,
+        "javascript_string_units": 0,
+        "repository_local_estimate_tokens": 0
+      },
+      "task_signal": "extended-thinking"
+    }
+  ],
+  "hook_emitters": {
+    "shared_instruction_block": {
+      "utf8_bytes": 687,
+      "unicode_code_points": 687,
+      "javascript_string_units": 687,
+      "repository_local_estimate_tokens": 172
+    },
+    "cases": [
+      {
+        "surface": "claude-code",
+        "emitter_scope": "per_prompt",
+        "shapeable_or_session_start_outcome": "shape",
+        "emitted_context": {
+          "utf8_bytes": 687,
+          "unicode_code_points": 687,
+          "javascript_string_units": 687,
+          "repository_local_estimate_tokens": 172
+        },
+        "per_prompt_planning_hold": {
+          "applicability": "measured",
+          "outcome": "hold-planning",
+          "emitted_context": {
+            "utf8_bytes": 0,
+            "unicode_code_points": 0,
+            "javascript_string_units": 0,
+            "repository_local_estimate_tokens": 0
+          }
+        }
+      },
+      {
+        "surface": "codex",
+        "emitter_scope": "per_prompt",
+        "shapeable_or_session_start_outcome": "shape",
+        "emitted_context": {
+          "utf8_bytes": 687,
+          "unicode_code_points": 687,
+          "javascript_string_units": 687,
+          "repository_local_estimate_tokens": 172
+        },
+        "per_prompt_planning_hold": {
+          "applicability": "measured",
+          "outcome": "hold-planning",
+          "emitted_context": {
+            "utf8_bytes": 0,
+            "unicode_code_points": 0,
+            "javascript_string_units": 0,
+            "repository_local_estimate_tokens": 0
+          }
+        }
+      },
+      {
+        "surface": "cursor",
+        "emitter_scope": "session_level",
+        "shapeable_or_session_start_outcome": "shape",
+        "emitted_context": {
+          "utf8_bytes": 687,
+          "unicode_code_points": 687,
+          "javascript_string_units": 687,
+          "repository_local_estimate_tokens": 172
+        },
+        "per_prompt_planning_hold": {
+          "applicability": "not_applicable_to_session_level_emitter",
+          "emitted_context": null
+        }
+      }
+    ]
+  }
+}
