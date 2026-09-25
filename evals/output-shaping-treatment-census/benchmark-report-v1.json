@@ -27,12 +27,12 @@
   "default_policy": {
     "policy_count": 4,
     "line_count": 5,
-    "policy_version": "output-shaping.v1.sha256.d326ef20760ad30142e0b4bc37fcb55a4a8fade7c9964f90158fdbafb49e0f83",
+    "policy_version": "output-shaping.v1.sha256.a94bd8a0b5b4e93b4e9c9657ad5d35ef85a91708bf082530e81434a80f47e845",
     "treatment_input": {
-      "utf8_bytes": 425,
-      "unicode_code_points": 425,
-      "javascript_string_units": 425,
-      "repository_local_estimate_tokens": 106
+      "utf8_bytes": 466,
+      "unicode_code_points": 466,
+      "javascript_string_units": 466,
+      "repository_local_estimate_tokens": 117
     }
   },
   "command_attachments": {
@@ -41,31 +41,31 @@
       {
         "surface": "codex",
         "first_invocation": {
-          "utf8_bytes": 427,
-          "unicode_code_points": 427,
-          "javascript_string_units": 427,
-          "repository_local_estimate_tokens": 107
+          "utf8_bytes": 468,
+          "unicode_code_points": 468,
+          "javascript_string_units": 468,
+          "repository_local_estimate_tokens": 117
         },
         "duplicate_second_invocation": {
-          "utf8_bytes": 427,
-          "unicode_code_points": 427,
-          "javascript_string_units": 427,
-          "repository_local_estimate_tokens": 107
+          "utf8_bytes": 468,
+          "unicode_code_points": 468,
+          "javascript_string_units": 468,
+          "repository_local_estimate_tokens": 117
         }
       },
       {
         "surface": "cursor",
         "first_invocation": {
-          "utf8_bytes": 427,
-          "unicode_code_points": 427,
-          "javascript_string_units": 427,
-          "repository_local_estimate_tokens": 107
+          "utf8_bytes": 468,
+          "unicode_code_points": 468,
+          "javascript_string_units": 468,
+          "repository_local_estimate_tokens": 117
         },
         "duplicate_second_invocation": {
-          "utf8_bytes": 427,
-          "unicode_code_points": 427,
-          "javascript_string_units": 427,
-          "repository_local_estimate_tokens": 107
+          "utf8_bytes": 468,
+          "unicode_code_points": 468,
+          "javascript_string_units": 468,
+          "repository_local_estimate_tokens": 117
         }
       }
     ]
@@ -77,12 +77,12 @@
         "case_id": "anthropic_absent_system",
         "native_attach_carrier": "anthropic_system_string",
         "first_pass": {
-          "planner_reported_addedInputCharacters": 425,
+          "planner_reported_addedInputCharacters": 466,
           "independently_derived_carrier_value_delta": {
-            "utf8_bytes": 425,
-            "unicode_code_points": 425,
-            "javascript_string_units": 425,
-            "repository_local_estimate_tokens": 106
+            "utf8_bytes": 466,
+            "unicode_code_points": 466,
+            "javascript_string_units": 466,
+            "repository_local_estimate_tokens": 117
           }
         },
         "same_native_carrier_second_pass": {
@@ -99,12 +99,12 @@
         "case_id": "anthropic_block_array_system",
         "native_attach_carrier": "anthropic_system_block_array",
         "first_pass": {
-          "planner_reported_addedInputCharacters": 425,
+          "planner_reported_addedInputCharacters": 466,
           "independently_derived_carrier_value_delta": {
-            "utf8_bytes": 425,
-            "unicode_code_points": 425,
-            "javascript_string_units": 425,
-            "repository_local_estimate_tokens": 106
+            "utf8_bytes": 466,
+            "unicode_code_points": 466,
+            "javascript_string_units": 466,
+            "repository_local_estimate_tokens": 117
           }
         },
         "same_native_carrier_second_pass": {
@@ -121,12 +121,12 @@
         "case_id": "anthropic_string_system",
         "native_attach_carrier": "anthropic_system_string",
         "first_pass": {
-          "planner_reported_addedInputCharacters": 427,
+          "planner_reported_addedInputCharacters": 468,
           "independently_derived_carrier_value_delta": {
-            "utf8_bytes": 427,
-            "unicode_code_points": 427,
-            "javascript_string_units": 427,
-            "repository_local_estimate_tokens": 107
+            "utf8_bytes": 468,
+            "unicode_code_points": 468,
+            "javascript_string_units": 468,
+            "repository_local_estimate_tokens": 117
           }
         },
         "same_native_carrier_second_pass": {
@@ -143,12 +143,12 @@
         "case_id": "openai_chat_inserted_system",
         "native_attach_carrier": "openai_chat_system_message",
         "first_pass": {
-          "planner_reported_addedInputCharacters": 425,
+          "planner_reported_addedInputCharacters": 466,
           "independently_derived_carrier_value_delta": {
-            "utf8_bytes": 425,
-            "unicode_code_points": 425,
-            "javascript_string_units": 425,
-            "repository_local_estimate_tokens": 106
+            "utf8_bytes": 466,
+            "unicode_code_points": 466,
+            "javascript_string_units": 466,
+            "repository_local_estimate_tokens": 117
           }
         },
         "same_native_carrier_second_pass": {
@@ -165,12 +165,12 @@
         "case_id": "openai_responses_absent_instructions",
         "native_attach_carrier": "openai_responses_instructions",
         "first_pass": {
-          "planner_reported_addedInputCharacters": 425,
+          "planner_reported_addedInputCharacters": 466,
           "independently_derived_carrier_value_delta": {
-            "utf8_bytes": 425,
-            "unicode_code_points": 425,
-            "javascript_string_units": 425,
-            "repository_local_estimate_tokens": 106
+            "utf8_bytes": 466,
+            "unicode_code_points": 466,
+            "javascript_string_units": 466,
+            "repository_local_estimate_tokens": 117
           }
         },
         "same_native_carrier_second_pass": {
@@ -187,12 +187,12 @@
         "case_id": "openai_responses_nonempty_instructions",
         "native_attach_carrier": "openai_responses_instructions",
         "first_pass": {
-          "planner_reported_addedInputCharacters": 427,
+          "planner_reported_addedInputCharacters": 468,
           "independently_derived_carrier_value_delta": {
-            "utf8_bytes": 427,
-            "unicode_code_points": 427,
-            "javascript_string_units": 427,
-            "repository_local_estimate_tokens": 107
+            "utf8_bytes": 468,
+            "unicode_code_points": 468,
+            "javascript_string_units": 468,
+            "repository_local_estimate_tokens": 117
           }
         },
         "same_native_carrier_second_pass": {
@@ -209,10 +209,10 @@
     "first_pass_matrix_closure": {
       "case_count": 6,
       "exact_input": {
-        "utf8_bytes": 2554,
-        "unicode_code_points": 2554,
-        "javascript_string_units": 2554,
-        "repository_local_estimate_tokens": 638
+        "utf8_bytes": 2800,
+        "unicode_code_points": 2800,
+        "javascript_string_units": 2800,
+        "repository_local_estimate_tokens": 702
       },
       "interpretation": "matrix closure only"
     }
@@ -245,10 +245,10 @@
   ],
   "hook_emitters": {
     "shared_instruction_block": {
-      "utf8_bytes": 687,
-      "unicode_code_points": 687,
-      "javascript_string_units": 687,
-      "repository_local_estimate_tokens": 172
+      "utf8_bytes": 728,
+      "unicode_code_points": 728,
+      "javascript_string_units": 728,
+      "repository_local_estimate_tokens": 182
     },
     "cases": [
       {
@@ -256,10 +256,10 @@
         "emitter_scope": "per_prompt",
         "shapeable_or_session_start_outcome": "shape",
         "emitted_context": {
-          "utf8_bytes": 687,
-          "unicode_code_points": 687,
-          "javascript_string_units": 687,
-          "repository_local_estimate_tokens": 172
+          "utf8_bytes": 728,
+          "unicode_code_points": 728,
+          "javascript_string_units": 728,
+          "repository_local_estimate_tokens": 182
         },
         "per_prompt_planning_hold": {
           "applicability": "measured",
@@ -277,10 +277,10 @@
         "emitter_scope": "per_prompt",
         "shapeable_or_session_start_outcome": "shape",
         "emitted_context": {
-          "utf8_bytes": 687,
-          "unicode_code_points": 687,
-          "javascript_string_units": 687,
-          "repository_local_estimate_tokens": 172
+          "utf8_bytes": 728,
+          "unicode_code_points": 728,
+          "javascript_string_units": 728,
+          "repository_local_estimate_tokens": 182
         },
         "per_prompt_planning_hold": {
           "applicability": "measured",
@@ -298,10 +298,10 @@
         "emitter_scope": "session_level",
         "shapeable_or_session_start_outcome": "shape",
         "emitted_context": {
-          "utf8_bytes": 687,
-          "unicode_code_points": 687,
-          "javascript_string_units": 687,
-          "repository_local_estimate_tokens": 172
+          "utf8_bytes": 728,
+          "unicode_code_points": 728,
+          "javascript_string_units": 728,
+          "repository_local_estimate_tokens": 182
         },
         "per_prompt_planning_hold": {
           "applicability": "not_applicable_to_session_level_emitter",

@@ -212,7 +212,7 @@ describe("Codex exact lifecycle settlement", () => {
     expect(readdirSync(shapingDirectory)).toEqual([]);
   });
 
-  it("keeps run one cold, activates only after its durable settle, and calibrates run two from exact empirical evidence", async () => {
+  it("keeps repeated turns unseeded when the shipped confirmation is for the historical policy", async () => {
     const f = fixture();
     const settle = async (turnId: string, sequence: number, at: string) => {
       const raw = hookPayload(f.cwd, f.rollout, { turn_id: turnId });
@@ -233,23 +233,17 @@ describe("Codex exact lifecycle settlement", () => {
     expect(first?.event.output_estimate_state).toBe("unseeded");
     expect(first?.event.estimated_output_tokens_saved).toBeUndefined();
     const calibration = await loadCalibration(f.env);
-    expect(calibration.records).toHaveLength(1);
-    expect(calibration.records[0]).toMatchObject({
-      provider: "openai",
-      model: "gpt-5.6-sol",
-      regime: "default-shapeable",
-      confirmationIds: ["a1afd6e947d584507a1b0dd0a3f1f1ef825f2481b83ca7f55c3049baf05f2aa2"]
-    });
+    expect(calibration.records).toEqual([]);
     expect(JSON.stringify(calibration)).not.toMatch(/prompt|response|transcript|credential|SECRET/i);
 
-    const second = await settle("turn-calibrated", 2, "2026-09-05T09:01:00.000Z");
-    expect(second?.line).toBe("compaction · observed input 427 · output 96→72 (−25%, est.) · basic shaping");
+    const second = await settle("turn-still-cold", 2, "2026-09-05T09:01:00.000Z");
+    expect(second?.line).toBe("compaction · observed input 427 · output N/A→72 (N/A%, est.) · basic shaping");
     expect(second?.event).toMatchObject({
       output_after: 72,
-      estimated_output_tokens_saved: 24,
-      output_estimate_basis: "measured",
-      output_estimate_state: "calibrated"
+      output_estimate_state: "unseeded"
     });
+    expect(second?.event.output_estimate_basis).toBeUndefined();
+    expect(second?.event.estimated_output_tokens_saved).toBeUndefined();
   });
 
   it("freezes one retry event before append and never recomputes it after sources change", async () => {

@@ -71,7 +71,8 @@ export const OUTPUT_SHAPING_POLICIES: readonly OutputShapingPolicy[] = [
     risk_level: "low",
     defaultOn: true,
     description: "Suppress boilerplate, preamble, apologies, and repetition.",
-    instruction: () => "Skip boilerplate, apologies, and repetition; do not summarize what you just said."
+    instruction: () =>
+      "Skip boilerplate, apologies, repetition, and routine tool-call narration; keep required updates and task-critical content."
   },
   {
     policy_name: "safe_tool_output_filtering",
