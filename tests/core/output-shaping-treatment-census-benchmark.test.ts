@@ -365,9 +365,9 @@ describe("output shaping treatment input overhead reproducibility benchmark", ()
       expect(row.planner_reported_addedInputCharacters).toBe(0);
       expect(row.added_input).toEqual(measureAddedUnits(0));
     }
-    expect(report.hook_emitters.shared_instruction_block).toEqual(measureAddedUnits(728));
+    expect(report.hook_emitters.shared_instruction_block).toEqual(measureAddedUnits(466));
     for (const row of report.hook_emitters.cases) {
-      expect(row.emitted_context).toEqual(measureAddedUnits(728));
+      expect(row.emitted_context).toEqual(measureAddedUnits(466));
       if (row.emitter_scope === "per_prompt") {
         expect(row.per_prompt_planning_hold).toEqual({
           applicability: "measured",
@@ -393,7 +393,7 @@ describe("output shaping treatment input overhead reproducibility benchmark", ()
       expect(carrierValue(endpoint, plan.mutatedBody ?? "{}")).toContain(policy.instructions);
     }
 
-    expect(shapingInstructionBlock().startsWith(`${policy.instructions}\n(`)).toBe(true);
+    expect(shapingInstructionBlock()).toBe(policy.instructions);
     const env = { COMPACTION_CONFIG_DIR: hookConfigDirectory } as NodeJS.ProcessEnv;
     for (const surface of ["claude-code", "codex", "cursor"] as const) {
       const input = surface === "cursor" ? "{}" : JSON.stringify({ prompt: "Implement the function." });

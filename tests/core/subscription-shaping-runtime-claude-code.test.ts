@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { decideShaping, shapingInstructionBlock } from "../../src/core/subscription-shaping-runtime.js";
+import { buildOutputShapingPolicy } from "../../src/core/output-shaping.js";
 import { stopShaping } from "../../src/core/subscription-shaping-state.js";
 import { SHAPING_HOOKS_ENV } from "../../src/core/output-shaping-hook-activation.js";
 
@@ -35,8 +36,7 @@ describe("await decideShaping('claude-code') - per-prompt UserPromptSubmit shapi
     const parsed = JSON.parse(d.stdout);
     // MUTATION happens ONLY via the whitelisted UserPromptSubmit hookSpecificOutput field.
     expect(parsed.hookSpecificOutput.hookEventName).toBe("UserPromptSubmit");
-    expect(typeof parsed.hookSpecificOutput.additionalContext).toBe("string");
-    expect(parsed.hookSpecificOutput.additionalContext).toContain("Output-shaping policy");
+    expect(parsed.hookSpecificOutput.additionalContext).toBe(buildOutputShapingPolicy().instructions);
   });
 
   it("HOLDS on a planning/reasoning turn (never shapes a thinking turn) - the load-bearing safety property", async () => {

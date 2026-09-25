@@ -57,6 +57,7 @@ describe("package-shipped shared output calibration registry", () => {
       expect(buildOutputShapingPolicy().policyVersion).toBe(
         "output-shaping.v1.sha256.a94bd8a0b5b4e93b4e9c9657ad5d35ef85a91708bf082530e81434a80f47e845"
       );
+      expect(CURRENT_EXACT.policyVersion).not.toBe(HISTORICAL_EXACT.policyVersion);
       expect(cold(CURRENT_EXACT)).toMatchObject({ availability: "unavailable", state: "unseeded" });
       expect(existsSync(calibrationStorePath(env))).toBe(false);
 

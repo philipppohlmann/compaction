@@ -34,7 +34,10 @@ import type { GatewayReceipt, GatewayReceiptTailWindow } from "../../src/core/ga
 import { activityTurnLinesFromJsonl, codexStopRunWindowsFromJsonl } from "../../src/core/activity-receipt-line.js";
 import { receiptTurnLinesFromJsonl } from "../../src/cli/commands/watch.js";
 import { buildActivityRows } from "../../src/core/activity-view.js";
-import { TEST_OUTPUT_POLICY_VERSION } from "../helpers/output-calibration-fixture.js";
+import {
+  TEST_OUTPUT_POLICY_VERSION,
+  seedOutputCalibration
+} from "../helpers/output-calibration-fixture.js";
 import {
   calibrationStorePath,
   loadCalibration
@@ -212,7 +215,7 @@ describe("Codex exact lifecycle settlement", () => {
     expect(readdirSync(shapingDirectory)).toEqual([]);
   });
 
-  it("keeps repeated turns unseeded when the shipped confirmation is for the historical policy", async () => {
+  it("keeps repeated turns unseeded until an exact current-policy confirmation is installed", async () => {
     const f = fixture();
     const settle = async (turnId: string, sequence: number, at: string) => {
       const raw = hookPayload(f.cwd, f.rollout, { turn_id: turnId });
@@ -244,6 +247,22 @@ describe("Codex exact lifecycle settlement", () => {
     });
     expect(second?.event.output_estimate_basis).toBeUndefined();
     expect(second?.event.estimated_output_tokens_saved).toBeUndefined();
+
+    await seedOutputCalibration(f.env, {
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      regime: "default-shapeable",
+      control: [120, 120, 120],
+      treatment: [72, 72, 72]
+    });
+    const calibrated = await settle("turn-calibrated", 3, "2026-09-05T09:02:00.000Z");
+    expect(calibrated?.line).toBe("compaction · observed input 427 · output 120→72 (−40%, est.) · basic shaping");
+    expect(calibrated?.event).toMatchObject({
+      output_after: 72,
+      output_estimate_state: "calibrated",
+      output_estimate_basis: "measured",
+      estimated_output_tokens_saved: 48
+    });
   });
 
   it("freezes one retry event before append and never recomputes it after sources change", async () => {
