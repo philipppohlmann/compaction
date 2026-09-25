@@ -21,6 +21,9 @@ const TOOL_RESULT_CENSUS_FIXTURES = [
   "tests/fixtures/request-input-census/openai-responses.json",
   "tests/fixtures/superseded-same-source-read.json"
 ] as const;
+const OUTPUT_SHAPING_TREATMENT_CENSUS_ID = "output-shaping-treatment-input-overhead-reproducibility-v1";
+const OUTPUT_SHAPING_TREATMENT_CENSUS_ARTIFACT =
+  "evals/output-shaping-treatment-census/benchmark-report-v1.json";
 
 function pathReferences(value: unknown): string[] {
   if (typeof value === "string") {
@@ -117,5 +120,54 @@ describe("public eval registry path closure", () => {
     }
     expect(entry?.fixtures).toEqual(TOOL_RESULT_CENSUS_FIXTURES);
     expect([...TOOL_RESULT_CENSUS_FIXTURES].sort()).toEqual(TOOL_RESULT_CENSUS_FIXTURES);
+  });
+
+  it("registers the output-shaping treatment census and its exact public evidence set once", () => {
+    const manifest = JSON.parse(readFileSync(MANIFEST, "utf8")) as { evals?: Array<Record<string, unknown>> };
+    const matches = (manifest.evals ?? []).filter((entry) => entry.id === OUTPUT_SHAPING_TREATMENT_CENSUS_ID);
+    expect(matches).toHaveLength(1);
+
+    const entry = matches[0];
+    expect(entry).toEqual({
+      id: OUTPUT_SHAPING_TREATMENT_CENSUS_ID,
+      name: "Output-shaping treatment input-overhead reproducibility oracle",
+      evidence_type: "synthetic_fixture",
+      proves: ["deterministic_treatment_input_measurements_for_registered_synthetic_cases_only"],
+      does_not_prove: [
+        "provider_prompt_construction",
+        "provider_token_counts",
+        "native_external_hook_application",
+        "output_reduction",
+        "output_sufficiency",
+        "savings",
+        "effectiveness",
+        "real_trace_prevalence",
+        "reducibility",
+        "generalization_beyond_registered_synthetic_cases"
+      ],
+      implementation: [
+        "src/core/gateway/output-shaping-policy.ts",
+        "src/core/gateway/output-shaping-task-classifier.ts",
+        "src/core/gateway/request-shape.ts",
+        "src/core/output-shaping-attach.ts",
+        "src/core/output-shaping.ts",
+        "src/core/subscription-shaping-runtime.ts"
+      ],
+      tests: [
+        "tests/core/output-shaping-treatment-census-benchmark.test.ts",
+        "tests/security/public-eval-registry-closure.test.ts"
+      ],
+      artifacts: [OUTPUT_SHAPING_TREATMENT_CENSUS_ARTIFACT],
+      status: "synthetic_fixture_reproducibility_oracle"
+    });
+
+    for (const field of ["proves", "does_not_prove", "implementation", "tests", "artifacts"] as const) {
+      const values = entry?.[field] as string[];
+      expect(new Set(values).size).toBe(values.length);
+    }
+    const artifactRegistrations = (manifest.evals ?? []).flatMap((candidate) =>
+      Array.isArray(candidate.artifacts) ? candidate.artifacts : []
+    ).filter((artifact) => artifact === OUTPUT_SHAPING_TREATMENT_CENSUS_ARTIFACT);
+    expect(artifactRegistrations).toHaveLength(1);
   });
 });

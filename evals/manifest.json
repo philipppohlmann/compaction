@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "updated": "2026-09-20",
+  "updated": "2026-09-24",
   "description": "Public registry for synthetic eval fixtures and content-free A/B harnesses. Engine-backed validation is delivered separately.",
   "eval_gates": {
     "context_preservation": {
@@ -169,6 +169,42 @@
         "evals/tool-result-fixture-census/benchmark-report-v1.json"
       ],
       "status": "synthetic_fixture_census_reproducibility_oracle"
+    },
+    {
+      "id": "output-shaping-treatment-input-overhead-reproducibility-v1",
+      "name": "Output-shaping treatment input-overhead reproducibility oracle",
+      "evidence_type": "synthetic_fixture",
+      "proves": [
+        "deterministic_treatment_input_measurements_for_registered_synthetic_cases_only"
+      ],
+      "does_not_prove": [
+        "provider_prompt_construction",
+        "provider_token_counts",
+        "native_external_hook_application",
+        "output_reduction",
+        "output_sufficiency",
+        "savings",
+        "effectiveness",
+        "real_trace_prevalence",
+        "reducibility",
+        "generalization_beyond_registered_synthetic_cases"
+      ],
+      "implementation": [
+        "src/core/gateway/output-shaping-policy.ts",
+        "src/core/gateway/output-shaping-task-classifier.ts",
+        "src/core/gateway/request-shape.ts",
+        "src/core/output-shaping-attach.ts",
+        "src/core/output-shaping.ts",
+        "src/core/subscription-shaping-runtime.ts"
+      ],
+      "tests": [
+        "tests/core/output-shaping-treatment-census-benchmark.test.ts",
+        "tests/security/public-eval-registry-closure.test.ts"
+      ],
+      "artifacts": [
+        "evals/output-shaping-treatment-census/benchmark-report-v1.json"
+      ],
+      "status": "synthetic_fixture_reproducibility_oracle"
     },
     {
       "id": "claims-guards",
