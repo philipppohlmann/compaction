@@ -245,10 +245,10 @@
   ],
   "hook_emitters": {
     "shared_instruction_block": {
-      "utf8_bytes": 728,
-      "unicode_code_points": 728,
-      "javascript_string_units": 728,
-      "repository_local_estimate_tokens": 182
+      "utf8_bytes": 466,
+      "unicode_code_points": 466,
+      "javascript_string_units": 466,
+      "repository_local_estimate_tokens": 117
     },
     "cases": [
       {
@@ -256,10 +256,10 @@
         "emitter_scope": "per_prompt",
         "shapeable_or_session_start_outcome": "shape",
         "emitted_context": {
-          "utf8_bytes": 728,
-          "unicode_code_points": 728,
-          "javascript_string_units": 728,
-          "repository_local_estimate_tokens": 182
+          "utf8_bytes": 466,
+          "unicode_code_points": 466,
+          "javascript_string_units": 466,
+          "repository_local_estimate_tokens": 117
         },
         "per_prompt_planning_hold": {
           "applicability": "measured",
@@ -277,10 +277,10 @@
         "emitter_scope": "per_prompt",
         "shapeable_or_session_start_outcome": "shape",
         "emitted_context": {
-          "utf8_bytes": 728,
-          "unicode_code_points": 728,
-          "javascript_string_units": 728,
-          "repository_local_estimate_tokens": 182
+          "utf8_bytes": 466,
+          "unicode_code_points": 466,
+          "javascript_string_units": 466,
+          "repository_local_estimate_tokens": 117
         },
         "per_prompt_planning_hold": {
           "applicability": "measured",
@@ -298,10 +298,10 @@
         "emitter_scope": "session_level",
         "shapeable_or_session_start_outcome": "shape",
         "emitted_context": {
-          "utf8_bytes": 728,
-          "unicode_code_points": 728,
-          "javascript_string_units": 728,
-          "repository_local_estimate_tokens": 182
+          "utf8_bytes": 466,
+          "unicode_code_points": 466,
+          "javascript_string_units": 466,
+          "repository_local_estimate_tokens": 117
         },
         "per_prompt_planning_hold": {
           "applicability": "not_applicable_to_session_level_emitter",

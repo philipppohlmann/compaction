@@ -50,7 +50,6 @@
  *   turns in the shipped path. Emit `{ additional_context }`.
  */
 import { buildOutputShapingPolicy } from "./output-shaping.js";
-import { OUTPUT_SHAPING_HONESTY_NOTE } from "./output-shaping.js";
 import { classifyShapingTask } from "./gateway/task-awareness-seam.js";
 import { isShapingHooksActivated } from "./output-shaping-hook-activation.js";
 import type { SubscriptionHookTool } from "./subscription-shaping-hooks.js";
@@ -65,14 +64,12 @@ import type { SubscriptionHookTool } from "./subscription-shaping-hooks.js";
 export type ShapingRuntimeTool = SubscriptionHookTool | "claude-code";
 
 /**
- * The content-free instruction block injected via the hook. Built from the deterministic public policy
- * family (never duplicated here) plus the honesty note. Generic text only, no request content.
+ * The content-free instruction block injected via the hook. This is exactly the deterministic public
+ * policy payload, so hook, gateway, and wrapper provenance all identify the same model-visible bytes.
+ * The user-facing honesty note remains CLI output and is not part of the model-visible treatment.
  */
 export function shapingInstructionBlock(): string {
-  const { instructions } = buildOutputShapingPolicy();
-  // The honesty note is a fixed, content-free reminder that this is a request-shaping instruction, not
-  // a savings claim; it never contains request bytes.
-  return `${instructions}\n(${OUTPUT_SHAPING_HONESTY_NOTE})`;
+  return buildOutputShapingPolicy().instructions;
 }
 
 export type ShapingDecisionOutcome =
