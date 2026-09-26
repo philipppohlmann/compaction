@@ -1,7 +1,7 @@
 /** Build one immutable, content-free, whole-run Claude Stop activity event from exact receipts. */
 import { computeActivityEventId, type ActivityEvent } from "./activity-event.js";
 import { claudeLogicalRunIdentity } from "./claude-logical-run-id.js";
-import { buildOutputShapingPolicy } from "./output-shaping.js";
+import { buildHookOutputShapingTreatment } from "./output-shaping.js";
 import { outputCalibrationQuery, type OutputShapingCalibrationQuery } from "./output-shaping-calibration-store.js";
 import { estimatePerTurnOutputSaved, type OutputCalibrationResolver } from "./output-shaping-savings.js";
 import type { ShapingDecisionOutcome } from "./subscription-shaping-runtime.js";
@@ -86,7 +86,7 @@ export function claudeTranscriptOutputCalibrationQuery(input: {
     input.usage.provider !== "anthropic"
   ) return undefined;
   return outputCalibrationQuery({
-    policyVersion: buildOutputShapingPolicy().policyVersion,
+    policyVersion: buildHookOutputShapingTreatment().policyVersion,
     provider: input.usage.provider,
     model: input.usage.model,
     ...(input.shapingOutcome === "shape" ? { regime: "default-shapeable" } : {})

@@ -10,6 +10,7 @@ import { buildOutputShapingPolicy } from "../../src/core/output-shaping.js";
 export const TEST_OUTPUT_POLICY_VERSION = buildOutputShapingPolicy().policyVersion;
 
 export function confirmedOutputCalibration(input: {
+  policyVersion?: string;
   provider?: string;
   model?: string;
   regime?: OutputShapingCalibrationRegime;
@@ -23,7 +24,7 @@ export function confirmedOutputCalibration(input: {
   const meanTreatment = treatment.reduce((sum, value) => sum + value, 0) / treatment.length;
   const delta = meanControl - meanTreatment;
   const numeric = {
-    policyVersion: TEST_OUTPUT_POLICY_VERSION,
+    policyVersion: input.policyVersion ?? TEST_OUTPUT_POLICY_VERSION,
     provider: input.provider ?? "anthropic",
     model: input.model ?? "claude-opus-5",
     ...(input.regime !== undefined ? { regime: input.regime } : {}),

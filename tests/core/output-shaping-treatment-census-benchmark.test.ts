@@ -9,7 +9,7 @@ import {
 } from "../../src/core/gateway/output-shaping-policy.js";
 import { taskAwareGate } from "../../src/core/gateway/output-shaping-task-classifier.js";
 import { attachOutputShapingToCommand } from "../../src/core/output-shaping-attach.js";
-import { buildOutputShapingPolicy } from "../../src/core/output-shaping.js";
+import { buildHookOutputShapingTreatment, buildOutputShapingPolicy } from "../../src/core/output-shaping.js";
 import { decideShaping, shapingInstructionBlock } from "../../src/core/subscription-shaping-runtime.js";
 
 const REPO_ROOT = join(__dirname, "..", "..");
@@ -335,23 +335,23 @@ describe("output shaping treatment input overhead reproducibility benchmark", ()
     expect(report.default_policy).toEqual({
       policy_count: 4,
       line_count: 5,
-      policy_version: "output-shaping.v1.sha256.a94bd8a0b5b4e93b4e9c9657ad5d35ef85a91708bf082530e81434a80f47e845",
+      policy_version: "output-shaping.v1.sha256.d326ef20760ad30142e0b4bc37fcb55a4a8fade7c9964f90158fdbafb49e0f83",
       treatment_input: {
-        utf8_bytes: 466,
-        unicode_code_points: 466,
-        javascript_string_units: 466,
-        repository_local_estimate_tokens: 117
+        utf8_bytes: 425,
+        unicode_code_points: 425,
+        javascript_string_units: 425,
+        repository_local_estimate_tokens: 106
       }
     });
     for (const row of report.command_attachments.cases) {
-      expect(row.first_invocation).toEqual(measureAddedUnits(468));
-      expect(row.duplicate_second_invocation).toEqual(measureAddedUnits(468));
+      expect(row.first_invocation).toEqual(measureAddedUnits(427));
+      expect(row.duplicate_second_invocation).toEqual(measureAddedUnits(427));
     }
     expect(report.gateway_native_carriers.first_pass_matrix_closure.exact_input).toEqual({
-      utf8_bytes: 2800,
-      unicode_code_points: 2800,
-      javascript_string_units: 2800,
-      repository_local_estimate_tokens: 702
+      utf8_bytes: 2554,
+      unicode_code_points: 2554,
+      javascript_string_units: 2554,
+      repository_local_estimate_tokens: 638
     });
     for (const row of report.gateway_native_carriers.cases) {
       expect(row.first_pass.planner_reported_addedInputCharacters).toBe(
@@ -365,9 +365,9 @@ describe("output shaping treatment input overhead reproducibility benchmark", ()
       expect(row.planner_reported_addedInputCharacters).toBe(0);
       expect(row.added_input).toEqual(measureAddedUnits(0));
     }
-    expect(report.hook_emitters.shared_instruction_block).toEqual(measureAddedUnits(466));
+    expect(report.hook_emitters.shared_instruction_block).toEqual(measureAddedUnits(687));
     for (const row of report.hook_emitters.cases) {
-      expect(row.emitted_context).toEqual(measureAddedUnits(466));
+      expect(row.emitted_context).toEqual(measureAddedUnits(687));
       if (row.emitter_scope === "per_prompt") {
         expect(row.per_prompt_planning_hold).toEqual({
           applicability: "measured",
@@ -378,8 +378,9 @@ describe("output shaping treatment input overhead reproducibility benchmark", ()
     }
   });
 
-  it("uses one exact policy identity across command, gateway, and hook carriers", async () => {
+  it("attributes command, gateway, and hook carriers to their exact bytes", async () => {
     const policy = buildOutputShapingPolicy();
+    const hook = buildHookOutputShapingTreatment();
     for (const surface of ["codex", "cursor"] as const) {
       const attached = attachOutputShapingToCommand([surface, "exec", "Synthetic task."]);
       expect(attached.policyVersion).toBe(policy.policyVersion);
@@ -393,7 +394,8 @@ describe("output shaping treatment input overhead reproducibility benchmark", ()
       expect(carrierValue(endpoint, plan.mutatedBody ?? "{}")).toContain(policy.instructions);
     }
 
-    expect(shapingInstructionBlock()).toBe(policy.instructions);
+    expect(shapingInstructionBlock()).toBe(hook.instructions);
+    expect(hook.policyVersion).not.toBe(policy.policyVersion);
     const env = { COMPACTION_CONFIG_DIR: hookConfigDirectory } as NodeJS.ProcessEnv;
     for (const surface of ["claude-code", "codex", "cursor"] as const) {
       const input = surface === "cursor" ? "{}" : JSON.stringify({ prompt: "Implement the function." });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildHookOutputShapingTreatment,
   buildOutputShapingPolicy,
   outputShapingPolicyVersion,
   OUTPUT_SHAPING_POLICIES,
@@ -25,7 +26,7 @@ describe("output-shaping policy family (deterministic)", () => {
     expect(r.applied.map((a) => a.policy_name)).not.toContain("safe_tool_output_filtering");
   });
 
-  it("suppresses routine tool-call narration while preserving required updates and task-critical content", () => {
+  it("suppresses redundant chatter without changing required content", () => {
     const policy = OUTPUT_SHAPING_POLICIES.find(
       ({ policy_name }) => policy_name === "redundant_chatter_suppression"
     );
@@ -35,13 +36,8 @@ describe("output-shaping policy family (deterministic)", () => {
       defaultOn: true
     });
     expect(policy?.instruction()).toBe(
-      "Skip boilerplate, apologies, repetition, and routine tool-call narration; keep required updates and task-critical content."
+      "Skip boilerplate, apologies, and repetition; do not summarize what you just said."
     );
-
-    const preservesRequiredContent = (instruction: string): boolean =>
-      ["required updates", "task-critical content"].every((required) => instruction.includes(required));
-    expect(preservesRequiredContent(policy?.instruction() ?? "")).toBe(true);
-    expect(preservesRequiredContent("Skip routine tool-call narration.")).toBe(false);
   });
 
   it("keeps safe tool-output filtering outside the four-policy default treatment", () => {
@@ -72,11 +68,23 @@ describe("output-shaping policy family (deterministic)", () => {
     const current = buildOutputShapingPolicy();
     expect(current.policyVersion).toMatch(/^output-shaping\.v1\.sha256\.[a-f0-9]{64}$/);
     expect(current.policyVersion).toBe(
-      "output-shaping.v1.sha256.a94bd8a0b5b4e93b4e9c9657ad5d35ef85a91708bf082530e81434a80f47e845"
+      "output-shaping.v1.sha256.d326ef20760ad30142e0b4bc37fcb55a4a8fade7c9964f90158fdbafb49e0f83"
     );
     expect(current.policyVersion).toBe(outputShapingPolicyVersion(current.instructions));
     expect(buildOutputShapingPolicy().policyVersion).toBe(current.policyVersion);
     expect(buildOutputShapingPolicy({ verbosityBudgetTokens: 300 }).policyVersion).not.toBe(current.policyVersion);
+  });
+
+  it("versions the exact hook bytes separately", () => {
+    const core = buildOutputShapingPolicy();
+    const hook = buildHookOutputShapingTreatment();
+    expect(hook.instructions).toBe(`${core.instructions}\n(${OUTPUT_SHAPING_HONESTY_NOTE})`);
+    expect(Buffer.byteLength(core.instructions, "utf8")).toBe(425);
+    expect(Buffer.byteLength(hook.instructions, "utf8")).toBe(687);
+    expect(hook.policyVersion).toBe(outputShapingPolicyVersion(hook.instructions));
+    expect(hook.policyVersion).toBe(
+      "output-shaping.v1.sha256.18ed526481a63fc7d7c596b3622b22d106ea906a33b58125e2a36233f25b8775"
+    );
   });
 
   it("ignores unknown policy names (never invents a policy)", () => {

@@ -15,13 +15,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGatewayServer } from "../../src/core/gateway/server.js";
 import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
-import { buildOutputShapingPolicy } from "../../src/core/output-shaping.js";
+import { buildHookOutputShapingTreatment } from "../../src/core/output-shaping.js";
 import { outputShapingActiveOnRequest } from "../../src/core/gateway/output-shaping-policy.js";
 import { writeProductMode } from "../../src/core/onboarding-preferences.js";
 import { aggregateRun } from "../../src/core/gateway/run-aggregate.js";
 
 const UPSTREAM_REPLY = JSON.stringify({ id: "msg_fake", usage: { input_tokens: 1200, output_tokens: 400 } });
-const POLICY = buildOutputShapingPolicy().instructions;
+const HOOK_POLICY = buildHookOutputShapingTreatment();
 
 /** Exactly what the tool's own UserPromptSubmit hook produces: the policy inside a system-role message. */
 function hookShapedBody(): string {
@@ -35,7 +35,7 @@ function hookShapedBody(): string {
         role: "system",
         content:
           "You are Claude Code, Anthropic's official CLI for Claude.\n\n" +
-          `UserPromptSubmit hook additional context: ${POLICY}\n`
+          `UserPromptSubmit hook additional context: ${HOOK_POLICY.instructions}\n`
       }
     ]
   });
@@ -124,6 +124,7 @@ describe("record-mode output-shaping provenance", () => {
 
     // THE DEFECT: every call is genuinely shaped, and the receipt recorded nothing.
     expect(receipts[0]?.output_shaping_state).toBe("already-active");
+    expect(receipts[0]?.output_shaping_policy_version).toBe(HOOK_POLICY.policyVersion);
   });
 
   it("the run renders its output arrow when a held call is mixed with shaped ones", async () => {

@@ -49,7 +49,7 @@
  *   the session hook: one coarse "prefer concise" instruction, with no per-turn HOLD on planning
  *   turns in the shipped path. Emit `{ additional_context }`.
  */
-import { buildOutputShapingPolicy } from "./output-shaping.js";
+import { buildHookOutputShapingTreatment } from "./output-shaping.js";
 import { classifyShapingTask } from "./gateway/task-awareness-seam.js";
 import { isShapingHooksActivated } from "./output-shaping-hook-activation.js";
 import type { SubscriptionHookTool } from "./subscription-shaping-hooks.js";
@@ -64,12 +64,10 @@ import type { SubscriptionHookTool } from "./subscription-shaping-hooks.js";
 export type ShapingRuntimeTool = SubscriptionHookTool | "claude-code";
 
 /**
- * The content-free instruction block injected via the hook. This is exactly the deterministic public
- * policy payload, so hook, gateway, and wrapper provenance all identify the same model-visible bytes.
- * The user-facing honesty note remains CLI output and is not part of the model-visible treatment.
+ * The content-free instruction block injected via the hook. Generic text only, no request content.
  */
 export function shapingInstructionBlock(): string {
-  return buildOutputShapingPolicy().instructions;
+  return buildHookOutputShapingTreatment().instructions;
 }
 
 export type ShapingDecisionOutcome =
