@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { decideShaping, shapingInstructionBlock } from "../../src/core/subscription-shaping-runtime.js";
-import { buildOutputShapingPolicy, OUTPUT_SHAPING_HONESTY_NOTE } from "../../src/core/output-shaping.js";
+import { buildHookOutputShapingTreatment, OUTPUT_SHAPING_HONESTY_NOTE } from "../../src/core/output-shaping.js";
 import {
   SHAPING_HOOKS_ENV,
   isShapingHooksActivated
@@ -100,10 +100,9 @@ describe("content-free", () => {
   });
 
   it("the instruction block is generic (no request content by construction)", async () => {
-    const policy = buildOutputShapingPolicy();
-    expect(shapingInstructionBlock()).toBe(policy.instructions);
-    expect(shapingInstructionBlock()).not.toContain(OUTPUT_SHAPING_HONESTY_NOTE);
+    expect(shapingInstructionBlock()).toBe(buildHookOutputShapingTreatment().instructions);
     expect(shapingInstructionBlock()).toContain("Output-shaping policy");
+    expect(shapingInstructionBlock()).toContain(OUTPUT_SHAPING_HONESTY_NOTE);
   });
 });
 

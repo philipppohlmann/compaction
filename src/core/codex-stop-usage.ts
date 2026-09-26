@@ -12,7 +12,7 @@ import {
   DEFAULT_ACTIVITY_DIRECTORY,
   readActivityEvents
 } from "./activity-store.js";
-import { buildOutputShapingPolicy } from "./output-shaping.js";
+import { buildHookOutputShapingTreatment } from "./output-shaping.js";
 import {
   invalidateShapingTurnRecord,
   lastTurnShapingOutcome,
@@ -415,7 +415,7 @@ export async function settleCodexStop(
     const hookShaped = shapingOutcome === "shape" || shapingOutcome === "shape-basic";
     const gatewayShaped = (aggregate?.shapedCallCount ?? 0) > 0;
     const shapingActive = hookShaped || gatewayShaped;
-    const hookPolicy = hookShaped ? buildOutputShapingPolicy().policyVersion : undefined;
+    const hookPolicy = hookShaped ? buildHookOutputShapingTreatment().policyVersion : undefined;
     const hookQuery = hookShaped
       ? outputCalibrationQuery({
           policyVersion: hookPolicy,

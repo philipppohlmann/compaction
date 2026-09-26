@@ -23,6 +23,7 @@
  * both consult the same validator.
  */
 import {
+  buildHookOutputShapingTreatment,
   buildOutputShapingPolicy,
   OUTPUT_SHAPING_POLICY_MARKER,
   type OutputShapingAttribution
@@ -142,9 +143,8 @@ export function bodyAlreadyCarriesOutputShaping(bodyText: string): boolean {
  * TWO NARROWINGS, both load-bearing:
  *
  *  1. THE FULL CURRENT PAYLOAD, not the marker. The marker is one 47-character sentence; a user asking
- *     about this very feature can write it. The payload is the whole policy `buildOutputShapingPolicy()`
- *     emits, so a match means the model is reading the instructions we would have attached — not that
- *     the phrase appears somewhere.
+ *     about this very feature can write it. Hook bytes are checked before the core policy they contain,
+ *     so the returned version identifies the complete treatment the model reads.
  *
  *  2. INSTRUCTION-LEVEL CARRIERS ONLY. Anthropic's top-level `system` (blocks or string), the Responses
  *     API `instructions`, and `system`/`developer`-role messages. User and assistant turns are NOT
@@ -162,9 +162,9 @@ export function outputShapingActiveOnRequest(bodyText: string): boolean {
 
 /** Exact current-policy identity only when the complete emitted bytes are active in an instruction carrier. */
 export function outputShapingPolicyVersionOnRequest(bodyText: string): string | undefined {
+  const hook = buildHookOutputShapingTreatment();
   const policy = buildOutputShapingPolicy();
-  const payload = policy.instructions;
-  if (payload === "") return undefined;
+  if (policy.instructions === "") return undefined;
   let parsed: unknown;
   try {
     parsed = JSON.parse(bodyText) as unknown;
@@ -173,9 +173,10 @@ export function outputShapingPolicyVersionOnRequest(bodyText: string): string | 
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
   const body = parsed as Record<string, unknown>;
-  return instructionCarriers(body).some((carrier) => carrier.includes(payload))
-    ? policy.policyVersion
-    : undefined;
+  const carriers = instructionCarriers(body);
+  if (carriers.some((carrier) => carrier.includes(hook.instructions))) return hook.policyVersion;
+  if (carriers.some((carrier) => carrier.includes(policy.instructions))) return policy.policyVersion;
+  return undefined;
 }
 
 /** Every instruction-level text carrier in the body. User/assistant turns are deliberately excluded. */

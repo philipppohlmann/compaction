@@ -71,8 +71,7 @@ export const OUTPUT_SHAPING_POLICIES: readonly OutputShapingPolicy[] = [
     risk_level: "low",
     defaultOn: true,
     description: "Suppress boilerplate, preamble, apologies, and repetition.",
-    instruction: () =>
-      "Skip boilerplate, apologies, repetition, and routine tool-call narration; keep required updates and task-critical content."
+    instruction: () => "Skip boilerplate, apologies, and repetition; do not summarize what you just said."
   },
   {
     policy_name: "safe_tool_output_filtering",
@@ -145,5 +144,16 @@ export function buildOutputShapingPolicy(opts: BuildOutputShapingOptions = {}): 
     instructions,
     policyVersion: outputShapingPolicyVersion(instructions),
     applied: selected.map((p) => ({ policy_name: p.policy_name, policy_family: p.policy_family, risk_level: p.risk_level }))
+  };
+}
+
+/** Build the exact instruction bytes emitted by subscription hooks. */
+export function buildHookOutputShapingTreatment(): OutputShapingResult {
+  const policy = buildOutputShapingPolicy();
+  const instructions = `${policy.instructions}\n(${OUTPUT_SHAPING_HONESTY_NOTE})`;
+  return {
+    ...policy,
+    instructions,
+    policyVersion: outputShapingPolicyVersion(instructions)
   };
 }

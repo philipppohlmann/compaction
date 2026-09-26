@@ -35,6 +35,10 @@ import { activityTurnLinesFromJsonl, codexStopRunWindowsFromJsonl } from "../../
 import { receiptTurnLinesFromJsonl } from "../../src/cli/commands/watch.js";
 import { buildActivityRows } from "../../src/core/activity-view.js";
 import {
+  buildHookOutputShapingTreatment,
+  buildOutputShapingPolicy
+} from "../../src/core/output-shaping.js";
+import {
   TEST_OUTPUT_POLICY_VERSION,
   seedOutputCalibration
 } from "../helpers/output-calibration-fixture.js";
@@ -234,6 +238,8 @@ describe("Codex exact lifecycle settlement", () => {
     const first = await settle("turn-cold", 1, "2026-09-05T09:00:00.000Z");
     expect(first?.line).toBe("compaction · observed input 427 · output N/A→72 (N/A%, est.) · basic shaping");
     expect(first?.event.output_estimate_state).toBe("unseeded");
+    expect(first?.event.policy_used).toBe(buildHookOutputShapingTreatment().policyVersion);
+    expect(first?.event.policy_used).not.toBe(buildOutputShapingPolicy().policyVersion);
     expect(first?.event.estimated_output_tokens_saved).toBeUndefined();
     const calibration = await loadCalibration(f.env);
     expect(calibration.records).toEqual([]);
@@ -249,6 +255,7 @@ describe("Codex exact lifecycle settlement", () => {
     expect(second?.event.estimated_output_tokens_saved).toBeUndefined();
 
     await seedOutputCalibration(f.env, {
+      policyVersion: buildHookOutputShapingTreatment().policyVersion,
       provider: "openai",
       model: "gpt-5.6-sol",
       regime: "default-shapeable",

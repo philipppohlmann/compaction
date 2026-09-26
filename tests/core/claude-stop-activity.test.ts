@@ -13,6 +13,7 @@ import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import type { UserRun } from "../../src/core/gateway/run-boundary.js";
 import { createUsageMetadata, missingUsageMetadata } from "../../src/core/usage-metadata.js";
 import { confirmedOutputCalibration } from "../helpers/output-calibration-fixture.js";
+import { buildHookOutputShapingTreatment } from "../../src/core/output-shaping.js";
 
 const CORRELATION = "1".repeat(32);
 const POLICY = `output-shaping.v1.sha256.${"a".repeat(64)}`;
@@ -417,6 +418,7 @@ describe("Claude transcript Stop fallback", () => {
     const measured = outputCalibrationResolver(foldCalibrationConfirmation(
       emptyCalibration(),
       confirmedOutputCalibration({
+        policyVersion: buildHookOutputShapingTreatment().policyVersion,
         provider: "anthropic",
         model: "claude-opus-5",
         regime: "default-shapeable"
