@@ -1001,7 +1001,10 @@ export function receiptCompactedInput(receipt: GatewayReceipt): boolean {
     if (!Array.isArray(components)) return false;
     if (
       !components.some(
-        (component) => component === "lcm-compaction" || component === "deterministic-compaction"
+        (component) =>
+          component === "json-whitespace-compaction" ||
+          component === "lcm-compaction" ||
+          component === "deterministic-compaction"
       )
     ) {
       return false;

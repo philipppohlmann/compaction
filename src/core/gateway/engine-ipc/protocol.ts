@@ -158,7 +158,7 @@ export interface EngineIpcReceiptArtifacts {
   };
   /** Content-free optimization-plan facts (selected/rejected method labels, evidence labels). */
   optimization_plan: unknown;
-  /** Applied-component labels, in fixed order (lcm → deterministic → output-shaping). */
+  /** Applied-component labels, in fixed order (JSON whitespace → lcm → deterministic → output-shaping). */
   applied_components: string[];
   /**
    * Output-shaping provenance for the FINAL forwarded request (`attached-this-pass` | `already-active` |

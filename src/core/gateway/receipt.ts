@@ -223,7 +223,7 @@ export interface GatewayReceipt {
     expected_output_token_delta?: number;
   };
   /** Content-free components actually attached/applied on this request. */
-  applied_components?: Array<"lcm-compaction" | "deterministic-compaction" | "output-shaping">;
+  applied_components?: Array<"json-whitespace-compaction" | "lcm-compaction" | "deterministic-compaction" | "output-shaping">;
   /**
    * WAS OUTPUT SHAPING ACTIVE ON THE FINAL MODEL-VISIBLE REQUEST this turn?
    *
