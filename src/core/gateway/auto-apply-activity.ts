@@ -51,7 +51,7 @@ export interface AutoApplyActivityParams {
   authorizationScopeLine: string;
   /** Every eligibility gate that passed (non-empty, an application with zero gates cannot exist). */
   gatesPassed: string[];
-  appliedComponents?: Array<"lcm-compaction" | "deterministic-compaction" | "output-shaping">;
+  appliedComponents?: Array<"json-whitespace-compaction" | "lcm-compaction" | "deterministic-compaction" | "output-shaping">;
   composedInputEstimate?: { before: number; after: number };
 }
 
@@ -67,6 +67,8 @@ export function buildAutoApplyActivityEvent(params: AutoApplyActivityParams): Ac
   const recoveryLocation = `${GATEWAY_RECOVERY_DIR}/${params.recoveryId}.json`;
   const components = params.appliedComponents ?? ["deterministic-compaction"];
   const outputShapingApplied = components.includes("output-shaping");
+  const jsonWhitespaceApplied = components.includes("json-whitespace-compaction");
+  const deterministicApplied = components.includes("deterministic-compaction");
   const inputPlan = params.plan;
   if (!inputPlan && !outputShapingApplied) {
     // Unrepresentable: an application with neither an input plan nor an output component applied
@@ -82,7 +84,10 @@ export function buildAutoApplyActivityEvent(params: AutoApplyActivityParams): Ac
   // OUTPUT, so `estTokensBefore` is already post-mutation and this event would state a reduction of
   // zero on a turn that really reduced. The composed estimate is the end-to-end pair the apply path
   // meters from; use it whenever a layer other than deterministic dedupe contributed.
-  const composedBasis = outputShapingApplied || components.includes("lcm-compaction");
+  const composedBasis =
+    outputShapingApplied ||
+    components.includes("lcm-compaction") ||
+    components.includes("json-whitespace-compaction");
   const inputBefore = inputPlan ? (composedBasis ? params.composedInputEstimate?.before : inputPlan.estTokensBefore) : undefined;
   const inputAfter = inputPlan ? (composedBasis ? params.composedInputEstimate?.after : inputPlan.estTokensAfter) : undefined;
   if (inputPlan && (inputBefore === undefined || inputAfter === undefined)) {
@@ -92,7 +97,11 @@ export function buildAutoApplyActivityEvent(params: AutoApplyActivityParams): Ac
     surface: identity.surface,
     provider: identity.provider,
     model_label: params.requestModel ?? "unknown",
-    policy_used: outputShapingApplied ? "cache-context-optimize" : DEDUPE_POLICY,
+    policy_used: outputShapingApplied
+      ? "cache-context-optimize"
+      : jsonWhitespaceApplied && !deterministicApplied
+        ? "json-whitespace-compaction"
+        : DEDUPE_POLICY,
     ...(inputBefore !== undefined ? { input_before: inputBefore } : {}),
     ...(inputAfter !== undefined ? { input_after: inputAfter } : {}),
     token_source: {
@@ -115,11 +124,16 @@ export function buildAutoApplyActivityEvent(params: AutoApplyActivityParams): Ac
       `applied components: ${components.join(", ")}`,
       // Only stated when the input component actually ran. "removed 0 exact-duplicate block(s)" reads
       // as "it ran and found nothing", which is a different fact from "it never ran".
-      ...(inputPlan
+      ...(inputPlan && deterministicApplied
         ? [
             `deterministic input component: removed ${inputPlan.removedBlocks} exact-duplicate block(s); est. supported-field input ${inputPlan.estTokensBefore} -> ${inputPlan.estTokensAfter} tokens (local estimate)`
           ]
-        : ["no input component ran on this request; the input was forwarded unchanged"]),
+        : !jsonWhitespaceApplied
+          ? ["no input component ran on this request; the input was forwarded unchanged"]
+          : []),
+      ...(jsonWhitespaceApplied
+        ? ["JSON whitespace input component: removed only insignificant JSON whitespace from supported string-valued tool results"]
+        : []),
       ...(outputShapingApplied
         ? [
             ...(inputBefore !== undefined && inputAfter !== undefined

@@ -31,6 +31,12 @@ export const APPLY_LABEL_NOOP =
 export const OUTPUT_SHAPING_APPLY_LABEL =
   "apply (cache + context optimize): deterministic pre-generation output-shaping instructions were attached under stored scoped authorization; the original request is retained locally and recoverable. Provider-reported output usage is recorded, but no output-token or cost reduction is claimed without a measured A/B and sufficiency evaluation.";
 
+const JSON_WHITESPACE_APPLY_LABEL =
+  "apply (JSON whitespace compaction): insignificant JSON whitespace was removed from supported string-valued tool results; JSON string bytes and non-whitespace lexemes were preserved, and the original request is retained locally and recoverable. No output-token, cost, provider-billing, or semantic-compaction claim.";
+
+const JSON_WHITESPACE_AND_OUTPUT_SHAPING_APPLY_LABEL =
+  "apply (cache + context optimize): insignificant JSON whitespace was removed from supported string-valued tool results and deterministic pre-generation output-shaping instructions were attached; the original request is retained locally and recoverable. Provider-reported output usage is recorded, but no output-token or cost reduction is claimed without measured evidence.";
+
 /**
  * The label for OPEN `basic` gateway shaping.
  *
@@ -87,7 +93,7 @@ export function buildApplyReceipt(params: {
   authorizationId?: string;
   failClosedReason?: string;
   optimizationPlan?: OptimizationPlan;
-  appliedComponents?: Array<"lcm-compaction" | "deterministic-compaction" | "output-shaping">;
+  appliedComponents?: Array<"json-whitespace-compaction" | "lcm-compaction" | "deterministic-compaction" | "output-shaping">;
   /**
    * Output-shaping provenance for the FINAL forwarded request. Distinct from `appliedComponents`, which
    * records only what this pass mutated. See `GatewayReceipt.output_shaping_state`. Omitted ⇒ the receipt
@@ -161,6 +167,20 @@ export function buildApplyReceipt(params: {
   // never fall through to the deterministic reduction claim or the "forwarded UNCHANGED" no-op.
   let applyLabel: string;
   if (params.applied && params.activation.policy === LCM_APPLY_POLICY) applyLabel = LCM_APPLY_LABEL_MUTATED;
+  else if (
+    params.applied &&
+    params.appliedComponents?.includes("json-whitespace-compaction") &&
+    params.appliedComponents.includes("output-shaping")
+  ) {
+    applyLabel = JSON_WHITESPACE_AND_OUTPUT_SHAPING_APPLY_LABEL;
+  }
+  else if (
+    params.applied &&
+    params.appliedComponents?.includes("json-whitespace-compaction") &&
+    plan?.changed !== true
+  ) {
+    applyLabel = JSON_WHITESPACE_APPLY_LABEL;
+  }
   else if (params.applied && params.appliedComponents?.includes("output-shaping") && plan?.changed) {
     applyLabel = COMBINED_APPLY_LABEL(plan.reductionPercent);
   }
@@ -177,6 +197,7 @@ export function buildApplyReceipt(params: {
   const optimizationPlan = params.optimizationPlan;
   const shapingApplied = params.appliedComponents?.includes("output-shaping") === true;
   const lcmApplied = params.appliedComponents?.includes("lcm-compaction") === true;
+  const jsonWhitespaceApplied = params.appliedComponents?.includes("json-whitespace-compaction") === true;
 
   /**
    * WHICH MEASUREMENT IS THE INPUT BASIS.
@@ -193,7 +214,7 @@ export function buildApplyReceipt(params: {
    * semantics and adds no parallel accounting — it points the receipt at the figure the apply path
    * already treats as authoritative.
    */
-  const composedBasis = shapingApplied || lcmApplied;
+  const composedBasis = shapingApplied || lcmApplied || jsonWhitespaceApplied;
   const inputBefore = composedBasis ? params.composedInputEstimate?.before : plan?.estTokensBefore;
   const inputAfter = composedBasis
     ? params.composedInputEstimate?.after

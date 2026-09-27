@@ -1172,7 +1172,7 @@ interface ApplyOutcome {
   applied: boolean;
   mutatedBody?: Buffer;
   recoveryId?: string;
-  appliedComponents?: Array<"lcm-compaction" | "deterministic-compaction" | "output-shaping">;
+  appliedComponents?: Array<"json-whitespace-compaction" | "lcm-compaction" | "deterministic-compaction" | "output-shaping">;
   /** Output-shaping provenance for the final forwarded request (see `GatewayReceipt.output_shaping_state`). */
   outputShapingState?: "attached-this-pass" | "already-active" | "absent";
   outputShapingPolicyVersion?: string;
@@ -1850,7 +1850,12 @@ async function resolveStoredAuthorizationApply(
     // Open/base capability; charging it to the Community input allowance, or withholding it once that
     // allowance is spent, would put a Community user at their ceiling BELOW the Open baseline.
     const compactsInput = (components: unknown[]): boolean =>
-      components.some((component) => component === "lcm-compaction" || component === "deterministic-compaction");
+      components.some(
+        (component) =>
+          component === "json-whitespace-compaction" ||
+          component === "lcm-compaction" ||
+          component === "deterministic-compaction"
+      );
     let compactedInput = compactsInput(artifacts.applied_components as unknown[]);
 
     if (compactedInput) {
@@ -1984,7 +1989,7 @@ async function resolveStoredAuthorizationApply(
       const receiptFacts = (from: NonNullable<typeof artifacts>) => ({
         plan: from.deterministic_plan as unknown as DedupePlan,
         optimizationPlan: from.optimization_plan as OptimizationPlanType,
-        appliedComponents: from.applied_components as Array<"lcm-compaction" | "deterministic-compaction" | "output-shaping">,
+        appliedComponents: from.applied_components as Array<"json-whitespace-compaction" | "lcm-compaction" | "deterministic-compaction" | "output-shaping">,
         // Engine-computed on the FINAL forwarded body; absent from an older engine ⇒ undefined ⇒ unknown.
         outputShapingState: from.output_shaping_state as "attached-this-pass" | "already-active" | "absent" | undefined,
         outputShapingPolicyVersion: from.output_shaping_policy_version as string | undefined,
