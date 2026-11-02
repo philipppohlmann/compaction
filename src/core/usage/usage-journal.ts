@@ -293,6 +293,15 @@ export type AppendUsageEventResult =
 export interface AppendCeiling {
   /** The period's total allowance, from the verified lease. */
   allowanceTokens: number;
+  /**
+   * The allowance of the lease stored NOW, or `undefined` when no valid lease for this period remains.
+   * When supplied it REPLACES `allowanceTokens` and is read under the lock, AFTER the watermark: a
+   * renewal writes its replacement lease before it moves the watermark (and with no valid lease it may
+   * move it at once), so the allowance read here is never older than the watermark it is measured
+   * against. A caller's request-start allowance is: measured against a watermark a renewal has since
+   * advanced, it would no longer be charged for the entries that renewal reconciled.
+   */
+  currentAllowanceTokens?: () => number | undefined;
 }
 
 /**
@@ -376,9 +385,18 @@ export async function appendUsageEvent(
       // sees the freshest reconciled position. A local file read only — no network ever runs under
       // this lock (that would wedge the gateway's HTTP handler behind a slow upstream).
       const watermark = await readReconciliationWatermark(env);
+      const allowanceTokens = options.ceiling.currentAllowanceTokens
+        ? options.ceiling.currentAllowanceTokens()
+        : options.ceiling.allowanceTokens;
+      if (allowanceTokens === undefined) {
+        return {
+          appended: false,
+          reason: "lease-not-valid-at-debit - no valid lease for this period backs this debit (nothing written; fail-closed)"
+        };
+      }
       const consumption = consumptionFromJournalRead(
         read,
-        options.ceiling.allowanceTokens,
+        allowanceTokens,
         event.period_id,
         watermarkForPeriod(watermark, event.period_id)?.reconciled_through_entry_hash
       );

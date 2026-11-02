@@ -1,8 +1,8 @@
 {
   "name": "@compaction/cli",
-  "version": "0.6.10",
+  "version": "0.6.11",
   "compactionRelease": {
-    "cliVersion": "0.6.10",
+    "cliVersion": "0.6.11",
     "launcherProtocol": 1,
     "integrationProtocol": 1,
     "gatewayProtocol": 1,
@@ -20,10 +20,10 @@
   "homepage": "https://compaction.dev",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/papo-2020/compaction.git"
+    "url": "git+https://github.com/philipppohlmann/compaction.git"
   },
   "bugs": {
-    "url": "https://github.com/papo-2020/compaction/issues",
+    "url": "https://github.com/philipppohlmann/compaction/issues",
     "email": "hello@compaction.dev"
   },
   "type": "module",

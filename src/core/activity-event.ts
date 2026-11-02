@@ -18,6 +18,7 @@ import {
   type CrossSurfaceEvent
 } from "./cross-surface-event.js";
 import type { CalibrationState } from "./output-shaping-calibration-store.js";
+import { outputShapingTreatmentFamilyForPolicyVersion } from "./output-shaping.js";
 
 /** Whether/how the user approved what Compaction did on this run (exact values). */
 export const ACTIVITY_APPROVAL_STATUSES = [
@@ -93,10 +94,14 @@ export interface ActivityExtension {
   run_started_at?: string;
   /** Positive-only proof: present only when shaping was active on this exact turn. */
   output_shaping_state?: "active";
-  /** Positive estimated saving derived only from exact-key measured calibration. */
+  /** Positive estimated saving derived from exact measured or strictly compatible family calibration. */
   estimated_output_tokens_saved?: number;
-  output_estimate_basis?: "measured";
+  output_estimate_basis?: "measured" | "family-calibrated";
   output_estimate_state?: CalibrationState;
+  /** Substantive shaping family used by the estimate; distinct from exact `policy_used`. */
+  output_calibration_family_version?: string;
+  /** Content-free identity of the exact or family evidence used for the settled estimate. */
+  output_calibration_evidence_id?: string;
   /** Proven posture of this settled event; absence means no label is claimed. */
   apply_posture?: "basic" | "full";
   /** Which local evidence produced the settled counts. */
@@ -284,8 +289,12 @@ export function validateActivityEvent(value: unknown): ActivityEventValidation {
   if (event.output_shaping_state !== undefined && event.output_shaping_state !== "active") {
     problems.push('output_shaping_state: must be the positive-only value "active" when present');
   }
-  if (event.output_estimate_basis !== undefined && event.output_estimate_basis !== "measured") {
-    problems.push('output_estimate_basis: only exact-key "measured" calibration is permitted');
+  if (
+    event.output_estimate_basis !== undefined &&
+    event.output_estimate_basis !== "measured" &&
+    event.output_estimate_basis !== "family-calibrated"
+  ) {
+    problems.push('output_estimate_basis: must be "measured" | "family-calibrated"');
   }
   if (
     event.output_estimate_state !== undefined &&
@@ -301,8 +310,42 @@ export function validateActivityEvent(value: unknown): ActivityEventValidation {
   }
   if (event.estimated_output_tokens_saved !== undefined) {
     if (event.output_shaping_state !== "active") problems.push("estimated_output_tokens_saved: requires positive shaping proof");
-    if (event.output_estimate_basis !== "measured") problems.push("estimated_output_tokens_saved: requires measured calibration basis");
+    if (event.output_estimate_basis !== "measured" && event.output_estimate_basis !== "family-calibrated") {
+      problems.push("estimated_output_tokens_saved: requires exact measured or family-calibrated basis");
+    }
     if (event.output_estimate_state !== "calibrated") problems.push("estimated_output_tokens_saved: requires calibrated state");
+  }
+  if (
+    event.output_calibration_family_version !== undefined &&
+    (typeof event.output_calibration_family_version !== "string" ||
+      !/^output-shaping\.family\.v1\.sha256\.[a-f0-9]{64}$/.test(event.output_calibration_family_version))
+  ) {
+    problems.push("output_calibration_family_version: invalid substantive treatment-family identity");
+  }
+  if (
+    event.output_calibration_evidence_id !== undefined &&
+    (typeof event.output_calibration_evidence_id !== "string" ||
+      !/^output-shaping\.evidence\.v1\.sha256\.[a-f0-9]{64}$/.test(event.output_calibration_evidence_id))
+  ) {
+    problems.push("output_calibration_evidence_id: invalid content-free calibration evidence identity");
+  }
+  if (event.output_estimate_basis === "family-calibrated") {
+    if (typeof event.policy_used !== "string" || !/^output-shaping\.v1\.sha256\.[a-f0-9]{64}$/.test(event.policy_used)) {
+      problems.push("family-calibrated output estimate: requires exact carrier identity in policy_used");
+    }
+    if (event.output_calibration_family_version === undefined) {
+      problems.push("family-calibrated output estimate: requires substantive treatment-family identity");
+    }
+    if (event.output_calibration_evidence_id === undefined) {
+      problems.push("family-calibrated output estimate: requires family evidence identity");
+    }
+    if (
+      typeof event.policy_used === "string" &&
+      typeof event.output_calibration_family_version === "string" &&
+      outputShapingTreatmentFamilyForPolicyVersion(event.policy_used) !== event.output_calibration_family_version
+    ) {
+      problems.push("family-calibrated output estimate: exact carrier and family identity are incompatible");
+    }
   }
   if (event.apply_posture !== undefined && event.apply_posture !== "basic" && event.apply_posture !== "full") {
     problems.push("apply_posture: must be basic | full when present");
@@ -388,6 +431,8 @@ export function validateActivityEvent(value: unknown): ActivityEventValidation {
     event.estimated_output_tokens_saved !== undefined ||
     event.output_estimate_basis !== undefined ||
     event.output_estimate_state !== undefined ||
+    event.output_calibration_family_version !== undefined ||
+    event.output_calibration_evidence_id !== undefined ||
     event.apply_posture !== undefined ||
     event.measurement_source !== undefined
   ) {

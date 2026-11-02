@@ -3,11 +3,22 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { readUpdatePreferences, writeUpdatePreferences } from "../../core/onboarding-preferences.js";
 import { compareReleaseVersions } from "../../core/update/compatibility.js";
+import { codexHookReviewNotice } from "../../core/codex-hook-trust.js";
+import { pinOwnedNativeHookCommands } from "../../core/update/native-hook-pinning.js";
 import { loadExecutingManagedInstallation } from "../../core/update/ownership.js";
 import { discoverVersion, type UpdateChannel } from "../../core/update/registry.js";
 import { stageLatestUpdate } from "../../core/update/worker.js";
 import { withManagedLock } from "../../core/update/state.js";
 import { engineEulaRequirementInstruction } from "./engine.js";
+
+/**
+ * The official installer command, as a printed instruction. Exported so other surfaces can NAME the
+ * installer without duplicating the literal: `tests/security/web-host-single-source-in-src.test.ts`
+ * allows this host in THIS file only, and that per-file entry is the review — a second copy elsewhere
+ * would either fail that guard or require widening it, and the point of the guard is that the set of
+ * hosts named in `src/` stays reviewable. Printed only; never opened and never fetched.
+ */
+export const OFFICIAL_INSTALLER_COMMAND = "curl -fsSL https://cli.compaction.dev/install | sh" as const;
 
 export function externalUpdateInstruction(entry = process.argv[1], channel: UpdateChannel = "stable"): string {
   const tag = channel === "preview" ? "next" : "latest";
@@ -68,6 +79,11 @@ export function registerUpdateCommand(program: Command): void {
           return;
         }
         if (options.channel) await withManagedLock(managed.root, () => writeUpdatePreferences({ channel: channel as UpdateChannel }));
+        // Owned hooks must run this install's launcher, never whatever `compaction` PATH resolves first.
+        // Local file IO only, before any network step, so an offline update still repairs them.
+        if (pinOwnedNativeHookCommands(managed.receipt.launcherPath, { codex: true }).some((pinned) => pinned.tool === "codex")) {
+          console.log(codexHookReviewNotice());
+        }
         const result = await stageLatestUpdate(managed.root, channel);
         console.log(result.status !== "unchanged" ? `Compaction ${result.version} ${result.status === "already-staged" ? "already " : ""}staged for a safe next session.` : `Already up to date: ${result.version}.`);
         if (result.reason) console.log(`Engine selection: ${result.engineMode === "signed" ? "verified compatible engine" : "Basic"} (${result.reason}).`);

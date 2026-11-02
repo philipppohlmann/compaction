@@ -204,8 +204,8 @@ describe("hooks shape <tool> runtime - auto-apply (default-ON), kill-switch, hol
     });
     const stopped = await run(["hooks", "line", "codex"], { env, input: stop });
     const systemMessage = JSON.parse(stopped.stdout).systemMessage as string;
-    expect(systemMessage).toBe("compaction · observed input 427 · output N/A→41 (N/A%, est.) · basic shaping");
-    expect(systemMessage).not.toMatch(/recording|reporting|47%/);
+    expect(systemMessage).toBe("compaction · observed input 427 · output 49→41 (−16.3%, est.)");
+    expect(systemMessage).not.toMatch(/recording|reporting|47(\.\d+)?%/);
 
     const watched = await run(["watch", "--once"], { env, cwd: home });
     expect(watched.stdout.split("\n")).toContain(systemMessage);

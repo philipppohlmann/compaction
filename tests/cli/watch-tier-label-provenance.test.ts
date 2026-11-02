@@ -43,13 +43,13 @@ async function seedMeasuredCalibration(configDir: string): Promise<void> {
 const WATCH_SCOPE: ShapingTurnScope = { tool: "claude-code", sessionId: "watch-test-session" };
 
 /**
- * THE PER-TURN TIER LABEL MUST DESCRIBE THE TURN, NOT TODAY'S SETTING.
+ * HISTORICAL TURN EVIDENCE MUST NOT CHANGE WITH TODAY'S SETTING.
  *
  * `compaction watch`, `watch --once` and `compaction status`'s "Last turns" all replay HISTORICAL
- * receipts through one formatter. The label they carried was read from the device's CURRENT product
- * mode, so flipping `compaction mode` retroactively relabelled turns that were never produced under
+ * receipts through one formatter. The posture once came from the device's CURRENT product mode, so
+ * flipping `compaction mode` retroactively relabelled turns that were never produced under
  * it - the same receipt rendered `apply off` or `basic shaping` depending on a setting changed days
- * later. The fix: omit the label on historical surfaces, and derive it from the receipt wherever the receipt proves it.
+ * later. The renderer now keeps the receipt's evidence and does not add basic/full posture words.
  *
  * These tests assert the PROPERTY (identical receipt ⇒ identical line) separately from the exact
  * strings, so a string change can never mask the property going dead.
@@ -154,7 +154,7 @@ describe("historical per-turn lines are independent of today's product mode", ()
     const asObserve = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: observeCfg } });
     const asBasic = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: basicCfg } });
 
-    // THE DEFECT: today this is `... · apply off · id ...` vs `... · basic shaping · id ...` for one
+    // THE DEFECT WAS `... · apply off · id ...` vs `... · basic shaping · id ...` for one
     // receipt that neither mode produced. The receipt records `mode: "record"`, no `request_mutated`
     // and no `applied_components` - there is no evidence for either label.
     expect(asBasic.lines, "the same receipt must render identically whatever the mode says today").toEqual(
@@ -200,14 +200,14 @@ describe("historical per-turn lines are independent of today's product mode", ()
   });
 });
 
-describe("the label the receipt DOES prove survives a contradicting preference", () => {
-  it("labels a gateway-shaped receipt `basic shaping` even while the device says `observe`", async () => {
+describe("the output evidence the receipt proves survives a contradicting preference", () => {
+  it("shows a gateway-shaped receipt's output axis even while the device says `observe`", async () => {
     await writeReceipts([shapedReceipt("ffffffff11112222333344445555ffff")]);
     const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: observeCfg } });
 
     // The receipt records the mutation and the component. That is a statement about THAT turn, so it
     // outlives a later `compaction mode observe`.
-    expect(lines[0]).toContain("basic shaping");
+    expect(lines[0]).toContain("output N/A→412 (N/A%, est.)");
     expect(lines[0]).not.toContain("apply off");
   });
 
@@ -219,17 +219,16 @@ describe("the label the receipt DOES prove survives a contradicting preference",
   });
 });
 
-describe("a full apply is never relabelled as Open `basic shaping`", () => {
+describe("a full apply always keeps its measured input evidence", () => {
   /**
    * A REAL Community full apply: the input was compacted (`estimated_input_tokens_before/after`) and
    * output shaping rode the same request, which is what the composed apply pipeline produces.
    *
    * THIS IS THE GUARD FOR THE INPUT-ARROW CONJUNCT of `receiptProvenOpenLabel`. Output shaping was
    * ACTIVE on a full apply (`output_shaping_state: "attached-this-pass"`), so without the `no input
-   * before→after` condition the helper answers `basic` for it — and every surface that asks (`watch`,
-   * `status`, the Stop-hook line, the gateway's own inline line) would print `basic shaping` on a
-   * Community full apply while suppressing its measured reduction. That is the same class of false
-   * label this whole rule exists to remove, pointed the other way.
+   * before→after` condition the helper answers `basic` for it. The Open path would then suppress the
+   * measured reduction. These cases pin the input axis and receipt identity, with the hidden posture
+   * words checked only as a presentation invariant.
    */
   function fullApplyReceipt(id: string): GatewayReceipt {
     return {
@@ -250,7 +249,7 @@ describe("a full apply is never relabelled as Open `basic shaping`", () => {
     };
   }
 
-  it("proves no Open label for a receipt carrying an input before→after", () => {
+  it("proves no Open basic classification for a receipt carrying an input before→after", () => {
     expect(receiptProvenOpenLabel(fullApplyReceipt("aaaa1111222233334444555566667777"))).toBeUndefined();
 
     // NON-VACUOUS, and pinned to the input-arrow condition alone: the SAME receipt with ONLY the two
@@ -262,52 +261,64 @@ describe("a full apply is never relabelled as Open `basic shaping`", () => {
     expect(receiptProvenOpenLabel(withoutInputArrow as GatewayReceipt)).toBe("basic");
   });
 
-  it("does not print `basic shaping` for a full apply replayed on an Open device", async () => {
+  it("keeps a full apply's measured axis and identity when replayed on an Open device", async () => {
     await writeReceipts([fullApplyReceipt("bbbb1111222233334444555566667777")]);
     // The device is Open TODAY; the receipt is a full apply from when it was not. The Open path must
     // not adopt it as its own shaping - it says nothing rather than misattributing the turn.
     const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: observeCfg } });
+    expect(lines[0]).toContain("input 41,210→21,876 (−47%)");
+    expect(lines[0]).toContain("id bbbb1111");
+    expect(lines[0]).not.toContain("observed input");
     expect(lines[0]).not.toContain("basic shaping");
     expect(lines[0]).not.toContain("apply off");
   });
 
-  it("does not print `basic shaping` for a full apply, whatever the injected tier says", () => {
+  it("keeps the measured axis for a full apply, whatever the injected tier says", () => {
     const chunk = JSON.stringify(fullApplyReceipt("cccc1111222233334444555566667777")) + "\n";
     for (const productTier of ["observe", "basic"] as const) {
-      expect(receiptLinesFromJsonl(chunk, { productTier })[0]).not.toContain("basic shaping");
+      const line = receiptLinesFromJsonl(chunk, { productTier })[0];
+      expect(line).toContain("input 41,210→21,876 (−47%)");
+      expect(line).toContain("id cccc1111");
+      expect(line).not.toContain("observed input");
+      expect(line).not.toContain("basic shaping");
     }
   });
 
   /**
-   * THE LIVE PATH, which the three cases above do not reach. On a live batch the label may also come
-   * from the turn's own shaped-evidence (`lastTurnWasShaped`) — and that fallback must decline a
-   * full-apply receipt too. The prompt hook shaping a turn does not make `basic shaping` a true
-   * description of a turn whose receipt records an input compaction, and the Open rendering that
-   * label rides suppresses the measured reduction the receipt actually carries.
+   * THE LIVE PATH, which the three cases above do not reach. A live batch also receives the turn's own
+   * shaped evidence (`lastTurnWasShaped`), and that fallback must not select the Open input path for a
+   * receipt that already carries a measured input compaction.
    *
    * Each case is paired with a CONTROL that differs only in the receipt, so a green result cannot come
    * from shaped-evidence being absent in the harness.
    */
-  it("does not take the live shaped-evidence label on a full apply (shared renderer)", () => {
+  it("keeps full-apply evidence under live shaped evidence (shared renderer)", () => {
     const context = { productTier: "basic" as const, shapedEvidence: true };
     const applyChunk = JSON.stringify(fullApplyReceipt("dddd1111222233334444555566667777")) + "\n";
-    expect(receiptLinesFromJsonl(applyChunk, context)[0]).not.toContain("basic shaping");
+    const applyLine = receiptLinesFromJsonl(applyChunk, context)[0];
+    expect(applyLine).toContain("input 41,210→21,876 (−47%)");
+    expect(applyLine).toContain("id dddd1111");
+    expect(applyLine).not.toContain("observed input");
+    expect(applyLine).not.toContain("basic shaping");
 
-    // CONTROL: same context, same live evidence, non-apply receipt ⇒ the fallback DOES label it.
+    // CONTROL: same context, same live evidence, non-apply receipt ⇒ the shaped output axis appears.
     const recordChunk = JSON.stringify(recordReceipt("eeee1111222233334444555566667777")) + "\n";
-    expect(receiptLinesFromJsonl(recordChunk, context)[0]).toContain("basic shaping");
+    expect(receiptLinesFromJsonl(recordChunk, context)[0]).toContain("output N/A→412 (N/A%, est.)");
   });
 
-  it("does not take the live shaped-evidence label on a full apply (real `watch` follow loop)", async () => {
+  it("keeps full-apply evidence under live shaped evidence (real `watch` follow loop)", async () => {
     const env = { COMPACTION_CONFIG_DIR: observeCfg } as NodeJS.ProcessEnv;
     await recordShapingOutcome(WATCH_SCOPE, "shape", env);
 
     const lines = await liveWatchLines(env, () => appendReceipt(fullApplyReceipt("ffff1111222233334444555566667777")));
     expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("input 41,210→21,876 (−47%)");
+    expect(lines[0]).toContain("id ffff1111");
+    expect(lines[0]).not.toContain("observed input");
     expect(lines[0]).not.toContain("basic shaping");
   });
 
-  it("CONTROL: the same live follow loop DOES label a non-apply turn `basic shaping`", async () => {
+  it("CONTROL: the same live follow loop shows a non-apply turn's shaped output axis", async () => {
     // Identical harness, identical recorded shaping outcome; only the receipt differs. Without this
     // the case above could pass simply because `lastTurnWasShaped` never became true.
     const env = { COMPACTION_CONFIG_DIR: observeCfg } as NodeJS.ProcessEnv;
@@ -315,16 +326,16 @@ describe("a full apply is never relabelled as Open `basic shaping`", () => {
 
     const lines = await liveWatchLines(env, () => appendReceipt(recordReceipt("aaaa9999222233334444555566667777")));
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("basic shaping");
+    expect(lines[0]).toContain("output N/A→412 (N/A%, est.)");
   });
 
   /**
    * `watch` fails closed. It is a side pane with no tool session identity, so it cannot name the turn on
    * screen — and the shaping evidence is now keyed by session. Without an injected scope it must decline
-   * the label rather than borrow whichever session recorded last, which is exactly what the shared global
-   * slot used to let it do.
+   * the shaped output axis rather than borrow whichever session recorded last, which is exactly what
+   * the shared global slot used to let it do.
    */
-  it("declines the shaped label when it cannot name the session (no injected scope)", async () => {
+  it("declines the shaped output axis when it cannot name the session (no injected scope)", async () => {
     const env = { COMPACTION_CONFIG_DIR: observeCfg } as NodeJS.ProcessEnv;
     // A live, valid `shape` record exists — it just belongs to a session `watch` cannot claim to be.
     await recordShapingOutcome(WATCH_SCOPE, "shape", env);
@@ -337,19 +348,21 @@ describe("a full apply is never relabelled as Open `basic shaping`", () => {
 });
 
 describe("receiptLinesFromJsonl (the shared renderer watch/status both call)", () => {
-  it("ignores the injected product tier for the label on a receipt that proves nothing", () => {
+  it("ignores the injected product tier on a receipt that proves nothing", () => {
     const chunk = JSON.stringify(recordReceipt("1111111111112222333344445555aaaa")) + "\n";
     const asObserve = receiptLinesFromJsonl(chunk, { productTier: "observe" });
     const asBasic = receiptLinesFromJsonl(chunk, { productTier: "basic" });
     expect(asBasic).toEqual(asObserve);
   });
 
-  it("labels the live batch `basic shaping` when the turn's own shaped-evidence says so", () => {
+  it("shows the live batch's shaped output axis when the turn's own evidence says so", () => {
     // The LIVE path only: `shapedEvidence` describes the turn that just happened, and it is already
     // the evidence the adjacent output arrow uses - so the two can never disagree. Historical replays
     // never receive it (see `WatchRenderContext.shapedEvidence`).
     const chunk = JSON.stringify(recordReceipt("2222222211112222333344445555aaaa")) + "\n";
-    expect(receiptLinesFromJsonl(chunk, { productTier: "observe", shapedEvidence: true })[0]).toContain("basic shaping");
+    expect(receiptLinesFromJsonl(chunk, { productTier: "observe", shapedEvidence: true })[0]).toContain(
+      "output N/A→412 (N/A%, est.)"
+    );
   });
 });
 
@@ -407,10 +420,9 @@ describe("the replay output arrow rides the receipt's own shaping evidence", () 
     const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: fullCfg } });
     // The reconstructed BEFORE is this device's MEASURED rate applied to THIS turn's own output:
     // 327 + round(327 × 0.38 / 0.62) = 527.
-    expect(lines[0]).toContain("output 527→327 (−38%, est.)");
-    // The measured input axis and the label are unchanged by this gate.
+    expect(lines[0]).toContain("output 527→327 (−38.0%, est.)");
+    // The measured input axis is unchanged by this gate.
     expect(lines[0]).toContain("input 40,203→38,999");
-    expect(lines[0]).toContain("full apply");
   });
 
   it("`watch --once` renders the arrow for a REPLAYED gateway-shaped Open receipt", async () => {
@@ -419,7 +431,7 @@ describe("the replay output arrow rides the receipt's own shaping evidence", () 
     await runWatchOnce({ once: true }, { cwd, env: { COMPACTION_CONFIG_DIR: basicCfg }, print: (l) => printed.push(l) });
     const line = printed.find((l) => l.startsWith("compaction · ")) ?? "";
     // 412 + round(412 × 0.38 / 0.62) = 665.
-    expect(line).toContain("output 665→412 (−38%, est.)");
+    expect(line).toContain("output 665→412 (−38.0%, est.)");
   });
 
   /**
@@ -469,7 +481,7 @@ describe("the replay output arrow rides the receipt's own shaping evidence", () 
     } as GatewayReceipt;
     await writeReceipts([alreadyActive]);
     const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: fullCfg } });
-    expect(lines[0]).toContain("output 527→327 (−38%, est.)");
+    expect(lines[0]).toContain("output 527→327 (−38.0%, est.)");
     expect(lines[0]).toContain("input 40,203→38,999");
   });
 
@@ -511,7 +523,7 @@ describe("the replay output arrow rides the receipt's own shaping evidence", () 
     await writeReceipts([fullApplyReceipt("aaaabbbb11112222333344445555cccc")]);
     const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: fullCfg } });
     // 20% measured: 327 / (1 − 0.2) = 409.
-    expect(lines[0]).toContain("output 409→327 (−20%, est.)");
+    expect(lines[0]).toContain("output 409→327 (−20.0%, est.)");
     expect(lines[0], "a measured rate must never carry the default-prior marker").not.toContain("default prior");
   });
 
@@ -528,19 +540,17 @@ describe("the replay output arrow rides the receipt's own shaping evidence", () 
 });
 
 /**
- * THE OPEN LABEL RIDES THE SAME EVIDENCE THE ARROW RIDES.
+ * THE OPEN CLASSIFICATION RIDES THE SAME EVIDENCE THE ARROW RIDES.
  *
  * `receiptProvenOpenLabel` used to read `request_mutated` + an `output-shaping` entry in
  * `applied_components` — "did THIS PASS mutate" — after the arrow beside it had already moved to
  * `output_shaping_state`. On the ordinary Open `already-active` turn (policy attached upstream by the
- * tool's own prompt hook, so the planner correctly attached nothing) the line therefore drew a savings
- * arrow with NO label naming what produced it: the stronger claim shown, the weaker one withheld.
+ * tool's own prompt hook, so the planner correctly attached nothing) the two decisions diverged.
  *
- * The state is authoritative whenever it is present. `absent` never takes a label — not from the
- * receipt and not from live session state — and a legacy receipt with no state fails closed exactly as
- * the arrow does.
+ * The state is authoritative whenever it is present. `absent` never takes the basic classification
+ * from live session state, and a legacy receipt with no state fails closed exactly as the arrow does.
  */
-describe("the Open label reads output_shaping_state, the same evidence as the arrow", () => {
+describe("the Open classification reads output_shaping_state, the same evidence as the arrow", () => {
   /** The ordinary Open LCM turn: policy already on the request upstream, this pass attached none. */
   function alreadyActiveOpenReceipt(id: string): GatewayReceipt {
     return {
@@ -575,15 +585,13 @@ describe("the Open label reads output_shaping_state, the same evidence as the ar
     expect(receiptProvenOpenLabel(receipt)).toBe("basic");
   });
 
-  it("labels an already-active Open turn `basic shaping` AND draws the arrow on replay", async () => {
+  it("draws the arrow for an already-active Open turn on replay", async () => {
     await writeReceipts([alreadyActiveOpenReceipt("bbbb0000111122223333444455550000")]);
     const { lines } = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: basicCfg } });
     expect(lines).toHaveLength(1);
     const line = lines[0] as string;
-    // Label and arrow name the same event: a number without a method is the state this pins against.
-    expect(line).toContain("basic shaping");
     // 412 + round(412 × 0.38 / 0.62) = 665.
-    expect(line).toContain("output 665→412 (−38%, est.)");
+    expect(line).toContain("output 665→412 (−38.0%, est.)");
     expect(line).not.toContain("apply off");
   });
 
@@ -592,7 +600,7 @@ describe("the Open label reads output_shaping_state, the same evidence as the ar
     const asObserve = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: observeCfg } });
     const asBasic = await lastReceiptLines(1, { cwd, env: { COMPACTION_CONFIG_DIR: basicCfg } });
     expect(asBasic.lines).toEqual(asObserve.lines);
-    expect(asBasic.lines[0]).toContain("basic shaping");
+    expect(asBasic.lines[0]).toContain("output 665→412 (−38.0%, est.)");
   });
 
   it("proves nothing and draws nothing for an explicit `absent` receipt on replay", async () => {
@@ -611,8 +619,8 @@ describe("the Open label reads output_shaping_state, the same evidence as the ar
     expect(line).not.toContain("est.");
   });
 
-  it("does not label a LEGACY receipt (no state) from `applied_components` alone", () => {
-    // It carries the old mutation evidence and no state: the label fails closed like the arrow does.
+  it("does not classify a LEGACY receipt (no state) from `applied_components` alone", () => {
+    // It carries the old mutation evidence and no state: classification fails closed like the arrow.
     const legacy = { ...shapedReceipt("eeee0000111122223333444455550000") } as Partial<GatewayReceipt>;
     delete legacy.output_shaping_state;
     expect(legacy.request_mutated).toBe(true);
@@ -625,21 +633,21 @@ describe("the Open label reads output_shaping_state, the same evidence as the ar
    * authoritative when present; the live fallback exists for the receipt that recorded none.
    */
   describe("openLineForTurn: an explicit state is never overridden by live session evidence", () => {
-    it("never labels an explicit `absent` receipt `basic shaping` from live evidence", () => {
+    it("never classifies an explicit `absent` receipt as basic from live evidence", () => {
       expect(openLineForTurn(absentOpenReceipt("ffff0000111122223333444455550000"), true)).toBe("unlabeled");
     });
 
-    it("CONTROL: the same live evidence DOES label a legacy receipt that recorded no state", () => {
+    it("CONTROL: the same live evidence classifies a legacy receipt that recorded no state", () => {
       // Differs from the case above in the receipt only, so a green result cannot come from the live
       // fallback being dead.
       expect(openLineForTurn(recordReceipt("0000ffff111122223333444455550000"), true)).toBe("basic");
     });
 
-    it("labels an already-active receipt `basic` with no live evidence at all (replay)", () => {
+    it("classifies an already-active receipt as basic with no live evidence at all (replay)", () => {
       expect(openLineForTurn(alreadyActiveOpenReceipt("1111ffff111122223333444455550000"), false)).toBe("basic");
     });
 
-    it("still never labels an input-apply receipt, whatever the state says", () => {
+    it("still never classifies an input-apply receipt as Open basic, whatever the state says", () => {
       const fullApply = {
         ...alreadyActiveOpenReceipt("2222ffff111122223333444455550000"),
         estimated_input_tokens_before: 41210,
@@ -655,7 +663,7 @@ describe("the Open label reads output_shaping_state, the same evidence as the ar
    * not inherit `true` from the later shaped turn and draw an arrow over a saving that did not occur.
    */
   describe("a coalesced live drain does not let `absent` inherit a later turn's shaping", () => {
-    it("shared renderer: [absent, already-active] under live shaped-evidence → arrow and label on the second only", async () => {
+    it("shared renderer: [absent, already-active] under live evidence → arrow on the second only", async () => {
       const env = { COMPACTION_CONFIG_DIR: basicCfg };
       const calibrationResolver = await loadOutputCalibrationResolver(env);
       const chunk =
@@ -671,8 +679,7 @@ describe("the Open label reads output_shaping_state, the same evidence as the ar
       expect(absentLine).not.toContain("est.");
       expect(absentLine).not.toContain("basic shaping");
       expect(activeLine).toContain("id 4444ffff");
-      expect(activeLine).toContain("output 665→412 (−38%, est.)");
-      expect(activeLine).toContain("basic shaping");
+      expect(activeLine).toContain("output 665→412 (−38.0%, est.)");
     });
 
     it("real `watch` follow loop: two receipts landing in one poll are described by their own state", async () => {
@@ -698,15 +705,13 @@ describe("the Open label reads output_shaping_state, the same evidence as the ar
       expect(absentLine).not.toContain("→");
       expect(absentLine).not.toContain("basic shaping");
       expect(activeLine).toContain("→412");
-      expect(activeLine).toContain("basic shaping");
     });
 
-    it("CONTROL: live evidence labels a legacy receipt and keeps its unavailable shaped axis", async () => {
+    it("CONTROL: live evidence keeps a legacy receipt's unavailable shaped axis", async () => {
       const env = { COMPACTION_CONFIG_DIR: basicCfg } as NodeJS.ProcessEnv;
       await recordShapingOutcome(WATCH_SCOPE, "shape", env);
       const lines = await liveWatchLines(env, () => appendReceipt(recordReceipt("7777ffff111122223333444455550000")));
       expect(lines).toHaveLength(1);
-      expect(lines[0]).toContain("basic shaping");
       // The live signal proves shaping, but this legacy receipt has no exact policy version/regime.
       // It cannot borrow a numeric cohort, and it must not erase the shaped axis either.
       expect(lines[0]).toContain("output N/A→412 (N/A%, est.)");

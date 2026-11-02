@@ -31,12 +31,18 @@ import {
   uninstallCursorShapingHook,
   hasCodexShapingHook,
   hasCursorShapingHook,
+  shapingHookArgs,
   shapingHookCommand,
   type SubscriptionHookTool,
   type CodexHooksConfig,
   type CursorHooksConfig
 } from "./subscription-shaping-hooks.js";
+import { compactionCommand, isWritableLauncher, parseCompactionCommand, type LauncherOwnership } from "./compaction-command.js";
+import type { PinResult } from "./claude-code-hooks.js";
+import { managedLauncherOwnership } from "./update/launcher-ownership.js";
+import { owningManagedLauncher } from "./update/ownership.js";
 import {
+  CODEX_TURN_LINE_ARGS,
   codexTurnLineCommand,
   hasCodexTurnLineHook,
   installCodexTurnLineHook,
@@ -70,17 +76,17 @@ export interface SubscriptionHookEntry {
  * authority on why `sessionStart` is the load-bearing mechanism there). Codex's `Stop` line is described
  * as what it is: a `systemMessage` this build asks Codex to display; only a live run proves it renders.
  */
-export function subscriptionHookEntries(tool: SubscriptionHookTool): SubscriptionHookEntry[] {
+export function subscriptionHookEntries(tool: SubscriptionHookTool, launcher?: string): SubscriptionHookEntry[] {
   if (tool === "codex") {
     return [
       {
         event: "UserPromptSubmit",
-        command: shapingHookCommand("codex"),
+        command: shapingHookCommand("codex", launcher),
         effect: "attaches a concise-response instruction to what the model sees, before generation"
       },
       {
         event: "Stop",
-        command: codexTurnLineCommand(),
+        command: codexTurnLineCommand(launcher),
         effect: "returns settled content-free receipt evidence as `systemMessage` when recorded"
       }
     ];
@@ -88,7 +94,7 @@ export function subscriptionHookEntries(tool: SubscriptionHookTool): Subscriptio
   return [
     {
       event: "sessionStart",
-      command: shapingHookCommand("cursor"),
+      command: shapingHookCommand("cursor", launcher),
       effect: "attaches one concise-response instruction per session (session-level, not per turn)"
     }
   ];
@@ -103,6 +109,8 @@ export interface SubscriptionHookPathOptions {
   home?: string;
   /** Working directory for the repo-local Codex config (defaults to `process.cwd()`). */
   cwd?: string;
+  /** Managed launcher new entries name instead of the bare PATH-resolved `compaction`. */
+  launcher?: string;
 }
 
 /** Resolve the on-disk config path for a tool's hooks (the SAME rule `hooks install` has always used). */
@@ -124,14 +132,15 @@ export function subscriptionHookConfigPath(tool: SubscriptionHookTool, options: 
  */
 export function mergeSubscriptionHooks(
   tool: SubscriptionHookTool,
-  config: SubscriptionConfig
+  config: SubscriptionConfig,
+  launcher?: string
 ): { config: SubscriptionConfig; changed: boolean } {
   if (tool === "cursor") {
-    const cursor = installCursorShapingHook(config);
+    const cursor = installCursorShapingHook(config, launcher);
     return { config: cursor.config, changed: cursor.changed };
   }
-  const shaping = installCodexShapingHook(config);
-  const line = installCodexTurnLineHook(shaping.config);
+  const shaping = installCodexShapingHook(config, launcher);
+  const line = installCodexTurnLineHook(shaping.config, launcher);
   return { config: line.config, changed: shaping.changed || line.changed };
 }
 
@@ -190,6 +199,11 @@ export interface SubscriptionHookInstallOutcome {
   entries: SubscriptionHookEntry[];
   /** The merged config a `--dry-run` WOULD have written (never written). */
   wouldWrite?: unknown;
+  /**
+   * Existing owned entries this install rewrote to the managed launcher. Non-zero on Codex means Codex
+   * treats those hooks as changed and holds them until reviewed once.
+   */
+  pinned?: number;
   /** The honest failure message for `error` (never a stack, never file content). */
   error?: string;
 }
@@ -249,7 +263,8 @@ export async function installSubscriptionHooks(
   options: SubscriptionHookPathOptions & { dryRun?: boolean } = {}
 ): Promise<SubscriptionHookInstallOutcome> {
   const file = subscriptionHookConfigPath(tool, options);
-  const entries = subscriptionHookEntries(tool);
+  const launcher = options.launcher ?? owningManagedLauncher();
+  const entries = subscriptionHookEntries(tool, launcher);
   const base = { tool, file, entries };
 
   const read = await readConfig(file);
@@ -259,14 +274,23 @@ export async function installSubscriptionHooks(
   if (!read.ok) return { ...base, existed: true, status: "error", error: read.reason };
   const { config, existed } = read;
   let merged: { config: SubscriptionConfig; changed: boolean };
+  let pinned = 0;
   try {
-    merged = mergeSubscriptionHooks(tool, config);
+    merged = mergeSubscriptionHooks(tool, config, launcher);
+    if (launcher !== undefined) {
+      const pin = pinSubscriptionOwnedCommands(tool, merged.config, launcher, managedLauncherOwnership());
+      if (pin.rewritten > 0) {
+        merged = { config: pin.config, changed: true };
+        pinned = pin.rewritten;
+      }
+    }
   } catch (error) {
     return { ...base, existed, status: "error", error: error instanceof Error ? error.message : String(error) };
   }
 
   if (!merged.changed) return { ...base, existed, status: "already-present" };
-  if (options.dryRun === true) return { ...base, existed, status: "dry-run", wouldWrite: merged.config };
+  const pinnedField = pinned > 0 ? { pinned } : {};
+  if (options.dryRun === true) return { ...base, existed, ...pinnedField, status: "dry-run", wouldWrite: merged.config };
 
   let backupPath: string | undefined;
   try {
@@ -292,7 +316,7 @@ export async function installSubscriptionHooks(
   if (!after.ok || !after.existed || !hasAllSubscriptionHooks(tool, after.config)) {
     return { ...base, existed, ...(backupPath ? { backupPath } : {}), status: "verify-failed" };
   }
-  return { ...base, existed, ...(backupPath ? { backupPath } : {}), status: "installed" };
+  return { ...base, existed, ...(backupPath ? { backupPath } : {}), ...pinnedField, status: "installed" };
 }
 
 /**
@@ -362,4 +386,53 @@ export async function uninstallSubscriptionHooks(
   } catch (error) {
     return { ...base, status: "error", removedCount: 0, error: error instanceof Error ? error.message : String(error) };
   }
+}
+
+/**
+ * The owned commands per tool, as (event, args) pairs. Codex nests entries under `{ hooks: [...] }`
+ * groups; Cursor lists flat entries.
+ */
+const OWNED_SUBSCRIPTION_COMMANDS: Record<SubscriptionHookTool, ReadonlyArray<{ event: string; args: string }>> = {
+  codex: [{ event: "UserPromptSubmit", args: shapingHookArgs("codex") }, { event: "Stop", args: CODEX_TURN_LINE_ARGS }],
+  cursor: [{ event: "sessionStart", args: shapingHookArgs("cursor") }]
+};
+
+/**
+ * Rewrite Compaction-OWNED Codex/Cursor hook commands to the launcher form for `launcher`: the bare form
+ * and launcher-form entries `owns` claims. A present `compaction` elsewhere and every foreign entry are
+ * preserved as-is. Pure: `owns` carries any filesystem knowledge.
+ */
+export function pinSubscriptionOwnedCommands(
+  tool: SubscriptionHookTool,
+  input: SubscriptionConfig,
+  launcher: string,
+  owns: LauncherOwnership
+): PinResult<SubscriptionConfig> {
+  if (!isWritableLauncher(launcher)) return { config: input, rewritten: 0 };
+  const config = JSON.parse(JSON.stringify(input)) as SubscriptionConfig;
+  const hooks = (config as { hooks?: unknown }).hooks;
+  if (!hooks || typeof hooks !== "object" || Array.isArray(hooks)) return { config: input, rewritten: 0 };
+  let rewritten = 0;
+  const pin = (entry: unknown, args: string): void => {
+    if (!entry || typeof entry !== "object") return;
+    const owned = entry as { command?: unknown };
+    const parsed = typeof owned.command === "string" ? parseCompactionCommand(owned.command, args) : undefined;
+    if (!parsed || (parsed.form === "launcher" && !owns(parsed.launcher))) return;
+    const target = compactionCommand(args, launcher);
+    if (owned.command !== target) {
+      owned.command = target;
+      rewritten += 1;
+    }
+  };
+  for (const { event, args } of OWNED_SUBSCRIPTION_COMMANDS[tool]) {
+    const entries = (hooks as Record<string, unknown>)[event];
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (tool === "cursor") pin(entry, args);
+      else if (entry && typeof entry === "object" && Array.isArray((entry as { hooks?: unknown }).hooks)) {
+        for (const hook of (entry as { hooks: unknown[] }).hooks) pin(hook, args);
+      }
+    }
+  }
+  return rewritten === 0 ? { config: input, rewritten } : { config, rewritten };
 }

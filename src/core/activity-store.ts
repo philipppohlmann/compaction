@@ -77,6 +77,8 @@ export const ACTIVITY_EVENT_ALLOWED_KEYS: readonly string[] = [
   "estimated_output_tokens_saved",
   "output_estimate_basis",
   "output_estimate_state",
+  "output_calibration_family_version",
+  "output_calibration_evidence_id",
   "apply_posture",
   "measurement_source"
 ];
@@ -345,6 +347,19 @@ function orderedCompatibleClaudeSnapshots(events: ActivityEvent[], indices: numb
   return true;
 }
 
+/**
+ * An earlier transcript-settled Claude Stop for the SAME run window. An ordinary Stop with no exact
+ * gateway total settles from the transcript; a later exactly reconciled task-notification continuation
+ * re-settles that same logical run, so the earlier event is its parent, not a separate run.
+ */
+function transcriptParentOf(event: ActivityEvent, final: ActivityEvent): boolean {
+  return event.activity_kind === "claude-stop" &&
+    event.measurement_source === "claude-transcript" &&
+    event.run_started_at === final.run_started_at &&
+    canonicalRecordedAt(event.recorded_at) &&
+    event.recorded_at < (final.recorded_at as string);
+}
+
 function finalClaudeStopCoversLegacySnapshots(events: ActivityEvent[], indices: number[]): boolean {
   const snapshots = indices.map((index) => events[index]);
   const final = snapshots[snapshots.length - 1];
@@ -354,14 +369,14 @@ function finalClaudeStopCoversLegacySnapshots(events: ActivityEvent[], indices: 
     !canonicalRecordedAt(final.run_started_at) ||
     !canonicalRecordedAt(final.recorded_at) ||
     final.recorded_at < final.run_started_at ||
-    snapshots.slice(0, -1).some((event) => event.activity_kind !== undefined)
+    snapshots.slice(0, -1).some((event) => event.activity_kind !== undefined && !transcriptParentOf(event, final))
   ) return false;
   // A transcript-backed final may be a task-scoped monotonic delta from the immediately preceding
   // session snapshot. Its earlier legacy parent is still cumulative, so their counts are deliberately
   // not comparable. The exact hashed session/run pair is the authority; it is derived from the run's
   // session correlation, sequence, and start identity rather than from a timestamp/content heuristic.
   if (final.measurement_source === "claude-transcript" && final.claim_scope === "run-scoped") return true;
-  return snapshots.slice(0, -1).every((event) =>
+  return snapshots.slice(0, -1).every((event) => transcriptParentOf(event, final) ||
     CLAUDE_MONOTONIC_COUNT_FIELDS.every((field) => {
       const before = event[field];
       const after = final[field];

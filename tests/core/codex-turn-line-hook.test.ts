@@ -23,9 +23,9 @@ import type { CodexHooksConfig } from "../../src/core/subscription-shaping-hooks
 
 describe("codex per-turn line hook — emitted stdout", () => {
   it("wraps the line as systemMessage, and never sets suppressOutput", () => {
-    const out = codexTurnLineStdout("compaction · output 512 · basic shaping");
+    const out = codexTurnLineStdout("compaction · output 512");
     const parsed = JSON.parse(out) as Record<string, unknown>;
-    expect(parsed.systemMessage).toBe("compaction · output 512 · basic shaping");
+    expect(parsed.systemMessage).toBe("compaction · output 512");
     // We are ASKING Codex to display this; suppressing it would defeat the whole surface.
     expect(parsed).not.toHaveProperty("suppressOutput");
   });

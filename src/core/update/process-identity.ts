@@ -5,7 +5,7 @@ import path from "node:path";
 import { homedir } from "node:os";
 import { generateShimScript, type ShimTool } from "../tool-shim.js";
 import type { ProcessIdentity } from "./types.js";
-import { readToolProcessMetadata, type ToolExecutable } from "./process-metadata.js";
+import { inspectToolProcesses, type ToolExecutable } from "./process-metadata.js";
 
 /** OS creation identity, never a locally generated wall-clock approximation. */
 export function processBirth(pid: number): string | undefined {
@@ -60,23 +60,47 @@ function commandHead(command: string): string[] {
 }
 
 /** Used only at activation boundaries. Command lines never leave memory or enter journals. */
+/**
+ * Whether an untracked Claude Code / Codex / Cursor process could still reach the launcher. Only `none`
+ * permits replacing it. `live` is a verified relevant session; `unknown` means the inventory or the
+ * legacy ownership could not be established (`pid` names a process that could not be inspected, when
+ * known). Both block; they differ only in what the operator should do about it.
+ */
+export type ToolProcessInventory = { state: "none" } | { state: "live" } | { state: "unknown"; pid?: number };
+
 export function hasUntrackedToolProcesses(root: string, trackedPids: ReadonlySet<number>, env: NodeJS.ProcessEnv = process.env): boolean {
   try {
     const receipt = JSON.parse(readFileSync(path.join(root, "install.json"), "utf8"));
-    return scanUntrackedToolProcesses(receipt.launcherPath, env.COMPACTION_SHIM_DIR || path.join(path.dirname(root), "shims"), trackedPids, env);
+    return scanUntrackedToolProcesses(receipt.launcherPath, env.COMPACTION_SHIM_DIR || path.join(path.dirname(root), "shims"), trackedPids, env).state !== "none";
   } catch { return true; }
 }
 
 /** Initial adoption needs the same guard before a managed receipt or replacement launcher exists. */
 export function hasUntrackedToolProcessesForLauncher(launcherPath: string, trackedPids: ReadonlySet<number>, env: NodeJS.ProcessEnv = process.env): boolean {
+  return untrackedToolProcessInventoryForLauncher(launcherPath, trackedPids, env).state !== "none";
+}
+
+export function untrackedToolProcessInventoryForLauncher(launcherPath: string, trackedPids: ReadonlySet<number>, env: NodeJS.ProcessEnv = process.env): ToolProcessInventory {
   const home = env.COMPACTION_HOME || env.COMPACTION_CONFIG_DIR || path.join(env.HOME || homedir(), ".compaction");
   return scanUntrackedToolProcesses(launcherPath, env.COMPACTION_SHIM_DIR || path.join(home, "shims"), trackedPids, env);
 }
 
-function scanUntrackedToolProcesses(launcherPath: string, shimDir: string, trackedPids: ReadonlySet<number>, env: NodeJS.ProcessEnv): boolean {
+/** The adoption refusal for a blocking inventory, worded by what was actually observed. */
+export function toolProcessInventoryRefusal(inventory: Exclude<ToolProcessInventory, { state: "none" }>): string {
+  if (inventory.state === "live") {
+    return "A Claude Code, Codex, or Cursor session connected to Compaction is still running; close it before migrating this launcher.";
+  }
+  return inventory.pid !== undefined
+    ? `The process inventory could not be completed (process ${inventory.pid} could not be inspected), so Compaction cannot `
+      + `prove no connected tool session is running. Retry in a moment; if it persists, quit the app that owns process ${inventory.pid}.`
+    : "Connected tool sessions could not be verified as closed; close Claude Code, Codex, and Cursor sessions, then retry.";
+}
+
+function scanUntrackedToolProcesses(launcherPath: string, shimDir: string, trackedPids: ReadonlySet<number>, env: NodeJS.ProcessEnv): ToolProcessInventory {
+  const unknown: ToolProcessInventory = { state: "unknown" };
   try {
     const launcher = physical(launcherPath);
-    if (!launcher) return true;
+    if (!launcher) return unknown;
     const known: ToolExecutable[] = [];
     const ownedShims = new Set<string>();
     const shimRecord = path.join(shimDir, ".shim-record.json");
@@ -87,30 +111,37 @@ function scanUntrackedToolProcesses(launcherPath: string, shimDir: string, track
         const shim = path.join(shimDir, shimName);
         if (!entry || !existsSync(shim)) continue;
         // Ambiguous legacy ownership remains a stop, rather than permission to adopt a foreign file.
-        if (typeof entry.realBin !== "string" || !path.isAbsolute(entry.realBin)) return true;
+        if (typeof entry.realBin !== "string" || !path.isAbsolute(entry.realBin)) return unknown;
         const actual = readFileSync(shim, "utf8");
         if (actual !== generateShimScript(tool as ShimTool, entry.realBin)
-          && actual !== generateShimScript(tool as ShimTool, entry.realBin, launcherPath)) return true;
-        const real = physical(entry.realBin); if (!real) return true;
+          && actual !== generateShimScript(tool as ShimTool, entry.realBin, launcherPath)) return unknown;
+        const real = physical(entry.realBin); if (!real) return unknown;
         known.push({ path: real, tool: shimName as ToolExecutable["tool"] });
-        const ownedShim = physical(shim); if (!ownedShim) return true;
+        const ownedShim = physical(shim); if (!ownedShim) return unknown;
         ownedShims.add(ownedShim);
         known.push({ path: ownedShim, tool: shimName as ToolExecutable["tool"] });
       }
     }
     // Only numeric inventory comes from ps. argv text, argv0, and the inspector's environment
     // cannot identify a target process or establish ownership of its hook route.
-    const rows = execFileSync("/bin/ps", ["-axo", "uid=,ruid=,pid="], {
+    // `stat` is the kernel's run state (Z = zombie); it only nominates PIDs the helper re-verifies.
+    const rows = execFileSync("/bin/ps", ["-axo", "uid=,ruid=,pid=,stat="], {
       encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1024 * 1024, env: { PATH: "/usr/bin:/bin", LC_ALL: "C" }
     }).trim().split("\n");
-    const uid = process.getuid?.(); if (uid === undefined) return true;
+    const uid = process.getuid?.(); if (uid === undefined) return unknown;
     const pids: number[] = [];
+    const zombies: number[] = [];
     for (const row of rows) {
-      const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s*$/.exec(row); if (!match) return true;
-      const pid = Number(match[3]); if (Number(match[1]) === uid && Number(match[2]) === uid && pid !== process.pid && !trackedPids.has(pid)) pids.push(pid);
+      const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(row); if (!match) return unknown;
+      const pid = Number(match[3]);
+      if (Number(match[1]) === uid && Number(match[2]) === uid && pid !== process.pid && !trackedPids.has(pid)) {
+        pids.push(pid);
+        if (match[4].startsWith("Z")) zombies.push(pid);
+      }
     }
-    const processes = readToolProcessMetadata(pids, known); if (!processes) return true;
-    return processes.some(({ tool, cwd, environment, recorded, dispatch }) => {
+    const inspected = inspectToolProcesses(pids, known, zombies);
+    if (!inspected.ok) return inspected.pid !== undefined ? { state: "unknown", pid: inspected.pid } : unknown;
+    const live = inspected.processes.some(({ tool, cwd, environment, recorded, dispatch }) => {
       // The exact native-messaging dispatch is a persistent browser helper, not a tool session.
       if (tool === "claude" && dispatch === "chrome-native-host") return false;
       const userHome = environment.HOME;
@@ -150,7 +181,8 @@ function scanUntrackedToolProcesses(launcherPath: string, shimDir: string, track
       }
       return false;
     });
-  } catch { return true; }
+    return live ? { state: "live" } : { state: "none" };
+  } catch { return unknown; }
 }
 
 /** Content-free matches allow callers to distinguish their own instances from concurrent ones. */

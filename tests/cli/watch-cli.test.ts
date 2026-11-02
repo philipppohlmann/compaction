@@ -436,8 +436,9 @@ describe("receiptLinesFromJsonl - tier + per-turn evidence", () => {
       content_uploaded: false
     });
     const [line] = receiptLinesFromJsonl(applied, { productTier: "full" });
-    expect(line, "a real Community apply must keep its label").toContain("full apply");
     expect(line).toContain("41,210→21,876");
+    expect(line).toContain("output 412");
+    expect(line).toContain("id dddddddd");
 
     // A NON-apply turn on the same full-tier device falls back to the honest Open line — and that
     // fallback claims no posture at all: the receipt records none, and being on a full-tier device
@@ -527,7 +528,7 @@ describe("receiptLinesFromJsonl - tier + per-turn evidence", () => {
       { productTier: "full" }
     );
     expect(validInputInvalidOutput).toContain("input 41,210→21,876");
-    expect(validInputInvalidOutput).toContain("full apply");
+    expect(validInputInvalidOutput).toContain("id eeeeeeee");
     expect(validInputInvalidOutput).not.toContain("output");
   });
 });
@@ -628,7 +629,7 @@ describe("runWatchOnce - snapshot mode (prints last N and EXITS, no follow)", ()
     const turns = lines.filter((line) => line.startsWith("compaction · "));
     expect(turns).toEqual([
       "compaction · observed input 50 · output 5 · id adjacent",
-      "compaction · observed input 300 · output N/A→30 (N/A%, est.) · basic shaping"
+      "compaction · observed input 300 · output N/A→30 (N/A%, est.)"
     ]);
     expect(turns.join("\n")).not.toContain("claude-");
     expect(turns.join("\n")).not.toContain("47%");

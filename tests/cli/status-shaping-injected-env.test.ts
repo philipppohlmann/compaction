@@ -125,7 +125,7 @@ async function capture(
     lines.push(args.map(String).join(" "));
   });
   try {
-    await runStatus({
+    await runStatus({ verbose: true,
       env,
       version: "0.0.0-test",
       json,

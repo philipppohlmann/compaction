@@ -114,7 +114,7 @@ describe("authenticated Gateway update barrier", () => {
     expect(await gatewayBarrier(root, "pair-old")).toEqual({ ok: true });
   });
 
-  it("a quiet HTTP gap with open logical runs or pending Codex/Claude publication blocks without changing state", async () => {
+  it("pending Codex/Claude publication blocks the drain without changing state", async () => {
     const { rec } = await gateway();
     const correlation = "a".repeat(32);
     const directory = path.join(root, "runs");
@@ -122,14 +122,18 @@ describe("authenticated Gateway update barrier", () => {
     const target = path.join(directory, `${correlation}.json`);
     const body = JSON.stringify({ schema: RUN_BOUNDARY_SCHEMA, runs: [{ session_correlation_id: correlation,
       run_seq: 1, started_at: "2026-09-01T12:00:00.000Z", codex_settlement_pending: { pending: true } }],
-      claude_provisional_pending: { phase: "open" } });
+      claude_provisional_pending: { phase: "settled" } });
     writeFileSync(target, body);
     expect(await queryGatewayIdentity(rec)).toMatchObject({ activeRequests: 0, unsettledRuns: 1, unsettledCodex: 1, unsettledClaude: 1 });
-    expect(await gatewayBarrier(root, "pair-old")).toMatchObject({ ok: false });
+    expect(await gatewayBarrier(root, "pair-old")).toMatchObject({ ok: false, reason: "gateway-busy-or-unsettled" });
+    expect(await queryGatewayIdentity(rec, true)).toBeUndefined();
     expect(readFileSync(target, "utf8")).toBe(body);
+    writeFileSync(target, JSON.stringify({ schema: RUN_BOUNDARY_SCHEMA, runs: [],
+      claude_provisional_pending: { phase: "unknown-future-phase" } }));
+    expect(readGatewaySettlementState({ COMPACTION_CONFIG_DIR: root }).unsettledClaude).toBe(1);
     writeFileSync(target, "invalid-json");
     expect(readGatewaySettlementState({ COMPACTION_CONFIG_DIR: root }).settlementUnknown).toBe(true);
-    expect(await queryGatewayIdentity(rec, true)).toBeUndefined();
+    expect(await gatewayBarrier(root, "pair-old")).toMatchObject({ ok: false, reason: "gateway-busy-or-unsettled" });
   });
 
   it("rechecks pending bookkeeping atomically at drain, even after an earlier idle status", async () => {

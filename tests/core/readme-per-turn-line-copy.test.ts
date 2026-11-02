@@ -24,7 +24,7 @@ import { LCM_APPLY_POLICY } from "../../src/core/gateway/lcm-apply-policy-name.j
  *
  *   CAPABILITY decides which axes exist. Open never compacts input, so it renders `observed input N`
  *   (a plain count) and can never show an input reduction. Community's apply makes the input axis a
- *   real before→after and adds the `full apply` label and the allowance countdown.
+ *   real before→after and adds the allowance countdown.
  *
  *   ROUTE decides whether a reduction can be PRICED. `−$X (list price)` requires
  *   `upstream_route_type === "api-key"`, because a subscription is billed no per-token amount and
@@ -42,7 +42,7 @@ const README = readFileSync(join(process.cwd(), "README.md"), "utf8");
 const INPUT_BEFORE = 91472;
 const INPUT_AFTER = 74769;
 const OUTPUT_TOKENS = 463;
-/** The device-calibrated output saving for that turn; renders the `857→463 (−46%, est.)` arrow. */
+/** The device-calibrated output saving for that turn; renders the `857→463 (−46.0%, est.)` arrow. */
 const OUTPUT_TOKENS_SAVED = 394;
 const RECEIPT_ID = "5f539978-76a7-48df-bb90-b67082a83dff";
 /** A priced model, so the subscription line's MISSING dollar clause is provably route-driven. */
@@ -133,10 +133,10 @@ function readmePerTurnLines(): string[] {
 }
 
 describe("README per-turn examples are exactly what the renderer emits", () => {
-  it("the OPEN example is the real Open rendering: observed input, output arrow, basic shaping", () => {
+  it("the OPEN example is the real Open rendering: observed input, output arrow and id", () => {
     const rendered = receiptLineFromGatewayReceipt(openReceipt(), "basic", undefined, estimatedSaved);
     expect(rendered).toBe(
-      "compaction · observed input 91,472 · output 857→463 (−46%, est.) · basic shaping · id 5f539978"
+      "compaction · observed input 91,472 · output 857→463 (−46.0%, est.) · id 5f539978"
     );
     expect(readmePerTurnLines()).toContain(rendered);
   });
@@ -162,7 +162,7 @@ describe("README per-turn examples are exactly what the renderer emits", () => {
       tokensSaved: OUTPUT_TOKENS_SAVED,
       basis: "default-prior"
     });
-    expect(rendered).toBe("compaction · observed input 91,472 · output 463 · basic shaping · id 5f539978");
+    expect(rendered).toBe("compaction · observed input 91,472 · output 463 · id 5f539978");
   });
 
   /**
@@ -186,12 +186,12 @@ describe("README per-turn examples are exactly what the renderer emits", () => {
     expect(rendered).not.toContain("857");
     expect(rendered).not.toContain("−46%");
     expect(rendered).toBe(
-      "compaction · observed input 91,472 · output N/A→463 (N/A%, est.) · basic shaping · id 5f539978"
+      "compaction · observed input 91,472 · output N/A→463 (N/A%, est.) · id 5f539978"
     );
     expect(readmePerTurnLines()).toContain(rendered);
     // The superseded plain-count form must not linger anywhere in the README.
     expect(readmePerTurnLines()).not.toContain(
-      "compaction · observed input 91,472 · output 463 · basic shaping · id 5f539978"
+      "compaction · observed input 91,472 · output 463 · id 5f539978"
     );
   });
 
@@ -204,10 +204,10 @@ describe("README per-turn examples are exactly what the renderer emits", () => {
     for (const line of readmePerTurnLines()) expect(line).not.toContain("default prior");
   });
 
-  it("the COMMUNITY SUBSCRIPTION example carries input reduction, full apply and the allowance — and no dollars", () => {
+  it("the COMMUNITY SUBSCRIPTION example carries input reduction and the allowance — and no dollars", () => {
     const rendered = communityFullApplyReceiptLine(applyReceipt("subscription"), estimatedSaved);
     expect(rendered).toBe(
-      "compaction · input 91,472→74,769 (−18%) · output 857→463 (−46%, est.) · full apply · 1.92M/2M left · id 5f539978"
+      "compaction · input 91,472→74,769 (−18%) · output 857→463 (−46.0%, est.) · 1.92M/2M left · id 5f539978"
     );
     expect(readmePerTurnLines()).toContain(rendered);
   });
@@ -215,9 +215,36 @@ describe("README per-turn examples are exactly what the renderer emits", () => {
   it("the COMMUNITY API-KEY example adds the priced clause and nothing else", () => {
     const rendered = communityFullApplyReceiptLine(applyReceipt("api-key"), estimatedSaved);
     expect(rendered).toBe(
-      "compaction · input 91,472→74,769 (−18%) · output 857→463 (−46%, est.) · −$0.05 (list price) · full apply · 1.92M/2M left · id 5f539978"
+      "compaction · input 91,472→74,769 (−18%) · output 857→463 (−46.0%, est.) · −$0.05 (list price) · 1.92M/2M left · id 5f539978"
     );
     expect(readmePerTurnLines()).toContain(rendered);
+  });
+
+  it("the representative run keeps its input, output and active-minutes evidence", () => {
+    expect(README).toContain(
+      "↳ compaction · input 8,388,356→7,212,095 (−14%) · output 14,393→10,795 (−25.0%, est.) · +~3.08m"
+    );
+  });
+});
+
+describe("onboarding's illustrative lines are the same lines the renderer and README carry", () => {
+  const ONBOARDING = readFileSync(join(process.cwd(), "src/cli/onboarding/OnboardingTui.tsx"), "utf8");
+
+  it("the subscription example is the README's representative run line", () => {
+    expect(ONBOARDING).toContain(
+      "Subscription: compaction · input 8,388,356→7,212,095 (−14%) · output 14,393→10,795 (−25.0%, est.) · +~3.08m"
+    );
+  });
+
+  it("the API-key example's input, output and priced clauses are what the renderer emits", () => {
+    const rendered = communityFullApplyReceiptLine(applyReceipt("api-key"), estimatedSaved) ?? "";
+    const prefix = "compaction · input 91,472→74,769 (−18%) · output 857→463 (−46.0%, est.) · −$0.05 (list price)";
+    expect(rendered.startsWith(prefix)).toBe(true);
+    expect(ONBOARDING).toContain(`API key: ${prefix}`);
+  });
+
+  it("no onboarding example renders an integer estimated percent", () => {
+    expect(ONBOARDING).not.toMatch(/\(−\d+%, est\.\)/);
   });
 });
 
@@ -245,7 +272,8 @@ describe("the README's two axes are the runtime's two axes", () => {
     // explained away as "the model had no price", which is the misreading this pins shut.
     const sub = communityFullApplyReceiptLine(applyReceipt("subscription"), estimatedSaved) ?? "";
     expect(applyReceipt("subscription").model).toBe(MODEL);
-    expect(sub).toContain("full apply");
+    expect(sub).toContain("input 91,472→74,769 (−18%)");
+    expect(sub).toContain("1.92M/2M left");
     expect(sub).not.toContain("list price");
   });
 });

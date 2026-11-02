@@ -12,13 +12,14 @@
  *  - IT MAY NOT ASSERT HEALTH IT CANNOT SUPPORT. When this directory's transparent-routing endpoint is
  *    recorded down or quarantined, the line says so and says nothing else — see `routing-health.ts`.
  *    That is a synchronous read of a prior render's measurement, never a probe on this path.
- *  - THE LINE DESCRIBES THE USER'S RUN, not one provider call. With a run boundary for this session,
- *    print that run's aggregate and NEVER a per-call receipt — a run with nothing to show falls
- *    through to the content-free stdin fallbacks rather than to the ledger.
+ *  - THE LINE DESCRIBES ONE COMPLETED USER RUN, not one provider call and not a live counter. With a
+ *    run boundary for this session, print the newest SETTLED run with a result (it changes when a
+ *    run settles, never while one is in flight), `compaction · working` before any run has a result,
+ *    and NEVER a per-call receipt or the live stdin count.
  *  - No run boundary at all → the legacy per-call path, but a receipt carrying a different named
- *    session's correlation is rejected instead of being borrowed from the cwd.
- *  - Either way, last: a minimal content-free OUTPUT-ONLY line from the stdin token counts, else a
- *    short quiet placeholder (`compaction · recording`). Never empty-crash.
+ *    session's correlation is rejected instead of being borrowed from the cwd; then a minimal
+ *    content-free OUTPUT-ONLY line from the stdin token counts, else a short quiet placeholder
+ *    (`compaction · recording`). Never empty-crash.
  *
  * Hard posture: FAST (no network; gateway tail plus the local activity fallback only when a closed
  * hook-only run has no receipt), FAIL-OPEN (any error → a minimal safe string or
@@ -29,6 +30,7 @@
 import { Command } from "commander";
 import path from "node:path";
 import { readActivityEvents } from "../../core/activity-store.js";
+import type { ActivityEvent } from "../../core/activity-event.js";
 import { claudeLogicalRunIdentity } from "../../core/claude-logical-run-id.js";
 import {
   readGatewayReceiptTailWindow,
@@ -48,6 +50,7 @@ import { aggregateRun } from "../../core/gateway/run-aggregate.js";
 import {
   latestConsistentClaudeStopEvent,
   settledRunApplyPosture,
+  settledRunOutputEstimate,
   settledStopLineFromActivityEvent
 } from "../../core/settled-stop-activity.js";
 import {
@@ -74,6 +77,15 @@ import { resolveOpenTier } from "../../core/onboarding-preferences.js";
 
 /** The quiet, claim-free placeholder when there is nothing to report yet (never empty). */
 export const STATUS_LINE_PLACEHOLDER = "compaction · recording";
+
+/**
+ * The line while a user run is in flight and no earlier run of this session has a result. The line
+ * describes ONE completed run; it never shows a provisional number that moves as provider calls land.
+ */
+export const STATUS_LINE_WORKING = "compaction · working";
+
+/** How many recent settled runs the line may look back through for one with a result. */
+const SETTLED_RUN_CANDIDATES = 5;
 
 /**
  * The line while this directory's routed endpoint is not answering.
@@ -178,18 +190,13 @@ export interface StatusLineDeps {
   shapingScope?: ShapingTurnScope;
 }
 
-/**
- * The RUN path's outcome. It separates two states the earlier `string | undefined` conflated — and
- * conflating them is precisely what made the line flicker BETWEEN runs (see `runAggregateStatusLine`):
- *  - `undefined` — this session has NO run boundary at all, so the run path has nothing to say and the
- *    per-receipt fallback runs exactly as it did before run boundaries existed.
- *  - `{ line }` — the session HAS run state, so the run path owns the PER-CALL RECEIPT rung. `line` is
- *    the run line; `undefined` there means "this run has nothing to report", which suppresses the
- *    per-call receipt outright — never "render whichever receipt landed last".
- */
-interface RunRender {
-  /** The line to print, or `undefined` for the quiet placeholder. */
-  line: string | undefined;
+/** The local activity log for the hook-only fallback; unreadable reads as empty (fail-open render). */
+async function readSettledActivity(cwd: string): Promise<readonly ActivityEvent[]> {
+  try {
+    return (await readActivityEvents(path.join(cwd, ".compaction", "activity"))).events;
+  } catch {
+    return [];
+  }
 }
 
 /**
@@ -201,12 +208,11 @@ interface RunRender {
  * and still fails closed (returns `undefined`) on a genuine conflict rather than guessing "latest" by
  * accident. See its doc comment for the exact consistency rule.
  */
-async function exactSettledClaudeActivityLine(cwd: string, run: UserRun): Promise<string | undefined> {
+function exactSettledClaudeActivityLine(events: readonly ActivityEvent[], run: UserRun): string | undefined {
   if (!run.ended_at) return undefined;
   const identity = claudeLogicalRunIdentity(run);
   if (!identity) return undefined;
   try {
-    const { events } = await readActivityEvents(path.join(cwd, ".compaction", "activity"));
     const matches = events.filter((event) =>
       event.activity_kind === "claude-stop" &&
       event.session_id === identity.sessionId &&
@@ -245,23 +251,25 @@ function runLineFor(args: {
   );
   const incomplete = window.truncated && (oldestCapturedAt === undefined || oldestCapturedAt > run.started_at);
 
-  // ONE rate source, the same `PerTurnReduction` every other surface uses — so the run line and the
-  // per-call lines can never disagree about the rate, only about the scope they apply it to. WHETHER a
+  // ONE rate source, the same `PerTurnReduction` every other surface uses. The run line and the per-call
+  // lines resolve the same ANCHOR and refine a family anchor through the same `refineOutputRateForRun`:
+  // a RUN with its whole-run morphology (inside `aggregateRun`), a single turn as a one-call run (inside
+  // `estimatePerTurnOutputSaved`). Same evidence, different scope, so the two may legitimately differ. WHETHER a
   // call contributes a counterfactual at all is decided per call inside `aggregateRun`, from that
   // call's own durable `output_shaping_state`. A run with no proven-shaped call therefore reports its
   // plain output total, whatever the device's calibration says.
   //
-  // ONLY A DEVICE-MEASURED RATE, NEVER THE SHIPPED PRIOR. `loadCalibrationReduction` used to report
-  // `availability: "measured"` for the default prior too (its rate is real and shipped; the sample
-  // behind it is empty), so gating on availability rendered `output B→A (−47%)` on every fresh device
-  // as if it were this run's result. It now reports an unfolded device as `unavailable`, so this
-  // reads the BASIS as well: the two conditions agree today, and the run line keeps its own gate
-  // rather than inheriting whichever answer the loader happens to give. With no measurement of this
-  // device the run line shows the actual output total and nothing counterfactual.
+  // ONLY AN EXACT OR STRICTLY COMPATIBLE FAMILY-CALIBRATED RATE, NEVER THE GENERIC SHIPPED PRIOR.
+  // `settledRunOutputEstimate` resolves the same per-receipt applicability keys as aggregation and
+  // retains whether the reconstructed counterfactual came from exact measurement or family evidence.
+  // With no compatible calibration the run line keeps the honest unknown axis; a generic prior can
+  // never produce a numerical before/after pair.
   const aggregate = aggregateRun(receipts, { outputCalibrationResolver: args.calibrationResolver });
   const posture = settledRunApplyPosture(receipts, aggregate);
+  const outputEstimate = settledRunOutputEstimate(aggregate, receipts, args.calibrationResolver);
   const outputCalibrated =
-    aggregate.shapedCallCount > 0 && aggregate.output?.counterfactualAvailable === true;
+    outputEstimate.calibrated === true &&
+    (outputEstimate.basis === "measured" || outputEstimate.basis === "family-calibrated");
   // THE RUN'S CEILING, from the call that recorded it, through the SAME translation the per-receipt
   // path uses (`receiptCeiling`): the pause reason, its reset date, whether shaping continued, and the
   // period-bound conversion path. Without it a blocked Community user whose run ended on an
@@ -271,8 +279,10 @@ function runLineFor(args: {
   return runAggregateLine({
     aggregate,
     ...(posture ? { tier: posture } : {}),
-    ...(outputCalibrated ? { outputBasis: "measured" as const } : {}),
-    ...(!outputCalibrated && aggregate.shapedCallCount > 0 ? { outputState: "unseeded" as const } : {}),
+    ...(outputCalibrated ? { outputBasis: outputEstimate.basis } : {}),
+    ...(!outputCalibrated && aggregate.shapedCallCount > 0
+      ? { outputState: outputEstimate.state ?? "unseeded" as const }
+      : {}),
     ...(ceiling !== undefined ? { ceiling } : {}),
     ...(args.run.ended_at
       ? { activeWindow: { startedAt: args.run.started_at, endedAt: args.run.ended_at } }
@@ -298,7 +308,7 @@ async function runAggregateStatusLine(args: {
   stdin: StatusLineStdin;
   calibrationResolver: OutputCalibrationResolver;
   readReceipts: (cwd: string, coverFrom?: string) => Promise<GatewayReceipt[] | GatewayReceiptTailWindow>;
-}): Promise<RunRender | undefined> {
+}): Promise<string | undefined> {
   const sessionId = asString(args.stdin.session_id);
   if (!sessionId) return undefined;
   const correlationId = sessionCorrelationId(sessionId, args.env);
@@ -306,39 +316,47 @@ async function runAggregateStatusLine(args: {
   const run = currentUserRun(correlationId, args.env);
   if (!run) return undefined;
 
-  // Cover THIS run: the window grows back past its start rather than stopping at a fixed byte tail
-  // measured from the end of the ledger, so a normal long run is COMPLETE instead of reporting an
-  // ambiguous partial total. A run that still exceeds the ceiling keeps its honest `truncated`.
-  const read = await args.readReceipts(args.cwd, run.started_at);
-  const window: GatewayReceiptTailWindow = Array.isArray(read) ? { receipts: read, truncated: false } : read;
-  const line = runLineFor({ run, window, env: args.env, calibrationResolver: args.calibrationResolver });
-  if (line !== undefined) return { line };
-
-  // A hook-only Claude run has no gateway receipts. Its exact positively reconciled final transcript
-  // event is the sole durable aggregate, shared with default watch. Never consult activity for an open
-  // run and never select a merely recent event from this or another session.
-  const settledActivityLine = await exactSettledClaudeActivityLine(args.cwd, run);
-  if (settledActivityLine !== undefined) return { line: settledActivityLine };
-
-  // ============================ THE LINE HOLDS BETWEEN RUNS TOO ============================
-  // `UserPromptSubmit` opens run N+1 the instant the user presses enter; that run's first receipt
-  // lands a second or more later. In that gap the current run is OPEN and EMPTY. Reporting "no run"
-  // here handed the surface back to the per-call fallback, which reads whatever landed last in this
-  // directory's ledger — and that is run N's FINAL micro-call, typically an auxiliary
-  // `claude-sonnet-5` record-mode call rendering with no apply posture. So the flicker #945 removed
-  // from INSIDE a run came back BETWEEN runs, one frame per prompt.
+  // ======================= ONE LINE PER SETTLED RUN, NEVER A MOVING TOTAL =======================
+  // The line represents ONE completed user task. While a run is in flight its receipts are still
+  // landing, so any number drawn from them would change during the task. An open run therefore
+  // renders NOTHING of its own: the line holds the newest SETTLED run of this session that has a
+  // result, or a quiet non-numeric `working` when none has. At Stop the run closes and the line
+  // changes to its final aggregate. Membership stays `same session correlation AND inside the run's
+  // interval`, so concurrent sessions cannot mix.
   //
-  // While the new run is still empty the line keeps showing the LAST COMPLETED run's aggregate: the
-  // same settled state `currentUserRun` already produces after `Stop`, simply held across the gap
-  // rather than dropped the moment the next prompt opens. ONE candidate only — the most recent
-  // completed run that is not the current one. This runs inside Claude Code's render loop, and
-  // walking further back would trade latency for an ever staler number; a session whose last two runs
-  // are both empty has nothing worth reporting anyway.
-  const previous = completedUserRuns(correlationId, args.env).find((r) => r.run_seq !== run.run_seq);
-  const previousLine = previous
-    ? runLineFor({ run: previous, window, env: args.env, calibrationResolver: args.calibrationResolver })
-    : undefined;
-  return { line: previousLine };
+  // The NEWEST RENDERABLE settled run, not merely the newest settled one: a run with no result yet (a
+  // hook-only run whose Stop event is still being written) or ever (a prompt that made no provider
+  // call) must not replace the last real result with a numberless frame. Bounded by
+  // a small candidate count (this runs in Claude Code's render loop), and the common case renders the
+  // first candidate.
+  //
+  // KNOWN AND INTENDED: a call that STARTED before Stop but completes after it belongs to the run
+  // (`receiptBelongsToRun`), so its late receipt can still correct the settled total once.
+  //
+  // Each store is read at most ONCE per render, whatever the number of candidates: the receipt window
+  // covers back to the OLDEST candidate's start (so a normal long run is COMPLETE instead of an
+  // ambiguous partial total; a run that still exceeds the ceiling keeps its honest `truncated`), and the
+  // activity log is read only if some candidate needs the hook-only fallback.
+  const candidates = completedUserRuns(correlationId, args.env).slice(0, SETTLED_RUN_CANDIDATES);
+  if (candidates.length > 0) {
+    const read = await args.readReceipts(args.cwd, candidates[candidates.length - 1].started_at);
+    const window: GatewayReceiptTailWindow = Array.isArray(read) ? { receipts: read, truncated: false } : read;
+    let activity: readonly ActivityEvent[] | undefined;
+    for (const settled of candidates) {
+      const line = runLineFor({ run: settled, window, env: args.env, calibrationResolver: args.calibrationResolver });
+      if (line !== undefined) return line;
+      // A hook-only Claude run has no gateway receipts. Its exact positively reconciled final
+      // transcript event is the sole durable aggregate, shared with default watch. Only a CLOSED run is
+      // consulted, and never a merely recent event from this or another session.
+      activity ??= await readSettledActivity(args.cwd);
+      const settledActivityLine = exactSettledClaudeActivityLine(activity, settled);
+      if (settledActivityLine !== undefined) return settledActivityLine;
+    }
+  }
+
+  // No settled run has a result: quiet, and never a per-call receipt or the live stdin count, either of
+  // which would describe something other than a completed run.
+  return run.ended_at === undefined ? STATUS_LINE_WORKING : STATUS_LINE_PLACEHOLDER;
 }
 
 /**
@@ -347,12 +365,10 @@ async function runAggregateStatusLine(args: {
  *  0. this directory's routed endpoint is quarantined or has been unreachable past the grace window →
  *     the ROUTING STATE line, and nothing else. Every rung below describes recording or shaping that
  *     is not happening.
- *  1. this session has a run boundary with something to report → the RUN line.
- *  2. else a gateway receipt for this cwd → the canonical per-call input+output line. SKIPPED ENTIRELY
- *     when the session has a run boundary: a run with nothing renderable stays quiet rather than
- *     reverting to a per-call rendering.
- *  3. else an OUTPUT-ONLY line from the stdin token count (content-free), if present. Reached with or
- *     without a run boundary — it describes THIS turn's own count, never a past provider call.
+ *  1. this session has a run boundary → the newest SETTLED run with a result, else `working` / the quiet
+ *     placeholder. Rungs 2-4 are never reached once a run boundary exists.
+ *  2. else a gateway receipt for this cwd → the canonical per-call input+output line.
+ *  3. else an OUTPUT-ONLY line from the stdin token count (content-free), if present.
  *  4. else the quiet placeholder.
  */
 export async function computeStatusLine(rawStdin: string, deps: StatusLineDeps = {}): Promise<string | undefined> {
@@ -427,40 +443,25 @@ export async function computeStatusLine(rawStdin: string, deps: StatusLineDeps =
     // prompt — including auxiliary record-mode calls of its own — so rendering whichever receipt
     // landed last made this line flicker `full apply → apply off → full apply` inside ONE task.
     //
-    // When this session has a run boundary (the `UserPromptSubmit` hook opened one), the line
-    // describes the WHOLE run: cumulative while the request is in flight, settling on the completed
-    // aggregate at `Stop`. Membership is `same session correlation AND inside this run's interval` —
-    // never the working directory, so two concurrent sessions here cannot mix.
+    // When this session has a run boundary (the `UserPromptSubmit` hook opened one), the line shows
+    // the newest SETTLED run with a result and changes only when a run settles (see
+    // `runAggregateStatusLine`), never while one is in flight. Membership is
+    // `same session correlation AND inside the run's interval` — never the working directory, so two
+    // concurrent sessions here cannot mix.
     //
-    // The receipts themselves are untouched; they remain the per-call evidence ledger that `watch`
-    // renders. Without a run boundary (no hook installed, or no `session_id` on the stdin) the
-    // per-receipt path below runs exactly as before.
-    //
-    // AND IT IS AUTHORITATIVE OVER THE RECEIPT RUNG ONCE IT EXISTS. A session with run boundaries never
-    // falls back to a per-call receipt: a run with nothing renderable — the gap before a new run's first
-    // receipt, with no earlier settled run to show — skips the ledger entirely. Falling back there is
-    // what resurrected the previous run's last micro-call.
-    const runRender = await runAggregateStatusLine({
+    // AND IT OWNS THE WHOLE SURFACE ONCE IT EXISTS. Neither the per-call receipt rung (whichever receipt
+    // landed last in this directory) nor the stdin output count (the host's live count for the turn in
+    // flight) describes a completed run, and both move during a task. Without a run boundary (no hook
+    // installed, or no `session_id` on the stdin) the rungs below run exactly as before.
+    const runLine = await runAggregateStatusLine({
       cwd, env, stdin, calibrationResolver,
       readReceipts:
         deps.readReceipts ??
         ((c: string, coverFrom?: string) => readGatewayReceiptTailWindow(c, undefined, coverFrom))
     });
-    if (runRender?.line !== undefined) return runRender.line;
-    // OWNERSHIP IS SCOPED TO THE PER-CALL RECEIPT RUNG, AND ONLY TO IT. Suppressing rung 2 is the whole
-    // point: it reads whichever receipt landed LAST in this directory's ledger, so reaching it with a
-    // run open re-renders run N's final auxiliary micro-call and reinstates the flicker.
-    //
-    // The stdin OUTPUT-ONLY rung is a different statement and stays reachable. It describes no provider
-    // call at all — it is the host's own count for the very turn being rendered, carried on the payload
-    // in hand — so it can resurrect nothing. And it is the ONLY rung a hooks-only device ever reaches:
-    // `UserPromptSubmit` opens a run on every prompt (`captureClaudeCodeShapeFromPromptHook`), while a
-    // device with no gateway writes no receipts at all. Gating this rung on run ownership too would
-    // render the placeholder on EVERY turn, permanently, for the devices whose only apply lever is
-    // output shaping — trading a between-run flicker for the loss of the whole visible surface.
-    const runOwnsSurface = runRender !== undefined;
+    if (runLine !== undefined) return runLine;
 
-    const candidateReceipt = runOwnsSurface ? undefined : await readReceipt(cwd);
+    const candidateReceipt = await readReceipt(cwd);
     const namedSessionId = asString(stdin.session_id);
     const expectedCorrelation = namedSessionId ? sessionCorrelationId(namedSessionId, env) : undefined;
     // Modern receipts identify their session with a keyed, content-free correlation. Named-session
@@ -580,8 +581,8 @@ export async function computeStatusLine(rawStdin: string, deps: StatusLineDeps =
       if (line) return line;
     }
 
-    // No per-call receipt line above — none read, nothing honest on the one read, or a run owning the
-    // surface with nothing to report — so: the output-only fallback from the stdin counts. On this
+    // No per-call receipt line above — none read, or nothing honest on the one read (a session with a
+    // run boundary never reaches here) — so: the output-only fallback from the stdin counts. On this
     // hook-only path output shaping is the only apply lever, so the label reflects the ACTUAL turn:
     // `basic shaping` iff shaping was active this turn, else `apply off`.
     const outputTokens = outputTokensFromStdin(stdin);

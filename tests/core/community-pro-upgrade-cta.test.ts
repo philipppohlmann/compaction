@@ -182,16 +182,12 @@ describe("the CTA appears exactly when Community input optimization is unavailab
     expect(line).not.toContain("output shaping continues");
   });
 
-  /**
-   * THE SHAPING IS SHOWN, NOT NARRATED. This case used to assert the words `output shaping continues`.
-   * The words are gone from the primary line; the FACT is not, and it is now carried by evidence the
-   * user can check rather than a caption: the `basic shaping` posture label, on a paused turn whose
-   * `apply off` counterpart would read very differently.
-   */
-  it("still shows that shaping ran on a paused turn — as a posture label, not a caption", () => {
+  it("keeps the paused turn's shaping fact internally while the line stays concise", () => {
     const shaped = pausedTurn("exhausted");
-    const line = receiptLineFromGatewayReceipt(shaped, "basic", undefined, undefined, receiptCeiling(shaped, PLAIN_ENV));
-    expect(line).toContain("basic shaping");
+    const ceiling = receiptCeiling(shaped, PLAIN_ENV);
+    const line = receiptLineFromGatewayReceipt(shaped, "basic", undefined, undefined, ceiling);
+    expect(ceiling?.outputShapingContinues).toBe(true);
+    expect(line).toContain("output 300");
     expect(line).toContain(communityLimitClause(PERIOD_END));
     expect(line).not.toContain("output shaping continues");
   });

@@ -147,7 +147,8 @@ export function bodyAlreadyCarriesOutputShaping(bodyText: string): boolean {
  *     so the returned version identifies the complete treatment the model reads.
  *
  *  2. INSTRUCTION-LEVEL CARRIERS ONLY. Anthropic's top-level `system` (blocks or string), the Responses
- *     API `instructions`, and `system`/`developer`-role messages. User and assistant turns are NOT
+ *     API `instructions`, and `system`/`developer`-role messages in `messages[]` or the Responses
+ *     `input[]`. User and assistant turns are NOT
  *     carriers: transcript history quoting the policy does not instruct the model, and counting it would
  *     make every long conversation look shaped. This is what "active" means structurally rather than
  *     textually.
@@ -203,6 +204,31 @@ function instructionCarriers(body: Record<string, unknown>): string[] {
       const role = (message as Record<string, unknown> | null)?.role;
       if (role !== "system" && role !== "developer") continue;
       pushBlocks((message as Record<string, unknown>).content);
+    }
+  }
+  // Responses API `input[]`: `system`/`developer`-role message items. Codex delivers its
+  // `UserPromptSubmit` hook context here as a `developer` message, so missing this carrier recorded
+  // every hook-shaped Codex turn as `absent`. Only message items count (`type` "message" or omitted,
+  // the EasyInputMessage form); tool calls and their outputs carry no role and are never carriers.
+  //
+  // CURRENT TURN ONLY. Codex persists the hook's developer item in its history (the benchmark rollout
+  // records it directly after the user message) and resends the whole conversation every request, so a
+  // later turn the hook HELD still carries an earlier turn's policy. Only items after the LAST user
+  // message are this turn's instructions; the tool loop within a turn adds no user item, so every
+  // request of a shaped turn still qualifies.
+  const input = body.input;
+  if (Array.isArray(input)) {
+    const messageItem = (item: unknown): Record<string, unknown> | undefined => {
+      if (item === null || typeof item !== "object") return undefined;
+      const record = item as Record<string, unknown>;
+      return record.type === undefined || record.type === "message" ? record : undefined;
+    };
+    let lastUser = -1;
+    input.forEach((item, index) => { if (messageItem(item)?.role === "user") lastUser = index; });
+    for (const item of input.slice(lastUser + 1)) {
+      const record = messageItem(item);
+      if (record?.role !== "system" && record?.role !== "developer") continue;
+      pushBlocks(record.content);
     }
   }
   return carriers;

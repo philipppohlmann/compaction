@@ -18,7 +18,12 @@
 import { CURRENT_AGENT_TRACE_ARTIFACT_VERSION } from "./trace-parser.js";
 import { createUsageMetadata, missingUsageMetadata, type UsageMetadata } from "./usage-metadata.js";
 import type { AgentTrace, TraceMessage } from "./types.js";
-import { executeLocalCommand, parseRunCommand, type LocalCommandRun } from "./command-runner.js";
+import {
+  executeLocalCommand,
+  parseRunCommand,
+  type LocalCommandExecutionOptions,
+  type LocalCommandRun
+} from "./command-runner.js";
 
 const CODEX_PROVIDER = "openai";
 
@@ -226,9 +231,13 @@ export interface CodexCaptureResult extends CodexNormalizationResult {
  * The command parts are the FULL command (e.g. ["codex","exec","--json","do the thing"]). No engine,
  * no upload. A non-zero Codex exit is preserved on the trace; capture still returns what was produced.
  */
-export async function captureCodexCommand(commandParts: string[], generatedAt?: string): Promise<CodexCaptureResult> {
+export async function captureCodexCommand(
+  commandParts: string[],
+  generatedAt?: string,
+  executionOptions: LocalCommandExecutionOptions = {}
+): Promise<CodexCaptureResult> {
   const parsed = parseRunCommand(commandParts);
-  const commandRun = await executeLocalCommand(parsed);
+  const commandRun = await executeLocalCommand(parsed, undefined, executionOptions);
   const result = normalizeCodexExecEvents({
     captureId: `${parsed.executable}-${commandRun.startedAt}`,
     rawOutput: commandRun.rawOutput,

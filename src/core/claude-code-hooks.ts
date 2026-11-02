@@ -13,10 +13,22 @@
  *   hooks cannot reduce the model's context and are non-interactive).
  *
  * Both hooks are fail-open by contract (they must never break Claude Code if Compaction fails).
+ *
+ * Every owned command is written in the form `compaction-command.ts` defines: bare, or naming the
+ * managed launcher when one owns the install. Identity accepts both forms.
  */
+import { compactionCommand, isCompactionCommand, isWritableLauncher, parseCompactionCommand, type LauncherOwnership } from "./compaction-command.js";
+import { ownsLauncher } from "./update/launcher-ownership.js";
+
+/** Arguments after `compaction` in each owned Claude Code command. */
+export const STOP_HOOK_ARGS = "capture claude-code --from-hook";
+export const BEFORE_CALL_HOOK_ARGS = "capture claude-code --from-prompt-hook";
+export const SHAPING_HOOK_ARGS = "capture claude-code --shape-prompt-hook";
+export const STATUS_LINE_ARGS = "statusline";
+
 
 /** The command the **Stop** (measurement) hook runs. Session JSONL found via the Stop payload's transcript_path. */
-export const CLAUDE_CODE_HOOK_COMMAND = "compaction capture claude-code --from-hook";
+export const CLAUDE_CODE_HOOK_COMMAND = compactionCommand(STOP_HOOK_ARGS);
 
 /**
  * The command the **before-call RECOMMENDATION** hook runs. Installed on the **UserPromptSubmit** event, a
@@ -25,7 +37,7 @@ export const CLAUDE_CODE_HOOK_COMMAND = "compaction capture claude-code --from-h
  * NOTE: it differs from the Stop hook only in this trailing flag, and identity is an exact match, so the
  * two hooks are never confused.
  */
-export const CLAUDE_CODE_BEFORE_CALL_HOOK_COMMAND = "compaction capture claude-code --from-prompt-hook";
+export const CLAUDE_CODE_BEFORE_CALL_HOOK_COMMAND = compactionCommand(BEFORE_CALL_HOOK_ARGS);
 
 /**
  * The command the **before-call SHAPING** hook runs. Installed on the **UserPromptSubmit** event (the
@@ -36,7 +48,7 @@ export const CLAUDE_CODE_BEFORE_CALL_HOOK_COMMAND = "compaction capture claude-c
  * NOTE: `--shape-prompt-hook` is a distinct trailing flag, and identity is an exact match, so uninstall
  * removes ONLY this hook.
  */
-export const CLAUDE_CODE_SHAPING_HOOK_COMMAND = "compaction capture claude-code --shape-prompt-hook";
+export const CLAUDE_CODE_SHAPING_HOOK_COMMAND = compactionCommand(SHAPING_HOOK_ARGS);
 
 /** The Claude Code hook event a Compaction hook installs on. */
 export type ClaudeHookEvent = "Stop" | "UserPromptSubmit";
@@ -75,9 +87,9 @@ export interface ClaudeSettings {
  * starts), and uninstall — the path `compaction hooks uninstall` and `init --disconnect claude-code` run —
  * would DELETE the user's own entry while claiming to remove only Compaction's.
  *
- * Install writes only the canonical constant below — callers cannot supply a command of their own —
- * so an exact comparison is both sufficient and the only safe rule. Surrounding whitespace is
- * tolerated because a hand-edited settings file often carries it.
+ * Install writes only a command `compactionCommand` builds — callers choose at most the managed
+ * launcher, never the command text — so an exact comparison against the bare or launcher form
+ * (`isCompactionCommand`) is both sufficient and the only safe rule.
  *
  * Exactness also keeps the three hook commands mutually exclusive for free: they differ only in
  * their trailing flag, and `--from-hook` is a substring of neither `--from-prompt-hook` nor
@@ -85,15 +97,13 @@ export interface ClaudeSettings {
  */
 
 /** True when a hook command is Compaction's own Claude Code **Stop** (measurement) hook. */
-export function isCompactionHookCommand(command: string | undefined): boolean {
-  if (typeof command !== "string") return false;
-  return command.trim() === CLAUDE_CODE_HOOK_COMMAND;
+export function isCompactionHookCommand(command: string | undefined, owns: LauncherOwnership = ownsLauncher): boolean {
+  return isCompactionCommand(command, STOP_HOOK_ARGS, owns);
 }
 
 /** True when a hook command is Compaction's own Claude Code **before-call RECOMMENDATION** (UserPromptSubmit) hook. */
-export function isCompactionBeforeCallHookCommand(command: string | undefined): boolean {
-  if (typeof command !== "string") return false;
-  return command.trim() === CLAUDE_CODE_BEFORE_CALL_HOOK_COMMAND;
+export function isCompactionBeforeCallHookCommand(command: string | undefined, owns: LauncherOwnership = ownsLauncher): boolean {
+  return isCompactionCommand(command, BEFORE_CALL_HOOK_ARGS, owns);
 }
 
 /**
@@ -101,9 +111,8 @@ export function isCompactionBeforeCallHookCommand(command: string | undefined): 
  * Distinct from the measurement hook (`--from-hook`) and the recommendation hook (`--from-prompt-hook`)
  * by its own trailing flag, so uninstall removes ONLY this hook.
  */
-export function isCompactionShapingHookCommand(command: string | undefined): boolean {
-  if (typeof command !== "string") return false;
-  return command.trim() === CLAUDE_CODE_SHAPING_HOOK_COMMAND;
+export function isCompactionShapingHookCommand(command: string | undefined, owns: LauncherOwnership = ownsLauncher): boolean {
+  return isCompactionCommand(command, SHAPING_HOOK_ARGS, owns);
 }
 
 type HookIdentity = (command: string | undefined) => boolean;
@@ -117,25 +126,25 @@ type HookIdentity = (command: string | undefined) => boolean;
  */
 interface HookSpec {
   event: ClaudeHookEvent;
-  command: string;
+  args: string;
   isOurs: HookIdentity;
 }
 
 const STOP_HOOK: HookSpec = {
   event: "Stop",
-  command: CLAUDE_CODE_HOOK_COMMAND,
+  args: STOP_HOOK_ARGS,
   isOurs: isCompactionHookCommand
 };
 
 const BEFORE_CALL_HOOK: HookSpec = {
   event: "UserPromptSubmit",
-  command: CLAUDE_CODE_BEFORE_CALL_HOOK_COMMAND,
+  args: BEFORE_CALL_HOOK_ARGS,
   isOurs: isCompactionBeforeCallHookCommand
 };
 
 const SHAPING_HOOK: HookSpec = {
   event: "UserPromptSubmit",
-  command: CLAUDE_CODE_SHAPING_HOOK_COMMAND,
+  args: SHAPING_HOOK_ARGS,
   isOurs: isCompactionShapingHookCommand
 };
 
@@ -181,7 +190,7 @@ export interface InstallResult {
  * The command written and the rule that finds it come from the SAME spec, so what install writes is by
  * construction what detection, idempotency, and uninstall recognize.
  */
-function installHookOnEvent(input: ClaudeSettings, spec: HookSpec): InstallResult {
+function installHookOnEvent(input: ClaudeSettings, spec: HookSpec, launcher?: string): InstallResult {
   const settings = clone(input);
   if (settings.hooks !== undefined && (typeof settings.hooks !== "object" || settings.hooks === null || Array.isArray(settings.hooks))) {
     throw new Error("existing settings.hooks is malformed (not an object) - refusing to modify; fix the settings file manually.");
@@ -197,23 +206,23 @@ function installHookOnEvent(input: ClaudeSettings, spec: HookSpec): InstallResul
     return { settings: input, changed: false, alreadyPresent: true };
   }
 
-  groups.push({ hooks: [{ type: "command", command: spec.command }] });
+  groups.push({ hooks: [{ type: "command", command: compactionCommand(spec.args, launcher) }] });
   return { settings, changed: true, alreadyPresent: false };
 }
 
 /**
  * MERGE Compaction's **Stop** (measurement) hook into the settings. Preserves everything; idempotent.
  */
-export function installStopHook(input: ClaudeSettings): InstallResult {
-  return installHookOnEvent(input, STOP_HOOK);
+export function installStopHook(input: ClaudeSettings, launcher?: string): InstallResult {
+  return installHookOnEvent(input, STOP_HOOK, launcher);
 }
 
 /**
  * MERGE Compaction's **before-call** hook onto the UserPromptSubmit event. Preserves everything;
  * idempotent. This is a genuine PRE-call hook - it never touches the Stop (measurement) hook.
  */
-export function installBeforeCallHook(input: ClaudeSettings): InstallResult {
-  return installHookOnEvent(input, BEFORE_CALL_HOOK);
+export function installBeforeCallHook(input: ClaudeSettings, launcher?: string): InstallResult {
+  return installHookOnEvent(input, BEFORE_CALL_HOOK, launcher);
 }
 
 /**
@@ -222,8 +231,8 @@ export function installBeforeCallHook(input: ClaudeSettings): InstallResult {
  * injects a content-free shaping instruction via `additionalContext`); it is a distinct entry from the
  * Stop (measurement) hook and the before-call recommendation hook, matched by its own command identity.
  */
-export function installShapingHook(input: ClaudeSettings): InstallResult {
-  return installHookOnEvent(input, SHAPING_HOOK);
+export function installShapingHook(input: ClaudeSettings, launcher?: string): InstallResult {
+  return installHookOnEvent(input, SHAPING_HOOK, launcher);
 }
 
 export interface UninstallResult {
@@ -298,7 +307,7 @@ export function uninstallShapingHook(input: ClaudeSettings): UninstallResult {
  * swallows), the status-line command's stdout is RENDERED at the bottom of the UI - the ONLY per-turn
  * VISIBLE surface. This prints the single content-free per-turn receipt line.
  */
-export const CLAUDE_CODE_STATUS_LINE_COMMAND = "compaction statusline";
+export const CLAUDE_CODE_STATUS_LINE_COMMAND = compactionCommand(STATUS_LINE_ARGS);
 
 /**
  * True when a `statusLine` command is Compaction's own (so uninstall removes only ours).
@@ -311,9 +320,8 @@ export const CLAUDE_CODE_STATUS_LINE_COMMAND = "compaction statusline";
  * with nothing of theirs left behind. Exactness routes a wrapper to `user-owned`, where the existing
  * discipline already leaves it untouched and prints guidance instead.
  */
-export function isCompactionStatusLineCommand(command: string | undefined): boolean {
-  if (typeof command !== "string") return false;
-  return command.trim() === CLAUDE_CODE_STATUS_LINE_COMMAND;
+export function isCompactionStatusLineCommand(command: string | undefined, owns: LauncherOwnership = ownsLauncher): boolean {
+  return isCompactionCommand(command, STATUS_LINE_ARGS, owns);
 }
 
 /** True when the settings object already has Compaction's own status line installed. */
@@ -343,7 +351,7 @@ export interface StatusLineInstallResult {
  *    caller can print honest guidance ("add `compaction statusline` to your existing status line").
  * Preserves every other key. Never throws.
  */
-export function installStatusLine(input: ClaudeSettings): StatusLineInstallResult {
+export function installStatusLine(input: ClaudeSettings, launcher?: string): StatusLineInstallResult {
   if (hasCompactionStatusLine(input)) {
     return { settings: input, changed: false, status: "already-present" };
   }
@@ -353,7 +361,7 @@ export function installStatusLine(input: ClaudeSettings): StatusLineInstallResul
     return { settings: input, changed: false, status: "user-owned" };
   }
   const settings = clone(input);
-  settings.statusLine = { type: "command", command: CLAUDE_CODE_STATUS_LINE_COMMAND };
+  settings.statusLine = { type: "command", command: compactionCommand(STATUS_LINE_ARGS, launcher) };
   return { settings, changed: true, status: "installed" };
 }
 
@@ -375,4 +383,41 @@ export function uninstallStatusLine(input: ClaudeSettings): StatusLineUninstallR
   const settings = clone(input);
   delete settings.statusLine;
   return { settings, changed: true, removed: true };
+}
+
+/* ------------------------------------- Launcher pinning (managed installs) ------------------------------------- */
+
+export interface PinResult<C> {
+  config: C;
+  /** Owned entries whose command was rewritten to the launcher form. */
+  rewritten: number;
+}
+
+/**
+ * Rewrite Compaction-OWNED hook and status-line commands to the launcher form for `launcher`. Only the
+ * bare form and launcher-form entries `owns` claims (the installation's launcher, or one that no longer
+ * exists) are rewritten; a present `compaction` elsewhere is the user's and stays as written. Every
+ * foreign entry, key and ordering is preserved. Pure: `owns` carries any filesystem knowledge.
+ */
+export function pinClaudeOwnedCommands(input: ClaudeSettings, launcher: string, owns: LauncherOwnership): PinResult<ClaudeSettings> {
+  if (!isWritableLauncher(launcher)) return { config: input, rewritten: 0 };
+  const settings = clone(input);
+  let rewritten = 0;
+  const pin = (entry: { command?: string }, args: string): void => {
+    const parsed = parseCompactionCommand(entry.command, args);
+    if (!parsed || (parsed.form === "launcher" && !owns(parsed.launcher))) return;
+    const target = compactionCommand(args, launcher);
+    if (entry.command !== target) { entry.command = target; rewritten += 1; }
+  };
+  for (const spec of [STOP_HOOK, BEFORE_CALL_HOOK, SHAPING_HOOK]) {
+    const groups = settings.hooks?.[spec.event];
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups as HookGroup[]) {
+      if (!group || !Array.isArray(group.hooks)) continue;
+      for (const hook of group.hooks) if (hook && typeof hook === "object") pin(hook, spec.args);
+    }
+  }
+  const statusLine = settings.statusLine;
+  if (statusLine && typeof statusLine === "object" && !Array.isArray(statusLine)) pin(statusLine, STATUS_LINE_ARGS);
+  return rewritten === 0 ? { config: input, rewritten } : { config: settings, rewritten };
 }

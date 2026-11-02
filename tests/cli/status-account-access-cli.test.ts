@@ -3,8 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runStatus } from "../../src/cli/commands/upgrade-status.js";
+import { writeOptimizationMode, addConnectedWorkflows } from "../../src/core/onboarding-preferences.js";
+import { savePolicyPreference, AUTO_APPLY_ELIGIBILITY_GATES } from "../../src/core/policy-preferences.js";
+import { stopShaping } from "../../src/core/subscription-shaping-state.js";
+import { routingSlotKey, writeRoutingSlot } from "../../src/core/gateway/routing-registry.js";
 import { provisionValidLease } from "../helpers/lease-fixture.js";
 import { leasePath } from "../../src/core/entitlement/lease-store.js";
+import { FULL_APPLY_PENDING_REASONS } from "../../src/cli/onboarding/model.js";
 
 /**
  * `compaction status` → `Account & access` section (launch-blocker O8 / F52+F55).
@@ -42,13 +47,13 @@ function statusEnv(enginePath: string): NodeJS.ProcessEnv {
   };
 }
 
-async function runStatusHuman(enginePath: string): Promise<string> {
+async function runStatusHuman(enginePath: string, extraEnv: NodeJS.ProcessEnv = {}): Promise<string> {
   const lines: string[] = [];
   vi.spyOn(console, "log").mockImplementation((...args: unknown[]) => {
     lines.push(args.map(String).join(" "));
   });
   try {
-    await runStatus({ env: statusEnv(enginePath), version: "0.0.0-test", projectsDir: join(configDir, "none") });
+    await runStatus({ verbose: true, env: { ...statusEnv(enginePath), ...extraEnv }, version: "0.0.0-test", projectsDir: join(configDir, "none") });
   } finally {
     vi.restoreAllMocks();
   }
@@ -81,8 +86,30 @@ afterEach(() => {
 });
 
 describe("compaction status - Account & access section (fixed wording)", () => {
+  /**
+   * ARM THE GATES THE GATEWAY ACTUALLY CHECKS. `provisionValidLease` writes credentials, a valid lease
+   * and `product_mode: full` — but the gateway ALSO requires the input-optimization mode and a stored
+   * per-tool apply authorization. Without those two this device applies nothing, so a fixture that
+   * omitted them was not "fully configured" and the active footer it asserted was the overclaim this
+   * section exists to prevent.
+   */
+  async function armApplyGates(): Promise<void> {
+    const env = { COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv;
+    writeOptimizationMode("cache-plus-context", env);
+    addConnectedWorkflows(["claude-code"], env);
+    await savePolicyPreference(
+      {
+        scope: { tool: "claude-code", policy_type: "deterministic-dedupe" },
+        preference: "auto-when-gates-pass",
+        gates_required: [...AUTO_APPLY_ELIGIBILITY_GATES]
+      },
+      join(configDir)
+    );
+  }
+
   it("(a) fully-configured DEV-SIGNED device reads as active - exact strings, no ids/token/endpoint copy", async () => {
     provisionValidLease(configDir); // credentials + valid dev-signed lease + product_mode=full
+    await armApplyGates(); // ...and the two gates the gateway checks beyond the tier
     const out = await runStatusHuman(presentEngine());
 
     expect(out).toContain("Account & access");
@@ -102,6 +129,104 @@ describe("compaction status - Account & access section (fixed wording)", () => {
     // The raw `product_mode` key/enum stays off the human path (only user-facing plan/posture
     // vocabulary shows; the raw enum lives only in `--json`, asserted separately below).
     expect(out).not.toContain("product_mode");
+  });
+
+  it("does NOT claim active when the tier is full but a local apply gate is still unmet", async () => {
+    // The exact shape that misled a real device: credentials, a valid lease, a verified engine and
+    // `product_mode: full` — so the tier resolves `full` — while the input-optimization mode is still
+    // plain `cache`. The gateway declines every turn in this state, so the screen must not say active.
+    provisionValidLease(configDir);
+    const out = await runStatusHuman(presentEngine());
+
+    expect(out).toContain("Optimization: Full");
+    expect(out).toContain("Engine: ready");
+    expect(out, "the device cannot apply, so it must not be reported as active").not.toContain(
+      "Compaction is active."
+    );
+  });
+
+  it("names the unconnected workflow, not the authorization, when an authorization is stored but nothing is connected", async () => {
+    provisionValidLease(configDir);
+    const env = { COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv;
+    writeOptimizationMode("cache-plus-context", env);
+    await savePolicyPreference(
+      {
+        scope: { tool: "claude-code", policy_type: "deterministic-dedupe" },
+        preference: "auto-when-gates-pass",
+        gates_required: [...AUTO_APPLY_ELIGIBILITY_GATES]
+      },
+      join(configDir)
+    );
+    const out = await runStatusHuman(presentEngine());
+
+    expect(out).toContain(FULL_APPLY_PENDING_REASONS.workflowNotConnected);
+    expect(out).not.toContain(FULL_APPLY_PENDING_REASONS.applyAuthorization);
+    expect(out).not.toContain("Compaction is active.");
+  });
+
+  it("does NOT claim active while `compaction stop` is in effect, even with every gate armed", async () => {
+    // The gateway declines every request while stopped (the unified switch). Same armed device as (a),
+    // so the only difference from the footer case is the stop.
+    provisionValidLease(configDir);
+    await armApplyGates();
+    stopShaping({ COMPACTION_CONFIG_DIR: configDir });
+    const out = await runStatusHuman(presentEngine());
+
+    expect(out).toContain("Optimization: Full");
+    expect(out, "a stopped device applies nothing, so it must not be reported as active").not.toContain(
+      "Compaction is active."
+    );
+  });
+
+  describe("a session pinned to a plain routing gateway is not described as upgraded", () => {
+    const NOTE = "A tool session started before this was ready stays record-only for input; a new tool session re-evaluates routing.";
+
+    /** A hermetic routing home holding one slot whose pid is THIS (live) process. */
+    function routingHomeWith(workflow?: "claude-code"): NodeJS.ProcessEnv {
+      const home = join(configDir, "routing-home");
+      const env = { COMPACTION_HOME: home } as NodeJS.ProcessEnv;
+      writeRoutingSlot(
+        routingSlotKey({ cwd, provider: "anthropic", ...(workflow ? { workflow } : {}) }, env),
+        {
+          pid: process.pid,
+          host: "127.0.0.1",
+          port: 21000,
+          reservedPort: 21000,
+          provider: "anthropic",
+          upstream: "https://api.anthropic.com",
+          mode: "record",
+          ...(workflow ? { workflow } : {}),
+          cwd,
+          startedAt: new Date().toISOString()
+        },
+        env
+      );
+      return env;
+    }
+
+    it("armed device + a LIVE plain (workflow none) routing gateway → the footer is qualified", async () => {
+      provisionValidLease(configDir);
+      await armApplyGates();
+      const out = await runStatusHuman(presentEngine(), routingHomeWith());
+      expect(out).toContain("Compaction is active.");
+      expect(out).toContain(NOTE);
+    });
+
+    it("armed device + only a workflow-scoped routing gateway → no qualification", async () => {
+      provisionValidLease(configDir);
+      await armApplyGates();
+      const out = await runStatusHuman(presentEngine(), routingHomeWith("claude-code"));
+      expect(out).toContain("Compaction is active.");
+      expect(out).not.toContain(NOTE);
+    });
+
+    it("armed device + no routing gateway at all → no qualification", async () => {
+      provisionValidLease(configDir);
+      await armApplyGates();
+      const out = await runStatusHuman(presentEngine(), { COMPACTION_HOME: join(configDir, "empty-home") });
+      expect(out).toContain("Compaction is active.");
+      expect(out).not.toContain(NOTE);
+    });
   });
 
   it("(b) signed-in but no valid lease and renew cannot reach a service → refresh gap, not browser activation", async () => {

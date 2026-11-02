@@ -148,7 +148,7 @@ describe("outputClause: four states, three renderings", () => {
       estimatedOutputSavedBasis: "measured",
       estimatedOutputSavedState: "calibrated"
     });
-    expect(line).toContain("output 1,020→771 (−24%, est.)");
+    expect(line).toContain("output 1,020→771 (−24.4%, est.)");
     expect(line).not.toContain("N/A");
   });
 
@@ -244,7 +244,7 @@ describe("the hook-only path carries the state (the line a fresh subscription in
       tier: "basic",
       estimatedSaved: { calibrated: true, tokensSaved: 249, basis: "measured", state: "calibrated" }
     });
-    expect(line).toContain("output 1,020→771 (−24%, est.)");
+    expect(line).toContain("output 1,020→771 (−24.4%, est.)");
   });
 
   it("distinguishes measured-no-effect from unseeded here too", () => {
@@ -308,7 +308,7 @@ describe("the RUN line applies the same rule to summed tokens", () => {
       outputBasis: "measured",
       outputState: "calibrated"
     });
-    expect(line).toContain("output 1,200→900 (−25%, est.)");
+    expect(line).toContain("output 1,200→900 (−25.0%, est.)");
     expect(line).not.toContain("N/A");
   });
 

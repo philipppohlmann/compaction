@@ -24,7 +24,7 @@ import {
   loadOutputCalibrationResolver,
   type OutputCalibrationResolver
 } from "./output-shaping-savings.js";
-import { outputCalibrationQuery, type CalibrationState } from "./output-shaping-calibration-store.js";
+import { outputCalibrationQuery } from "./output-shaping-calibration-store.js";
 import { readGatewayReceiptTailWindow, type GatewayReceipt, type GatewayReceiptTailWindow } from "./gateway/receipt.js";
 import { aggregateRun } from "./gateway/run-aggregate.js";
 import {
@@ -45,10 +45,15 @@ import { isRealApply, isReceiptLineEnabled, receiptCompactedInput } from "./gate
 import {
   settledRunApplyPosture,
   settledRunOutputEstimate,
+  settledOutputEstimateActivityFields,
   settledStopLineFromActivityEvent
 } from "./settled-stop-activity.js";
 
 export const CODEX_ROLLOUT_TAIL_MAX_BYTES = 4 * 1024 * 1024;
+// The observed failed Stop completed in ~1.9s and the final exact record was readable immediately
+// afterward. A 0.5s grace samples that narrow durability gap without approaching the 15s hook cap.
+export const CODEX_ROLLOUT_SETTLE_RETRY_INTERVAL_MS = 100;
+export const CODEX_ROLLOUT_SETTLE_RETRY_BUDGET_MS = 500;
 
 interface CodexHookPayload {
   sessionId: string;
@@ -254,6 +259,7 @@ export interface SettleCodexStopDeps {
   clearPending?: typeof clearCodexSettlementPending;
   readReceipts?: (cwd: string, coverFrom?: string) => Promise<GatewayReceiptTailWindow>;
   readTurnUsage?: typeof readCodexTurnUsage;
+  waitForRolloutRetry?: (milliseconds: number) => Promise<void>;
   calibrationResolver?: OutputCalibrationResolver;
 }
 
@@ -278,6 +284,25 @@ function exactReceiptQuery(receipts: GatewayReceipt[]): ReturnType<typeof output
   if (queries.length === 0 || queries.some((query) => query === undefined)) return undefined;
   const first = JSON.stringify(queries[0]);
   return queries.every((query) => JSON.stringify(query) === first) ? queries[0] : undefined;
+}
+
+async function readCodexTurnUsageAfterVisibilityGrace(
+  transcriptPath: string | undefined,
+  sessionId: string,
+  turnId: string,
+  readTurnUsage: typeof readCodexTurnUsage,
+  waitForRetry: (milliseconds: number) => Promise<void>
+): Promise<CodexTurnUsage | undefined> {
+  let usage = await readTurnUsage(transcriptPath, sessionId, turnId);
+  for (
+    let waitedMs = 0;
+    !usage && waitedMs < CODEX_ROLLOUT_SETTLE_RETRY_BUDGET_MS;
+    waitedMs += CODEX_ROLLOUT_SETTLE_RETRY_INTERVAL_MS
+  ) {
+    await waitForRetry(CODEX_ROLLOUT_SETTLE_RETRY_INTERVAL_MS);
+    usage = await readTurnUsage(transcriptPath, sessionId, turnId);
+  }
+  return usage;
 }
 
 /** Close, settle, persist, and render one exact Codex turn. Total and local-only. */
@@ -401,10 +426,12 @@ export async function settleCodexStop(
     const gatewayOutputUsable = gatewayInputUsable && aggregate?.output !== undefined;
     const rolloutUsage = gatewayInputUsable && gatewayOutputUsable
       ? undefined
-      : await (deps.readTurnUsage ?? readCodexTurnUsage)(
+      : await readCodexTurnUsageAfterVisibilityGrace(
           payload.transcriptPath,
           payload.sessionId,
-          payload.turnId
+          payload.turnId,
+          deps.readTurnUsage ?? readCodexTurnUsage,
+          deps.waitForRolloutRetry ?? ((milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)))
         );
     if (!gatewayInputUsable && !rolloutUsage) return undefined;
 
@@ -432,11 +459,10 @@ export async function settleCodexStop(
         ? estimatePerTurnOutputSaved(
             hookQuery
               ? resolver(hookQuery)
-              : { availability: "unavailable", reason: "no exact calibration key", state: "unseeded" },
+              : { availability: "unavailable", reason: "no compatible calibration key", state: "unseeded" },
             outputAfter
           )
         : undefined;
-    const estimateState: CalibrationState | undefined = estimate?.state;
     const inputReduced =
       typeof inputBefore === "number" && typeof inputAfter === "number" && inputAfter < inputBefore;
     const gatewayInputUsesEstimate = exactReceipts.some(
@@ -479,15 +505,7 @@ export async function settleCodexStop(
       run_started_at: run.started_at,
       measurement_source: gatewayInputUsable ? "gateway-run" : "codex-rollout",
       ...(shapingActive ? { output_shaping_state: "active" } : {}),
-      ...(estimate?.calibrated === true && estimate.tokensSaved && estimate.basis === "measured"
-        ? {
-            estimated_output_tokens_saved: estimate.tokensSaved,
-            output_estimate_basis: "measured",
-            output_estimate_state: "calibrated"
-          }
-        : estimateState
-          ? { output_estimate_state: estimateState }
-          : {}),
+      ...settledOutputEstimateActivityFields(estimate),
       ...(receiptPosture
         ? { apply_posture: receiptPosture }
         : hookShaped && !inputReduced

@@ -11,6 +11,7 @@ import {
   TEST_OUTPUT_POLICY_VERSION,
   confirmedOutputCalibration
 } from "../helpers/output-calibration-fixture.js";
+import { buildHookOutputShapingTreatment } from "../../src/core/output-shaping.js";
 
 function receipt(input: {
   id: string;
@@ -18,6 +19,7 @@ function receipt(input: {
   output?: number;
   state?: GatewayReceipt["output_shaping_state"];
   regime?: GatewayReceipt["output_shaping_regime"];
+  policyVersion?: string;
 }): GatewayReceipt {
   return {
     receipt_id: input.id,
@@ -41,7 +43,7 @@ function receipt(input: {
     label: "test",
     ...(input.state ? { output_shaping_state: input.state } : {}),
     ...(input.state === "attached-this-pass" || input.state === "already-active"
-      ? { output_shaping_policy_version: TEST_OUTPUT_POLICY_VERSION }
+      ? { output_shaping_policy_version: input.policyVersion ?? TEST_OUTPUT_POLICY_VERSION }
       : {}),
     ...(input.regime ? { output_shaping_regime: input.regime } : {})
   };
@@ -62,7 +64,7 @@ describe("run output calibration resolves per call and aggregates token quantiti
     ], { outputCalibrationResolver: outputCalibrationResolver(store) });
     expect(aggregate.output).toEqual({ before: 1100, after: 860, counterfactualAvailable: true });
     const line = runAggregateLine({ aggregate, outputBasis: "measured", outputState: "calibrated" });
-    expect(line).toContain("output 1,100→860 (−22%, est.)");
+    expect(line).toContain("output 1,100→860 (−21.8%, est.)");
   });
 
   it("one uncalibrated shaped call makes the whole run counterfactual N/A", () => {
@@ -77,6 +79,31 @@ describe("run output calibration resolves per call and aggregates token quantiti
     const line = runAggregateLine({ aggregate, outputState: "unseeded" });
     expect(line).toContain("output N/A→800 (N/A%, est.)");
     expect(line).not.toMatch(/output [\d,]+→/);
+  });
+
+  it("reconstructs a compatible Run-1 hook counterfactual from the family prior deterministically", () => {
+    const receipts = [receipt({
+      id: "hook",
+      model: "gpt-5.6-sol",
+      output: 100,
+      state: "already-active",
+      regime: "default-shapeable",
+      policyVersion: buildHookOutputShapingTreatment().policyVersion
+    })];
+    const resolver = outputCalibrationResolver(emptyCalibration());
+    const first = aggregateRun(receipts, { outputCalibrationResolver: resolver });
+    const second = aggregateRun(receipts, { outputCalibrationResolver: resolver });
+    expect(first).toEqual(second);
+    // The family posterior is 18.33%; this run is ONE short, terse shaped turn, so the refinement shrinks
+    // it toward the low end of the evidence corpus (confidence 1/6 at a single shaped call) and the run
+    // renders its own figure rather than the posterior verbatim. Pinned exactly because the whole point
+    // is determinism: the same receipts must always produce this number.
+    expect(first.output).toEqual({ before: 119, after: 100, counterfactualAvailable: true });
+    expect(runAggregateLine({
+      aggregate: first,
+      outputBasis: "family-calibrated",
+      outputState: "calibrated"
+    })).toContain("output 119→100 (−16.0%, est.)");
   });
 
   it("held/unshaped calls contribute actual before=after and zero claimed saving", () => {

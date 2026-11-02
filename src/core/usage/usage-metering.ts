@@ -54,6 +54,12 @@ export interface MeterConfirmedApplyContext {
    */
   allowanceTokens: number;
   /**
+   * The allowance of the valid lease stored NOW for this period, or `undefined` when there is none.
+   * When present the ceiling is re-measured against it under the journal append lock (see
+   * `AppendCeiling.currentAllowanceTokens`), and the debit is refused when it is `undefined`.
+   */
+  currentAllowanceTokens?: () => number | undefined;
+  /**
    * Content-free local id of the retained-original record this debit belongs to — the RECOVERY id
    * (`.compaction/gateway/recovery/<id>.json`). It has always been the recovery id; only the name it
    * was stored under was wrong (see `usage-event.ts`, schema v1's `receipt_id`).
@@ -129,6 +135,9 @@ export async function meterConfirmedApply(
 
   const leaseIdentity = readLeaseIdentity(env);
   if (!leaseIdentity) return { metered: false, reason: "lease-unreadable" };
+  if (ctx.currentAllowanceTokens && ctx.currentAllowanceTokens() === undefined) {
+    return { metered: false, reason: "lease-not-valid-at-debit" };
+  }
 
   // Engine-authoritative count when present; otherwise the documented fallback with a DISTINCT label.
   // SHARED resolution: the gateway's pre-commit ceiling check calls the SAME function, so the number
@@ -200,7 +209,10 @@ export async function meterConfirmedApply(
     event,
     signature,
     {
-      ceiling: { allowanceTokens: ctx.allowanceTokens },
+      ceiling: {
+        allowanceTokens: ctx.allowanceTokens,
+        ...(ctx.currentAllowanceTokens ? { currentAllowanceTokens: ctx.currentAllowanceTokens } : {})
+      },
       ...(ctx.engineEventId ? { engineEventId: ctx.engineEventId } : {})
     },
     env

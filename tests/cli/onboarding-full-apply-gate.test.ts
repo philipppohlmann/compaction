@@ -75,7 +75,8 @@ describe("pendingFullApplyGate — the local gates between a valid lease and a r
   it("nothing enabled ⇒ no turn on this device can be a full apply", async () => {
     writeOptimizationMode("cache-plus-context", env);
     await authorize("claude-code");
-    expect(await pendingFullApplyGate([], env)).toBe(FULL_APPLY_PENDING_REASONS.applyAuthorization);
+    // The missing workflow is the blocker, not the (stored) authorization.
+    expect(await pendingFullApplyGate([], env)).toBe(FULL_APPLY_PENDING_REASONS.workflowNotConnected);
   });
 
   it("BOTH gates satisfied ⇒ nothing pending, and only then may the screen say `full apply`", async () => {

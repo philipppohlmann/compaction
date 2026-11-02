@@ -340,7 +340,6 @@ describe("captureClaudeCodeFromHook - activity bridge", () => {
     expect(JSON.parse(await readFile(ledgerPath, "utf8")).entries).toHaveLength(1);
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("output N/A→200 (N/A%, est.)");
-    expect(lines[0]).toContain("basic shaping");
     expect(lines[0]).not.toContain("47%");
 
     await captureClaudeCodeFromHook({}, deps);

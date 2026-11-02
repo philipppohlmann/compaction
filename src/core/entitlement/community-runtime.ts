@@ -33,6 +33,8 @@
 
 import { engineAvailability } from "../engine-availability.js";
 import { engineEulaAccepted } from "../legal/engine-eula.js";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { compactionConfigDir, type ConfigDirEnv } from "../config-dir.js";
 import { leaseNeedsRenewal, readLeaseVerdict, verifySignedLease } from "./lease-store.js";
 
@@ -42,6 +44,19 @@ import { leaseNeedsRenewal, readLeaseVerdict, verifySignedLease } from "./lease-
  * to record-only, and the next request can retry.
  */
 export const REQUEST_TIME_LEASE_RENEW_MS = 2_500;
+
+/**
+ * Timing for lease repair, mutable ONLY as a test seam (nothing in `src/` writes it).
+ *
+ * `deadlineMs` bounds ONE repair — reconcile and acquire together — whoever started it. Without it a
+ * repair started with no AbortSignal (gateway start, status) had no bound of its own: every later
+ * request-time caller joined that same promise, so a renewal that hung suppressed every fresh attempt
+ * for as long as the network stack kept the socket open.
+ *
+ * `retryCooldownMs` spaces request-triggered attempts after one that failed, so an entitlement outage
+ * costs the service one attempt per interval rather than one per provider request.
+ */
+export const leaseRepairTiming = { deadlineMs: 60_000, retryCooldownMs: 30_000 };
 
 /** What the device's entitlement lease looks like after the attempt. */
 export type CommunityLeaseState =
@@ -156,7 +171,8 @@ export async function ensureCommunityRuntime(
 async function ensureCommunityLease(
   env: ConfigDirEnv,
   onProgress: (step: "lease" | "engine") => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  trigger: LeaseRepairTrigger = "direct"
 ): Promise<LeaseRepairOutcome> {
   const dirKey = compactionConfigDir(env);
   const existing = inflightLeaseRepairs.get(dirKey);
@@ -168,11 +184,204 @@ async function ensureCommunityLease(
     return signal ? awaitSharedLeaseRepair(existing, signal, env) : existing;
   }
 
-  const run = runLeaseRepair(env, onProgress, signal).finally(() => {
+  const run = boundedLeaseRepair(env, onProgress, signal, trigger).finally(() => {
     if (inflightLeaseRepairs.get(dirKey) === run) inflightLeaseRepairs.delete(dirKey);
   });
   inflightLeaseRepairs.set(dirKey, run);
   return run;
+}
+
+/** What started a lease repair — recorded in the renewal diagnostics, never shown as a claim. */
+type LeaseRepairTrigger = "request-recovery" | "request-refresh" | "direct";
+
+/**
+ * One lease repair under `leaseRepairTiming.deadlineMs`, whether or not the caller passed a signal.
+ *
+ * The deadline is threaded into every network call, and the result is ALSO raced against it, so even a
+ * step that ignores its signal cannot keep this repair — and with it the in-flight slot every later
+ * caller joins — alive past the bound. A deadline expiry reports `timeout`, never `cancelled`: no user
+ * stopped anything. Records the content-free renewal diagnostics when a network attempt was made.
+ */
+async function boundedLeaseRepair(
+  env: ConfigDirEnv,
+  onProgress: (step: "lease" | "engine") => void,
+  signal: AbortSignal | undefined,
+  trigger: LeaseRepairTrigger
+): Promise<LeaseRepairOutcome> {
+  const startedAt = Date.now();
+  const deadline = AbortSignal.timeout(leaseRepairTiming.deadlineMs);
+  const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  const timedOut = (): boolean => deadline.aborted && signal?.aborted !== true;
+  const timeoutOutcome = (): LeaseRepairOutcome => ({
+    account: "present",
+    lease: readLeaseVerdict(env).label === "lease-valid" ? "valid" : "unavailable",
+    reason: "timeout",
+    networkUsed: true
+  });
+
+  let onDeadline: (() => void) | undefined;
+  const watchdog = new Promise<LeaseRepairOutcome>((resolve) => {
+    onDeadline = () => resolve(timeoutOutcome());
+    deadline.addEventListener("abort", onDeadline, { once: true });
+  });
+  let outcome: LeaseRepairOutcome;
+  try {
+    outcome = await Promise.race([
+      runLeaseRepair(env, onProgress, combined).catch(
+        (): LeaseRepairOutcome => ({ ...timeoutOutcome(), reason: timedOut() ? "timeout" : "lease-unavailable" })
+      ),
+      watchdog
+    ]);
+  } finally {
+    if (onDeadline) deadline.removeEventListener("abort", onDeadline);
+  }
+  if (outcome.reason === "cancelled" && timedOut()) outcome = { ...outcome, reason: "timeout" };
+  if (outcome.networkUsed) recordLeaseRenewalAttempt(env, trigger, outcome, Date.now() - startedAt);
+  return outcome;
+}
+
+/**
+ * REQUEST-TIME LEASE RECOVERY for a long-lived gateway. Never throws, never waits longer than `waitMs`.
+ *
+ * DETACHED FROM THE REQUEST. The repair is started WITHOUT the request's signal, so the request's
+ * bound ends only the request's wait, never the repair. Passing the request's signal into the repair
+ * made the bound kill the repair itself: a renewal whose reconcile needed longer than the request
+ * bound was aborted on every request and restarted from scratch on the next, so it never reached the
+ * lease call at all. The repair is still bounded, by `leaseRepairTiming.deadlineMs`.
+ *
+ * ONE AT A TIME, AND SPACED AFTER A FAILURE. A repair already in flight is joined, not duplicated.
+ * After a request-triggered attempt ends without a usable lease, the next one starts only after
+ * `leaseRepairTiming.retryCooldownMs`, and then automatically, on whichever request comes next.
+ *
+ * `waitMs = 0` starts (or joins) the repair and returns immediately: the gateway's proactive refresh
+ * inside the renewal window, where the current lease is still valid and nothing should wait.
+ */
+export async function recoverLeaseForRequest(
+  env: ConfigDirEnv,
+  waitMs: number = REQUEST_TIME_LEASE_RENEW_MS,
+  trigger: "request-recovery" | "request-refresh" = "request-recovery"
+): Promise<void> {
+  try {
+    const dirKey = compactionConfigDir(env);
+    let run = inflightLeaseRepairs.get(dirKey);
+    if (!run) {
+      const failedAt = lastRequestRepairFailure.get(dirKey);
+      if (failedAt !== undefined && performance.now() - failedAt < leaseRepairTiming.retryCooldownMs) return;
+      run = ensureCommunityLease(env, () => {}, undefined, trigger);
+      void run.then(
+        (outcome) => {
+          if (leaseAttemptFailed(outcome)) lastRequestRepairFailure.set(dirKey, performance.now());
+          else lastRequestRepairFailure.delete(dirKey);
+        },
+        () => lastRequestRepairFailure.set(dirKey, performance.now())
+      );
+    }
+    if (waitMs <= 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        run.then(
+          () => undefined,
+          () => undefined
+        ),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, waitMs);
+        })
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  } catch {
+    // Recovery is best-effort; the caller re-reads the verdict from disk either way.
+  }
+}
+
+/**
+ * When the last request-triggered repair failed (config dir → `performance.now()`). Monotonic, so a
+ * wall-clock step backwards cannot stretch the cooldown.
+ */
+const lastRequestRepairFailure = new Map<string, number>();
+
+/**
+ * A repair attempt FAILED when it renewed nothing yet reported a reason. That includes a refresh
+ * that fell back on a still-valid lease (`lease: "valid"` + a reason): it, too, must wait out the
+ * cooldown, or every request inside the renewal window re-uploads the backlog during an outage.
+ */
+function leaseAttemptFailed(outcome: LeaseRepairOutcome): boolean {
+  // `cancelled` is a user's decision (onboarding Esc), not a service failure.
+  return outcome.account === "present" && outcome.lease !== "renewed" && outcome.reason !== undefined && outcome.reason !== "cancelled";
+}
+
+/** Test seam: forget request-repair cooldowns so one test's failure cannot space out the next test. */
+export function resetLeaseRepairStateForTests(): void {
+  lastRequestRepairFailure.clear();
+}
+
+/** The persisted renewal record — bounded (one attempt), content-free, no identifiers. */
+export interface LeaseRenewalRecord {
+  schema_version: 1;
+  last_attempt: {
+    at: string;
+    trigger: LeaseRepairTrigger;
+    outcome: CommunityLeaseState;
+    reason?: string;
+    duration_ms: number;
+  };
+  last_renewed_at?: string;
+  consecutive_failures: number;
+}
+
+/** `<configDir>/entitlement/lease-renewal.json`. */
+export function leaseRenewalRecordPath(env: ConfigDirEnv = process.env): string {
+  return join(compactionConfigDir(env), "entitlement", "lease-renewal.json");
+}
+
+/** Read the renewal record, or `undefined` when there is none or it does not parse. Never throws. */
+export function readLeaseRenewalRecord(env: ConfigDirEnv = process.env): LeaseRenewalRecord | undefined {
+  try {
+    const parsed = JSON.parse(readFileSync(leaseRenewalRecordPath(env), "utf8")) as LeaseRenewalRecord;
+    return parsed && parsed.schema_version === 1 && typeof parsed.last_attempt?.at === "string" ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Overwrite the renewal record with this attempt. ONE record, replaced per attempt — never a log — and
+ * written only when a network attempt was made, so a device with a valid lease writes nothing per
+ * request. Holds a timestamp, the trigger, the lease state and the coded reason: no account, device,
+ * token, lease body or work content. Best-effort; a write failure never affects the repair.
+ */
+function recordLeaseRenewalAttempt(
+  env: ConfigDirEnv,
+  trigger: LeaseRepairTrigger,
+  outcome: LeaseRepairOutcome,
+  durationMs: number
+): void {
+  try {
+    const previous = readLeaseRenewalRecord(env);
+    const now = new Date().toISOString();
+    const renewed = outcome.lease === "renewed";
+    const failed = leaseAttemptFailed(outcome);
+    const record: LeaseRenewalRecord = {
+      schema_version: 1,
+      last_attempt: {
+        at: now,
+        trigger,
+        outcome: outcome.lease,
+        ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
+        duration_ms: Math.max(0, Math.round(durationMs))
+      },
+      ...(renewed ? { last_renewed_at: now } : previous?.last_renewed_at ? { last_renewed_at: previous.last_renewed_at } : {}),
+      consecutive_failures: failed ? (previous?.consecutive_failures ?? 0) + 1 : 0
+    };
+    const path = leaseRenewalRecordPath(env);
+    mkdirSync(join(compactionConfigDir(env), "entitlement"), { recursive: true, mode: 0o700 });
+    writeFileSync(path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    chmodSync(path, 0o600);
+  } catch {
+    // Diagnostics only.
+  }
 }
 
 /**
@@ -255,6 +464,15 @@ async function runLeaseRepair(
 
   let usageReconciled = false;
   let commitReconciliationWatermark: (() => Promise<void>) | undefined;
+  // DEFER THE WATERMARK ONLY WHILE A VALID LEASE IS HELD. A reconcile and the replacement lease are
+  // one accounting handover: while the stored lease still grants headroom, moving the watermark before
+  // a verified replacement lands would drop these entries from the local half of the ceiling and let a
+  // transient lease failure replenish headroom. With NO valid lease there is no headroom to replenish —
+  // the next usable lease is a fresh server-net one that already reflects whatever the service
+  // confirmed — so the confirmed position is committed at once. That makes reconcile progress
+  // CUMULATIVE across attempts: deferring it there meant every interrupted attempt re-uploaded the
+  // whole backlog from its first entry and never reached the lease call.
+  const deferWatermark = readLeaseVerdict(env).label === "lease-valid";
   try {
     const client = await import("../auth/usage-reconcile-client.js");
     try {
@@ -264,29 +482,28 @@ async function runLeaseRepair(
         new Date(),
         {
           ...(signal === undefined ? {} : { signal }),
-          // A reconcile and the replacement lease are one accounting handover. Until a verified
-          // replacement lands, keep these entries in the local half of the ceiling so a transient
-          // lease failure cannot replenish headroom. Explicit reconcile callers keep the default
-          // immediate-watermark behavior.
-          deferWatermark: true
+          deferWatermark
         }
       );
       if (result.reconciled) {
         usageReconciled = true;
         networkUsed = true;
-        commitReconciliationWatermark = () =>
-          client.recordReconciliationWatermark(result.summary, env);
+        if (deferWatermark) {
+          commitReconciliationWatermark = () => client.recordReconciliationWatermark(result.summary, env);
+        }
       }
     } catch (error) {
       // A partial upload may already have committed server-side. Treat it as a handover that needs
-      // a replacement lease, but leave its watermark deferred so the stale lease remains paired
-      // with the conservative local tally until that replacement verifies.
+      // a replacement lease. While a valid lease is held its watermark stays deferred, so that lease
+      // remains paired with the conservative local tally until a replacement verifies; otherwise
+      // `reconcileStoredUsage` has already recorded the confirmed prefix.
       if (error instanceof client.UsageReconcileClientError && error.partial) {
         usageReconciled = true;
         networkUsed = true;
         const partial = error.partial;
-        commitReconciliationWatermark = () =>
-          client.recordReconciliationWatermark(partial, env);
+        if (deferWatermark) {
+          commitReconciliationWatermark = () => client.recordReconciliationWatermark(partial, env);
+        }
       }
     }
   } catch {
@@ -509,6 +726,8 @@ export function leaseBlockedReason(outcome: CommunityRuntimeOutcome): string {
       return "the entitlement service cannot issue leases right now";
     case "lease-unverifiable":
       return "the entitlement it issued did not verify on this device";
+    case "timeout":
+      return "the entitlement service did not answer in time";
     case "cancelled":
       // A USER DECISION, not a fault. Saying the service failed here would blame it for a keypress.
       return "the setup was stopped before it finished";

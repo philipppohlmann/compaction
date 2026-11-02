@@ -1408,6 +1408,11 @@ export async function runCommunityActivation(
 
   // Community upgrades the Open fallback only after login, runtime, and engine checks succeed.
   await saveModeAuthorizations(workflows);
+  // CAPTURED BEFORE THE OVERWRITE, so a revert below can restore what the user actually had rather than
+  // inventing a posture for them. The revert used to hardcode `cache`, which silently DOWNGRADED a user
+  // who had deliberately chosen `cache-plus-context`: their own choice was overwritten on the next line
+  // and then replaced with a third value neither they nor this function ever selected.
+  const optimizationModeBeforeActivation = readOptimizationMode(process.env);
   writeOptimizationMode("cache-plus-context");
 
   // Reuse the mode command's lease gate so onboarding and manual selection cannot diverge.
@@ -1434,7 +1439,7 @@ export async function runCommunityActivation(
     // run nowhere. The entitlement is not lost — it is on disk in the lease, so `compaction mode full`
     // enables it the moment the user actually asks for it.
     writeProductMode("basic", process.env);
-    writeOptimizationMode("cache");
+    writeOptimizationMode(optimizationModeBeforeActivation);
     return {
       ok: true,
       alreadyLoggedIn: login.alreadyLoggedIn,

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyLcmReason, type LcmOutcomeKind } from "../../src/core/gateway/lcm-outcome.js";
+import { classifyEngineDecline, classifyLcmReason, type LcmOutcomeKind } from "../../src/core/gateway/lcm-outcome.js";
 
 describe("classifyLcmReason — public fixed vocabulary", () => {
   const cases: Array<[string, string | undefined, LcmOutcomeKind, string]> = [
@@ -45,6 +45,18 @@ describe("classifyLcmReason — public fixed vocabulary", () => {
         kind: "no-candidate",
         reason: "model-error"
       });
+    }
+  });
+});
+
+describe("classifyEngineDecline — an engine decline that carried no LCM outcome", () => {
+  it("names the decline class and never passes an engine string through", () => {
+    expect(classifyEngineDecline({ reason: "engine-degraded:timeout" })).toEqual({ kind: "not-attempted", reason: "engine-unavailable" });
+    expect(classifyEngineDecline({ reason: "engine-result:refused", refusal: "quota-exhausted" })).toEqual({ kind: "rejected", reason: "allowance-insufficient" });
+    expect(classifyEngineDecline({ reason: "engine-result:refused" })).toEqual({ kind: "error", reason: "engine-refused" });
+    // A no-op, an error or an unusable apply is not a refusal and is not recorded as one.
+    for (const reason of ["engine-result:noop", "engine-result:error", "engine-apply-unusable", "engine-result:error: secret text"]) {
+      expect(classifyEngineDecline({ reason })).toEqual({ kind: "error", reason: "engine-no-result" });
     }
   });
 });

@@ -97,11 +97,10 @@ describe("Claude whole-run Stop event", () => {
     const line = settledStopLineFromActivityEvent(event)!;
     expect(line).toContain("observed input 300");
     expect(line).toContain("output N/A→50 (N/A%, est.)");
-    expect(line).toContain("basic shaping");
-    expect(line).not.toContain("47%");
+    expect(line).not.toMatch(/47(\.\d+)?%/);
   });
 
-  it("labels only stored-authorized input reduction full", () => {
+  it("records full posture only for stored-authorized input reduction", () => {
     const event = buildClaudeStopActivityEvent({
       run: RUN,
       window: {
@@ -121,7 +120,6 @@ describe("Claude whole-run Stop event", () => {
     })!;
     expect(event.apply_posture).toBe("full");
     expect(settledStopLineFromActivityEvent(event)).toContain("input 100→60 (−40%)");
-    expect(settledStopLineFromActivityEvent(event)).toContain("full apply");
     expect(settledStopLineFromActivityEvent(event)).not.toContain("+~");
   });
 
@@ -231,7 +229,7 @@ describe("Claude whole-run Stop event", () => {
       measurement_source: "gateway-run"
     });
     expect(settledStopLineFromActivityEvent(event)).toContain(
-      "observed input 300 · output N/A→50 (N/A%, est.) · basic shaping"
+      "observed input 300 · output N/A→50 (N/A%, est.)"
     );
     expect(claudeStopOutputCalibrationQuery({ run: RUN, window })).toEqual({
       policyVersion: POLICY,
@@ -335,7 +333,11 @@ describe("Claude transcript Stop fallback", () => {
       measurement_source: "claude-transcript",
       claim_scope: "workflow-scoped",
       output_shaping_state: "active",
-      output_estimate_state: "unseeded",
+      // A supported shaped turn now resolves the substantive family posterior, so the estimate lifecycle
+      // reads `calibrated` instead of `unseeded`. The validator assertion above is what keeps this honest:
+      // a family-basis estimate is only storable WITH its family version and evidence id attached.
+      output_estimate_state: "calibrated",
+      output_estimate_basis: "family-calibrated",
       apply_posture: "basic",
       token_source: {
         input: { source: "provider-reported" },
@@ -343,14 +345,16 @@ describe("Claude transcript Stop fallback", () => {
       }
     });
     expect(event.input_after).toBeUndefined();
-    expect(event.output_before).toBeUndefined();
-    expect(event.estimated_output_tokens_saved).toBeUndefined();
+    // The output counterfactual now EXISTS (family-backed) where it previously did not. It must arrive
+    // with its provenance, never bare.
+    expect(event.estimated_output_tokens_saved).toBeGreaterThan(0);
+    expect(event.output_calibration_family_version).toBeDefined();
+    expect(event.output_calibration_evidence_id).toBeDefined();
     const line = settledStopLineFromActivityEvent(event)!;
     expect(line).toContain("compaction · session cumulative ·");
     expect(line).toContain("observed input 2,000");
-    expect(line).toContain("output N/A→180 (N/A%, est.)");
-    expect(line).toContain("basic shaping");
-    expect(line).not.toContain("47%");
+    expect(line).toMatch(/output [\d,]+→180 \(−\d+\.\d%, est\.\)/);
+    expect(line).not.toMatch(/47(\.\d+)?%/);
   });
 
   it("keeps held/local-estimate usage observed and unlabelled", () => {
@@ -438,7 +442,7 @@ describe("Claude transcript Stop fallback", () => {
       shapingOutcome: "shape",
       calibrationResolver: measured
     })!;
-    expect(settledStopLineFromActivityEvent(exact)).toContain("output 100→60 (−40%, est.)");
+    expect(settledStopLineFromActivityEvent(exact)).toContain("output 100→60 (−40.0%, est.)");
     expect(exact.output_estimate_state).toBe("calibrated");
 
     const basic = buildClaudeTranscriptStopActivityEvent({

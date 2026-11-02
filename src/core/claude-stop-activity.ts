@@ -10,7 +10,11 @@ import { aggregateRun } from "./gateway/run-aggregate.js";
 import { isRealApply, receiptCompactedInput } from "./gateway/receipt-line.js";
 import { receiptBelongsToRun, type UserRun } from "./gateway/run-boundary.js";
 import { buildRunFlowTokenReport } from "./run-flow-report.js";
-import { settledRunApplyPosture, settledRunOutputEstimate } from "./settled-stop-activity.js";
+import {
+  settledOutputEstimateActivityFields,
+  settledRunApplyPosture,
+  settledRunOutputEstimate
+} from "./settled-stop-activity.js";
 import type { UsageMetadata } from "./usage-metadata.js";
 
 export interface ClaudeTranscriptUsageBaseline {
@@ -147,15 +151,7 @@ export function buildClaudeStopActivityEvent(input: {
     run_started_at: input.run.started_at,
     measurement_source: "gateway-run",
     ...(aggregate.shapedCallCount > 0 ? { output_shaping_state: "active" } : {}),
-    ...(estimate?.calibrated === true && estimate.tokensSaved && estimate.basis === "measured"
-      ? {
-          estimated_output_tokens_saved: estimate.tokensSaved,
-          output_estimate_basis: "measured",
-          output_estimate_state: "calibrated"
-        }
-      : estimate?.state
-        ? { output_estimate_state: estimate.state }
-        : {}),
+    ...settledOutputEstimateActivityFields(estimate),
     ...(posture ? { apply_posture: posture } : {})
   };
   return { ...eventBase, activity_event_id: computeActivityEventId(eventBase) };
@@ -256,14 +252,11 @@ export function buildClaudeTranscriptStopActivityEvent(input: {
     measurement_source: "claude-transcript",
     ...(shaped
       ? {
+          policy_used: buildHookOutputShapingTreatment().policyVersion,
           output_shaping_state: "active" as const,
-          ...(estimate?.calibrated === true && estimate.tokensSaved && estimate.basis === "measured"
-            ? {
-                estimated_output_tokens_saved: estimate.tokensSaved,
-                output_estimate_basis: "measured" as const,
-                output_estimate_state: "calibrated" as const
-              }
-            : { output_estimate_state: estimate?.state ?? "unseeded" as const }),
+          ...settledOutputEstimateActivityFields(
+            estimate ?? { calibrated: false, state: "unseeded" }
+          ),
           apply_posture: "basic" as const
         }
       : {})

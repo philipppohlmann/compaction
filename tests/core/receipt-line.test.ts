@@ -8,6 +8,7 @@ import {
   receiptCeiling,
   isReceiptLineEnabled,
   RECEIPT_LINE_ENV,
+  RECEIPT_TIER_LABELS,
   CALIBRATED_ESTIMATE_MARKER
 } from "../../src/core/gateway/receipt-line.js";
 import { buildGatewayReceipt } from "../../src/core/gateway/receipt.js";
@@ -34,7 +35,7 @@ function assertContentFreeShape(line: string): void {
   const segments = line.split(" · ");
   expect(segments[0]).toBe("compaction");
   const known =
-    /^(observed input [\d,]+|input [\d,]+(→[\d,]+ \(−\d+%\))?|output [\d,]+(→[\d,]+ \(−\d+%, est\.\))?|−\$[\d,]+\.\d{2} \(list price\)|apply off|basic shaping|full apply|id [0-9a-f]{8})$/;
+    /^(observed input [\d,]+|input [\d,]+(→[\d,]+ \(−\d+%\))?|output [\d,]+(→[\d,]+ \(−\d+\.\d%, est\.\))?|−\$[\d,]+\.\d{2} \(list price\)|apply off|id [0-9a-f]{8})$/;
   for (const seg of segments.slice(1)) {
     expect(seg, `segment "${seg}" is not a known content-free clause`).toMatch(known);
   }
@@ -374,9 +375,9 @@ describe("receiptLineOutputOnly - out-saved clause (labeled est, never a per-tur
       estimatedSaved: { calibrated: true, tokensSaved: 140 }
     });
     // 512 real output + 140 estimated saved = a 652 derived before. The arrow is on OUTPUT now.
-    expect(line).toBe("compaction · output 652→512 (−21%, est.)");
+    expect(line).toBe("compaction · output 652→512 (−21.5%, est.)");
     assertContentFreeShape(line as string);
-    expect(line, "an output percent must always carry `est`").not.toMatch(/−\d+%(?!, est)/);
+    expect(line, "an output percent must always carry `est`").not.toMatch(/−\d+(?:\.\d+)?%(?!, est)/);
   });
 
   it("requested but uncalibrated → a plain count, never a fabricated before", () => {
@@ -472,7 +473,7 @@ describe("output-arrow PROVENANCE: a default prior renders no per-run figure at 
       shapingActive: true,
       estimatedSaved: { calibrated: true, tokensSaved: 140, basis: "measured" }
     });
-    expect(line).toBe("compaction · output 652→512 (−21%, est.)");
+    expect(line).toBe("compaction · output 652→512 (−21.5%, est.)");
     assertContentFreeShape(line as string);
   });
 
@@ -485,9 +486,9 @@ describe("output-arrow PROVENANCE: a default prior renders no per-run figure at 
     const prior = receiptLineOutputOnly({ ...common, estimatedSaved: { calibrated: true, tokensSaved: 140, basis: "default-prior" } });
     const measured = receiptLineOutputOnly({ ...common, estimatedSaved: { calibrated: true, tokensSaved: 140, basis: "measured" } });
     expect(prior).not.toBe(measured);
-    expect(measured).toContain("652→512 (−21%");
+    expect(measured).toContain("652→512 (−21.5%");
     expect(prior).not.toContain("652");
-    expect(prior).not.toContain("−21%");
+    expect(prior).not.toMatch(/−21(\.\d+)?%/);
   });
 
   /**
@@ -502,7 +503,7 @@ describe("output-arrow PROVENANCE: a default prior renders no per-run figure at 
       shapingActive: true,
       estimatedSaved: { calibrated: true, tokensSaved: 140 }
     });
-    expect(line).toBe("compaction · output 652→512 (−21%, est.)");
+    expect(line).toBe("compaction · output 652→512 (−21.5%, est.)");
   });
 });
 
@@ -528,8 +529,8 @@ describe("formatReceiptLine - out-saved clause is opt-in and never a % ", () => 
       estimatedOutputTokensSaved: 140
     });
     // 140 saved out of a 652 derived before = 21%.
-    expect(line).toContain("652→512 (−21%, est.)");
-    expect(line, "an output percent must never appear unlabeled").not.toMatch(/−\d+%(?!, est)/);
+    expect(line).toContain("652→512 (−21.5%, est.)");
+    expect(line, "an output percent must never appear unlabeled").not.toMatch(/−\d+(?:\.\d+)?%(?!, est)/);
   });
 
   it("the cost clause takes precedence over an out-saved clause if both are somehow present", () => {
@@ -544,7 +545,7 @@ describe("formatReceiptLine - out-saved clause is opt-in and never a % ", () => 
   });
 });
 
-describe("open-core tier labels (observe → apply off, basic → basic shaping, full → full apply)", () => {
+describe("open-core tier display", () => {
   it("observe: `observed input N · output N · apply off · id` (no reduction glyph, no compaction of input)", () => {
     const line = formatReceiptLine({
       observedInput: 41210,
@@ -559,19 +560,19 @@ describe("open-core tier labels (observe → apply off, basic → basic shaping,
     assertMinusOnlyInApplyClauses(line);
   });
 
-  it("basic: `observed input N · output N · basic shaping · id` (deterministic shaping, still no input reduction)", () => {
+  it("basic keeps the observed input and output evidence without a posture label", () => {
     const line = formatReceiptLine({
       observedInput: 41210,
       outputTokens: 372,
       tier: "basic",
       shortReceiptId: "a1b2c3d4"
     });
-    expect(line).toBe("compaction · observed input 41,210 · output 372 · basic shaping · id a1b2c3d4");
+    expect(line).toBe("compaction · observed input 41,210 · output 372 · id a1b2c3d4");
     expect(line).not.toContain("−");
     assertContentFreeShape(line);
   });
 
-  it("basic with a CALIBRATED saving: output before→after (est) · basic shaping · id", () => {
+  it("basic with a CALIBRATED saving keeps the output before→after estimate and id", () => {
     const line = formatReceiptLine({
       observedInput: 41210,
       outputTokens: 372,
@@ -582,10 +583,10 @@ describe("open-core tier labels (observe → apply off, basic → basic shaping,
       shortReceiptId: "a1b2c3d4"
     });
     expect(line).toBe(
-      "compaction · observed input 41,210 · output 512→372 (−27%, est.) · basic shaping · id a1b2c3d4"
+      "compaction · observed input 41,210 · output 512→372 (−27.3%, est.) · id a1b2c3d4"
     );
     assertContentFreeShape(line);
-    expect(line, "an output percent must always carry `est`").not.toMatch(/−\d+%(?!, est)/);
+    expect(line, "an output percent must always carry `est`").not.toMatch(/−\d+(?:\.\d+)?%(?!, est)/);
   });
 
   it("basic with an UNCALIBRATED request omits the arrow entirely", () => {
@@ -598,11 +599,11 @@ describe("open-core tier labels (observe → apply off, basic → basic shaping,
       shortReceiptId: "a1b2c3d4"
     });
     expect(line).not.toContain("→");
-    expect(line).toContain("basic shaping");
+    expect(line).toBe("compaction · observed input 41,210 · output 372 · id a1b2c3d4");
     expect(line).not.toMatch(/~\d/);
   });
 
-  it("the `full apply` label is DEFINED for the Community full-apply line (apply before→after + full apply)", () => {
+  it("full keeps the measured input reduction and output without a posture label", () => {
     const line = formatReceiptLine({
       inputBefore: 41210,
       inputAfter: 21876,
@@ -610,8 +611,13 @@ describe("open-core tier labels (observe → apply off, basic → basic shaping,
       tier: "full",
       shortReceiptId: "a1b2c3d4"
     });
-    expect(line).toBe("compaction · input 41,210→21,876 (−47%) · output 286 · full apply · id a1b2c3d4");
+    expect(line).toBe("compaction · input 41,210→21,876 (−47%) · output 286 · id a1b2c3d4");
     assertContentFreeShape(line);
+  });
+
+  it("retains the internal basic and full tier labels", () => {
+    expect(RECEIPT_TIER_LABELS.basic).toBe("basic shaping");
+    expect(RECEIPT_TIER_LABELS.full).toBe("full apply");
   });
 });
 
@@ -635,9 +641,9 @@ describe("receiptLineFromGatewayReceipt - Open tier (observed input, never a red
     expect(line).not.toContain("−");
   });
 
-  it("basic → `observed input N · output N · basic shaping · id`", () => {
+  it("basic → `observed input N · output N · id`", () => {
     const line = receiptLineFromGatewayReceipt(openReceipt(), "basic");
-    expect(line).toBe("compaction · observed input 41,210 · output 512 · basic shaping · id 8f4c2f6e");
+    expect(line).toBe("compaction · observed input 41,210 · output 512 · id 8f4c2f6e");
   });
 
   it("no tier → the legacy plain `input N` line (no label), unchanged", () => {
@@ -668,7 +674,7 @@ describe("communityFullApplyReceiptLine - DEFINED but emitted ONLY on a real ful
     reductionPercent: 47
   };
 
-  it("a stored-authorized private LCM reduction → `input B→A (−PP%) · output N · full apply · id`", () => {
+  it("a stored-authorized private LCM reduction keeps the measured input, output and id", () => {
     const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens: 286, model: "gpt-4o" };
     const receipt = buildApplyReceipt({
       provider: "openai",
@@ -689,7 +695,6 @@ describe("communityFullApplyReceiptLine - DEFINED but emitted ONLY on a real ful
     });
     expect(line).toContain("input 41,210→21,876 (−47%)");
     expect(line).toContain("output 286");
-    expect(line).toContain("full apply");
     expect(line).toContain("id 8f4c2f6e");
   });
 
@@ -979,8 +984,9 @@ describe("communityFullApplyReceiptLine - healthy allowance countdown", () => {
     // separate axis and is asserted elsewhere.)
     const clauses = (line ?? "").split(" \u00b7 ");
     expect(clauses).toContain("1.82M/2M left");
-    // Its position is between the entitlement label and the id — the ceiling clause's slot on a paused turn.
-    expect(clauses.indexOf("1.82M/2M left")).toBeGreaterThan(clauses.indexOf("full apply"));
+    // Its position is after the turn evidence and before the id — the ceiling clause's slot on a paused turn.
+    expect(clauses.indexOf("1.82M/2M left")).toBeGreaterThan(clauses.indexOf("output 286"));
+    expect(clauses.indexOf("1.82M/2M left")).toBeLessThan(clauses.indexOf("id 8f4c2f6e"));
     expect(line).not.toContain("Upgrade");
     expect(line).not.toContain("paused");
   });
@@ -999,7 +1005,8 @@ describe("communityFullApplyReceiptLine - healthy allowance countdown", () => {
     expect(line).not.toContain("left");
     // The absence is a MISSING CLAUSE, not a degraded line: the evidence axes still render.
     expect(line).toContain("input 41,210→21,876 (−47%)");
-    expect(line).toContain("full apply");
+    expect(line).toContain("output 286");
+    expect(line).toContain("id 8f4c2f6e");
   });
 
   it("an INCOHERENT pair renders nothing rather than a clamped number that still looks authoritative", () => {
@@ -1022,18 +1029,18 @@ describe("communityFullApplyReceiptLine - healthy allowance countdown", () => {
   });
 });
 
-describe("receiptLineOutputOnly - Open tier label on the hook-only path", () => {
-  it("basic tier → `output N · basic shaping` on the hook-only path", () => {
+describe("receiptLineOutputOnly - apply posture on the hook-only path", () => {
+  it("basic tier keeps the output count without adding a posture label", () => {
     const line = receiptLineOutputOnly({
       outputTokens: 372,
       providerReported: false,
       shapingActive: true,
       tier: "basic"
     });
-    expect(line).toBe("compaction · output 372 · basic shaping");
+    expect(line).toBe("compaction · output 372");
   });
 
-  it("basic tier + calibrated saving → `output B→A (est) · basic shaping`", () => {
+  it("basic tier + calibrated saving keeps the output before→after estimate", () => {
     const line = receiptLineOutputOnly({
       outputTokens: 512,
       providerReported: false,
@@ -1041,7 +1048,7 @@ describe("receiptLineOutputOnly - Open tier label on the hook-only path", () => 
       tier: "basic",
       estimatedSaved: { calibrated: true, tokensSaved: 140 }
     });
-    expect(line).toBe("compaction · output 652→512 (−21%, est.) · basic shaping");
+    expect(line).toBe("compaction · output 652→512 (−21.5%, est.)");
   });
 
   it("observe tier → `output N · apply off`", () => {

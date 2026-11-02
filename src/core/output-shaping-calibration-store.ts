@@ -10,16 +10,21 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { compactionConfigDir } from "./config-dir.js";
+import { outputShapingTreatmentFamilyForPolicyVersion } from "./output-shaping.js";
 
 export const OUTPUT_SHAPING_CALIBRATION_SCHEMA = "output-shaping.calibration.v3" as const;
 export const OUTPUT_SHAPING_CALIBRATION_CONFIRMATION_SCHEMA =
   "output-shaping.calibration-confirmation.v1" as const;
+export const OUTPUT_SHAPING_FAMILY_CALIBRATION_SCHEMA =
+  "output-shaping.family-calibration.v1" as const;
 
 /** The only regime v1 can identify without retaining task content. */
 export type OutputShapingCalibrationRegime = "default-shapeable";
 
 export interface OutputShapingCalibrationQuery {
   policyVersion: string;
+  /** Derived only for carriers this build explicitly recognizes as the same substantive treatment. */
+  treatmentFamilyVersion?: string;
   provider: string;
   model: string;
   regime?: OutputShapingCalibrationRegime;
@@ -48,6 +53,24 @@ export interface OutputShapingCalibrationConfirmation extends OutputShapingCalib
   confirmedAt: string;
 }
 
+/** Closed package record for a content-free treatment-family posterior (never exact-carrier evidence). */
+export interface OutputShapingFamilyCalibrationRecord {
+  schema: typeof OUTPUT_SHAPING_FAMILY_CALIBRATION_SCHEMA;
+  calibration: "family-calibrated";
+  treatmentFamilyVersion: string;
+  provider: string;
+  model: string;
+  regime: OutputShapingCalibrationRegime;
+  rate: number;
+  validPairCount: number;
+  sourceEvidencePolicyVersion: string;
+  evidenceId: string;
+  evidenceDigest: string;
+  methodDigest: string;
+  provenance: "hierarchical-family-calibration";
+  confirmedAt: string;
+}
+
 export interface OutputShapingCalibrationRecord extends OutputShapingCalibrationQuery {
   evidenceCount: number;
   /** Σ(mean control tokens × total turns in that confirmation). */
@@ -71,7 +94,7 @@ export interface OutputShapingCalibration {
 /** Kept only for internal heuristics. It is never persisted, resolved, or rendered as calibration. */
 export const DEFAULT_OUTPUT_SHAPING_RATE = 0.47;
 
-export type CalibrationBasis = "default-prior" | "measured";
+export type CalibrationBasis = "default-prior" | "measured" | "family-calibrated";
 export type CalibrationState = "unseeded" | "calibrating" | "calibrated" | "measured-no-effect";
 
 export interface ApplicableOutputCalibration extends OutputShapingCalibrationQuery {
@@ -81,6 +104,8 @@ export interface ApplicableOutputCalibration extends OutputShapingCalibrationQue
   nTreatment: number;
   meanControlOutputTokens: number;
   meanTreatmentOutputTokens: number;
+  /** Deterministic identity of the exact confirmation set used for this resolution. */
+  evidenceId: string;
 }
 
 export function emptyCalibration(now: () => string = () => new Date().toISOString()): OutputShapingCalibration {
@@ -104,6 +129,21 @@ function safePolicyVersion(value: unknown): value is string {
   return typeof value === "string" && /^output-shaping\.v1\.sha256\.[a-f0-9]{64}$/.test(value);
 }
 
+export function safeTreatmentFamilyVersion(value: unknown): value is string {
+  return typeof value === "string" && /^output-shaping\.family\.v1\.sha256\.[a-f0-9]{64}$/.test(value);
+}
+
+export function outputCalibrationEvidenceId(confirmationIds: readonly string[]): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify([...confirmationIds].sort()), "utf8")
+    .digest("hex");
+  return `output-shaping.evidence.v1.sha256.${digest}`;
+}
+
+export function safeOutputCalibrationEvidenceId(value: unknown): value is string {
+  return typeof value === "string" && /^output-shaping\.evidence\.v1\.sha256\.[a-f0-9]{64}$/.test(value);
+}
+
 function knownModel(value: unknown): value is string {
   return safeMetadata(value) && !/(^unknown$|-unknown-model$)/i.test(value);
 }
@@ -123,6 +163,7 @@ function validRegime(value: unknown): value is OutputShapingCalibrationRegime | 
 /** Normalize fixed receipt/adapter metadata into an exact query; unknowns fail closed. */
 export function outputCalibrationQuery(input: {
   policyVersion?: unknown;
+  treatmentFamilyVersion?: unknown;
   provider?: unknown;
   model?: unknown;
   regime?: unknown;
@@ -135,8 +176,14 @@ export function outputCalibrationQuery(input: {
   ) {
     return undefined;
   }
+  const derivedFamily = outputShapingTreatmentFamilyForPolicyVersion(input.policyVersion);
+  if (
+    input.treatmentFamilyVersion !== undefined &&
+    (!safeTreatmentFamilyVersion(input.treatmentFamilyVersion) || input.treatmentFamilyVersion !== derivedFamily)
+  ) return undefined;
   return {
     policyVersion: input.policyVersion,
+    ...(derivedFamily !== undefined ? { treatmentFamilyVersion: derivedFamily } : {}),
     provider: input.provider,
     model: input.model,
     ...(input.regime !== undefined ? { regime: input.regime } : {})
@@ -239,6 +286,54 @@ export function validateOutputCalibrationConfirmation(
     treatmentFullContentSufficiency: "pass",
     truncated: false,
     refused: false,
+    confirmedAt: v.confirmedAt
+  };
+}
+
+/** Validate and close a package-shipped family record. Invalid metadata is never partially trusted. */
+export function validateOutputShapingFamilyCalibration(
+  value: unknown
+): OutputShapingFamilyCalibrationRecord | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const v = value as Partial<OutputShapingFamilyCalibrationRecord>;
+  if (
+    v.schema !== OUTPUT_SHAPING_FAMILY_CALIBRATION_SCHEMA ||
+    v.calibration !== "family-calibrated" ||
+    !safeTreatmentFamilyVersion(v.treatmentFamilyVersion) ||
+    !safeMetadata(v.provider) ||
+    !knownModel(v.model) ||
+    v.regime !== "default-shapeable" ||
+    typeof v.rate !== "number" ||
+    !Number.isFinite(v.rate) ||
+    v.rate <= 0 ||
+    v.rate >= 1 ||
+    !positiveInteger(v.validPairCount) ||
+    !safePolicyVersion(v.sourceEvidencePolicyVersion) ||
+    outputShapingTreatmentFamilyForPolicyVersion(v.sourceEvidencePolicyVersion) !== v.treatmentFamilyVersion ||
+    !safeOutputCalibrationEvidenceId(v.evidenceId) ||
+    typeof v.evidenceDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(v.evidenceDigest) ||
+    v.evidenceId !== `output-shaping.evidence.v1.sha256.${v.evidenceDigest}` ||
+    typeof v.methodDigest !== "string" ||
+    !/^[a-f0-9]{64}$/.test(v.methodDigest) ||
+    v.provenance !== "hierarchical-family-calibration" ||
+    typeof v.confirmedAt !== "string" ||
+    Number.isNaN(Date.parse(v.confirmedAt))
+  ) return undefined;
+  return {
+    schema: OUTPUT_SHAPING_FAMILY_CALIBRATION_SCHEMA,
+    calibration: "family-calibrated",
+    treatmentFamilyVersion: v.treatmentFamilyVersion,
+    provider: v.provider,
+    model: v.model,
+    regime: v.regime,
+    rate: v.rate,
+    validPairCount: v.validPairCount,
+    sourceEvidencePolicyVersion: v.sourceEvidencePolicyVersion,
+    evidenceId: v.evidenceId,
+    evidenceDigest: v.evidenceDigest,
+    methodDigest: v.methodDigest,
+    provenance: "hierarchical-family-calibration",
     confirmedAt: v.confirmedAt
   };
 }
@@ -386,6 +481,9 @@ export function bestApplicableOutputCalibration(
   if (!Number.isFinite(rate) || rate <= 0 || rate >= 1) return undefined;
   return {
     policyVersion: record.policyVersion,
+    ...(query.treatmentFamilyVersion !== undefined
+      ? { treatmentFamilyVersion: query.treatmentFamilyVersion }
+      : {}),
     provider: record.provider,
     model: record.model,
     ...(record.regime !== undefined ? { regime: record.regime } : {}),
@@ -394,7 +492,8 @@ export function bestApplicableOutputCalibration(
     nControl: record.nControl,
     nTreatment: record.nTreatment,
     meanControlOutputTokens: record.weightedControlOutputTokens / record.totalWeight,
-    meanTreatmentOutputTokens: record.weightedTreatmentOutputTokens / record.totalWeight
+    meanTreatmentOutputTokens: record.weightedTreatmentOutputTokens / record.totalWeight,
+    evidenceId: outputCalibrationEvidenceId(record.confirmationIds)
   };
 }
 

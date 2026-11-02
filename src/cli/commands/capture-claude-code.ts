@@ -46,7 +46,7 @@ import {
   loadOutputCalibrationResolver
 } from "../../core/output-shaping-savings.js";
 import { outputCalibrationQuery, type OutputShapingCalibrationQuery } from "../../core/output-shaping-calibration-store.js";
-import { buildOutputShapingPolicy } from "../../core/output-shaping.js";
+import { buildHookOutputShapingTreatment } from "../../core/output-shaping.js";
 import { resolveOpenTier } from "../../core/onboarding-preferences.js";
 import {
   readGatewayReceiptTailWindow,
@@ -548,7 +548,7 @@ async function printPerTurnReceiptLine(input: {
     const hookShapedTurn = hookOutcome === "shape" || hookOutcome === "shape-basic";
     const hookQuery = hookShapedTurn
       ? outputCalibrationQuery({
-        policyVersion: buildOutputShapingPolicy().policyVersion,
+        policyVersion: buildHookOutputShapingTreatment().policyVersion,
         provider: input.usage.provider,
         model: input.usage.model,
         ...(hookOutcome === "shape" ? { regime: "default-shapeable" } : {})
@@ -682,6 +682,77 @@ async function printCommunityInviteIfDue(
  * `last_assistant_message`. Idempotent via a content-free dedup ledger. FAIL-OPEN by contract: any error is
  * swallowed and the process exits 0 so the hook can never break Claude Code.
  */
+/**
+ * The hook-only settlement of one closed Claude run from its final transcript, used when no exact
+ * gateway aggregate exists. A cumulative transcript total is reduced to this run by the exact prior
+ * run's hook record when one exists; otherwise the event says it is session-cumulative.
+ */
+async function claudeTranscriptSettlement(input: {
+  run: import("../../core/gateway/run-boundary.js").UserRun;
+  usage: import("../../core/usage-metadata.js").UsageMetadata;
+  correlationId: string;
+  sessionId: string | undefined;
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  stopAt: string;
+}): Promise<{ event: ActivityEvent; calibrationQuery: OutputShapingCalibrationQuery | undefined } | undefined> {
+  const { run, usage, sessionId, cwd, env } = input;
+  const priorRun = completedUserRuns(input.correlationId, env)
+    .find((candidate) => candidate.run_seq === run.run_seq - 1);
+  const priorIdentity = priorRun ? claudeLogicalRunIdentity(priorRun) : undefined;
+  let baseline: ClaudeTranscriptUsageBaseline | undefined;
+  if (priorIdentity && sessionId) {
+    const priorRecord = exactPriorClaudeHookRecord(
+      await loadHookUsageRecords(hookDir(cwd)),
+      {
+        sessionId,
+        logicalRunId: priorIdentity.runId,
+        before: run.started_at
+      }
+    );
+    if (
+      priorRecord &&
+      (priorRecord.tokenSource === "provider-reported" || priorRecord.tokenSource === "local-estimate")
+    ) {
+      baseline = {
+        inputTokens: priorRecord.inputTokens,
+        outputTokens: priorRecord.outputTokens,
+        cacheReadInputTokens: priorRecord.cacheReadInputTokens,
+        cacheCreationInputTokens: priorRecord.cacheCreationInputTokens,
+        tokenSource: priorRecord.tokenSource
+      };
+    }
+  }
+  const shapingOutcome = sessionId
+    ? await lastTurnShapingOutcome(
+        { tool: "claude-code", sessionId },
+        env,
+        () => new Date(input.stopAt)
+      )
+    : undefined;
+  // The decision record covers the latest turn only. A shaping claim (and its estimate) therefore
+  // needs output isolated to this run: a prior-run baseline, or the session's first run.
+  const outputIsolated = baseline !== undefined || run.run_seq === 1;
+  const positiveShapingOutcome = outputIsolated && (shapingOutcome === "shape" || shapingOutcome === "shape-basic")
+    ? shapingOutcome
+    : undefined;
+  const event = buildClaudeTranscriptStopActivityEvent({
+    run,
+    usage,
+    ...(positiveShapingOutcome ? { shapingOutcome: positiveShapingOutcome } : {}),
+    calibrationResolver: await loadOutputCalibrationResolver(env),
+    ...(baseline ? { baseline } : {})
+  });
+  if (!event) return undefined;
+  return {
+    event,
+    calibrationQuery: claudeTranscriptOutputCalibrationQuery({
+      usage,
+      ...(positiveShapingOutcome ? { shapingOutcome: positiveShapingOutcome } : {})
+    })
+  };
+}
+
 export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, deps: FromHookDeps = {}): Promise<void> {
   const cwd = deps.cwd ?? process.cwd();
   const now = deps.now ?? (() => new Date().toISOString());
@@ -803,56 +874,11 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
             // Without exact frozen bytes, a positive pair may not collapse into unrecoverable state.
           }
           if (!settledActivityEvent) {
-            const priorRun = completedUserRuns(correlationId, env)
-              .find((run) => run.run_seq === projected.run_seq - 1);
-            const priorIdentity = priorRun ? claudeLogicalRunIdentity(priorRun) : undefined;
-            let baseline: ClaudeTranscriptUsageBaseline | undefined;
-            if (priorIdentity && sessionId) {
-              const priorRecord = exactPriorClaudeHookRecord(
-                await loadHookUsageRecords(hookDir(cwd)),
-                {
-                  sessionId,
-                  logicalRunId: priorIdentity.runId,
-                  before: projected.started_at
-                }
-              );
-              if (
-                priorRecord &&
-                (priorRecord.tokenSource === "provider-reported" || priorRecord.tokenSource === "local-estimate")
-              ) {
-                baseline = {
-                  inputTokens: priorRecord.inputTokens,
-                  outputTokens: priorRecord.outputTokens,
-                  cacheReadInputTokens: priorRecord.cacheReadInputTokens,
-                  cacheCreationInputTokens: priorRecord.cacheCreationInputTokens,
-                  tokenSource: priorRecord.tokenSource
-                };
-              }
-            }
-            const shapingOutcome = sessionId
-              ? await lastTurnShapingOutcome(
-                  { tool: "claude-code", sessionId },
-                  env,
-                  () => new Date(stopAt)
-                )
-              : undefined;
-            const positiveShapingOutcome = shapingOutcome === "shape" || shapingOutcome === "shape-basic"
-              ? shapingOutcome
-              : undefined;
-            const calibrationResolver = await loadOutputCalibrationResolver(env);
-            settledActivityEvent = buildClaudeTranscriptStopActivityEvent({
-              run: projected,
-              usage: normalized.usage,
-              ...(positiveShapingOutcome ? { shapingOutcome: positiveShapingOutcome } : {}),
-              calibrationResolver,
-              ...(baseline ? { baseline } : {})
+            const transcript = await claudeTranscriptSettlement({
+              run: projected, usage: normalized.usage, correlationId, sessionId, cwd, env, stopAt
             });
-            settledCalibrationQuery = settledActivityEvent
-              ? claudeTranscriptOutputCalibrationQuery({
-                  usage: normalized.usage,
-                  ...(positiveShapingOutcome ? { shapingOutcome: positiveShapingOutcome } : {})
-                })
-              : undefined;
+            settledActivityEvent = transcript?.event;
+            settledCalibrationQuery = transcript?.calibrationQuery;
             positiveSettlementEvidenceInsufficient = settledActivityEvent === undefined;
           }
         }
@@ -960,8 +986,22 @@ export async function captureClaudeCodeFromHook(options: FromHookOptions = {}, d
           ? claudeStopOutputCalibrationQuery({ run: settledRun, window })
           : undefined;
       } catch {
-        // Exact gateway settlement is additive. Any read/validation failure retains the legacy
-        // transcript snapshot and never guesses a whole-run event.
+        // Exact gateway settlement is additive. Any read/validation failure falls through to the
+        // transcript settlement below and never guesses a whole-run event from receipts.
+      }
+      // A closed run with no exact gateway aggregate (no receipts in this directory's ledger, or an
+      // incomplete window) still has its own final transcript. Without this, the run left no settled
+      // event and the status line could only fall back to the placeholder.
+      if (!settledActivityEvent && correlationId) {
+        try {
+          const transcript = await claudeTranscriptSettlement({
+            run: settledRun, usage, correlationId, sessionId, cwd, env, stopAt
+          });
+          settledActivityEvent = transcript?.event;
+          settledCalibrationQuery = transcript?.calibrationQuery;
+        } catch {
+          // Also additive: a failed transcript settlement keeps the legacy record and event.
+        }
       }
     }
     const record = buildClaudeCodeHookRecord({

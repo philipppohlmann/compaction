@@ -154,7 +154,11 @@ interface RunStore {
   claude_provisional_pending?: ClaudeProvisionalPending;
 }
 
-/** Read-only update barrier. Unknown/corrupt state is busy, never silently settled or repaired. */
+/**
+ * Read-only update barrier. Unknown/corrupt state is busy, never silently settled or repaired.
+ * `unsettledRuns` is work only a live tool can advance (an open run, or an open Claude provisional
+ * pending awaiting its Stop); `unsettledCodex` / `unsettledClaude` are durable publications owed.
+ */
 export function readGatewaySettlementState(env: ConfigDirEnv = process.env): {
   unsettledRuns: number; unsettledCodex: number; unsettledClaude: number; settlementUnknown: boolean;
 } {
@@ -180,12 +184,18 @@ export function readGatewaySettlementState(env: ConfigDirEnv = process.env): {
       if (opened.ino !== before.ino || opened.dev !== before.dev) throw new Error("Run store changed");
       const store = JSON.parse(readFileSync(fd, "utf8")) as RunStore;
       if (store.schema !== RUN_BOUNDARY_SCHEMA || !Array.isArray(store.runs)) throw new Error("Unknown run store");
+      let open = 0;
       for (const run of store.runs) {
         if (!validRunCore(run, correlation)) throw new Error("Invalid run");
-        if (!run.ended_at) result.unsettledRuns += 1;
+        if (!run.ended_at) open += 1;
         if (run.codex_settlement_pending !== undefined) result.unsettledCodex += 1;
       }
-      if (store.claude_provisional_pending !== undefined) result.unsettledClaude += 1;
+      // A VALID open provisional pending awaits the same Stop as its open run, so it is open work, not
+      // an owed publication. Any other pending (settled, malformed, or an unknown shape) still blocks.
+      const pending = store.claude_provisional_pending;
+      if (pending !== undefined && validClaudeOpenPending(pending, store.runs, correlation)) open = Math.max(open, 1);
+      else if (pending !== undefined) result.unsettledClaude += 1;
+      result.unsettledRuns += open;
     } catch { result.settlementUnknown = true; }
     finally { if (fd !== undefined) closeSync(fd); }
   }

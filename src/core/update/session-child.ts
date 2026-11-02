@@ -14,8 +14,13 @@ process.once("message", async (message: { root: string; id: string; command: str
   try {
     // Bash job control creates a distinct process group without setsid, preserving /dev/tty.
     // The inner shell cannot exec until its actual PID is durably admitted by this supervisor.
+    // `fg` needs the terminal on fd 2: macOS bash 3.2 hands the terminal to the job with tcsetpgrp on
+    // fd 2, so with fd 2 on /dev/null or a file (`claude 2>errors.log`) the tool silently stays in a
+    // background group where its first raw-mode/tty read stops it (SIGTTOU/SIGTTIN) - a blank,
+    // unresponsive terminal. So `fg` gets /dev/tty as fd 2 whenever one is openable; the tool keeps
+    // its own inherited stderr. Without a controlling terminal there is nothing to hand over.
     const gate = 'exec 4>&-; IFS= read -r __compaction_go <&3 || exit 125; [ "$__compaction_go" = go ] || exit 125; exec 3<&-; exec "$@"';
-    child = spawn("/bin/bash", ["-c", 'set -m; /bin/bash -c "$1" compaction-session "${@:2}" & __pid=$!; printf "%s\\n" "$__pid" >&4; exec 4>&-; fg %1 >/dev/null 2>&1; exit $?',
+    child = spawn("/bin/bash", ["-c", 'set -m; /bin/bash -c "$1" compaction-session "${@:2}" & __pid=$!; printf "%s\\n" "$__pid" >&4; exec 4>&-; if { : >/dev/tty; } 2>/dev/null; then fg %1 >/dev/null 2>/dev/tty; else fg %1 >/dev/null; fi; exit $?',
       "compaction-session-owner", gate, message.command, ...message.args], { stdio: ["inherit", "inherit", "inherit", "pipe", "pipe"], env: process.env });
     const started = child;
     for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {

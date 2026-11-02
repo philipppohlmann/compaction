@@ -41,6 +41,9 @@ export async function pendingFullApplyGate(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<string | undefined> {
   if (readOptimizationMode(env) !== "cache-plus-context") return FULL_APPLY_PENDING_REASONS.optimizationMode;
+  // With nothing connected, a stored authorization exists or not - either way the missing workflow is
+  // the blocker, and naming the authorization would send the user to a step that changes nothing.
+  if (workflows.length === 0) return FULL_APPLY_PENDING_REASONS.workflowNotConnected;
   for (const workflow of workflows) {
     // ONE env for both gates. The mode and the authorization are two facts about the same device, and
     // a surface must answer the question the gateway will answer - reading them from two different
@@ -48,7 +51,5 @@ export async function pendingFullApplyGate(
     const authorization = await findStoredAuthorization({ scope: { tool: workflow }, env });
     if (authorization) return undefined;
   }
-  // Also the "nothing was enabled" case: no enabled workflow can carry an authorization, so no turn
-  // routed through this device can be a full apply either.
   return FULL_APPLY_PENDING_REASONS.applyAuthorization;
 }

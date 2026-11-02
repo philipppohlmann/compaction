@@ -49,11 +49,18 @@ export type LcmOutcomeReason =
   // rejected — a candidate was produced and the safety validator declined it.
   | "validation-unsourced"
   | "validation-over-compression"
+  // not-attempted / rejected / error — the engine was consulted and returned no LCM outcome of its own
+  // (it degraded, or refused the whole request). Recorded by the gateway from the decline class.
+  | "engine-unavailable"
+  | "allowance-insufficient"
+  | "engine-refused"
+  | "engine-no-result"
   // construction-failed — validated candidate, but no safe body could be built.
   | "unsupported-apply-shape"
   | "body-construction-failed"
   | "reconstructed-body-not-smaller"
   | "candidate-identical-to-original"
+  | ApplyConstructionReason
   // contributed / catch-all.
   | "applied"
   | "unexpected-error";
@@ -61,6 +68,38 @@ export type LcmOutcomeReason =
 export interface LcmOutcome {
   kind: LcmOutcomeKind;
   reason: LcmOutcomeReason;
+}
+
+/**
+ * The body builder's own refusal reasons (`src/engine/lcm/apply-body-construction.ts`), recorded as
+ * themselves rather than collapsed. Every refusal used to read `body-construction-failed`, which hid
+ * that Claude Code input compaction had been refused on one rule (`unhoistable-system-content`) for
+ * weeks. Each value is a literal from the builder; anything else still becomes the generic reason.
+ */
+export const APPLY_CONSTRUCTION_REASONS = [
+  "unhoistable-system-content",
+  "developer-role-not-hoistable",
+  "directive-prefix-leaves-nothing-to-collapse",
+  "no-messages-array",
+  "unreadable-message-content",
+  "no-older-history-to-collapse",
+  "no-tool-safe-boundary",
+  "only-instruction-history-nothing-to-collapse",
+  "orphan-tool-result",
+  "dangling-tool-use",
+  "system-message-illegal-position"
+] as const;
+
+export type ApplyConstructionReason = (typeof APPLY_CONSTRUCTION_REASONS)[number];
+
+/** A builder refusal as a fixed-vocabulary outcome. Total: an unlisted reason is never passed through. */
+export function classifyConstructionReason(reason: string): LcmOutcome {
+  if (reason === "reconstructed-body-not-smaller") return { kind: "construction-failed", reason };
+  const known = (APPLY_CONSTRUCTION_REASONS as readonly string[]).includes(reason);
+  return {
+    kind: "construction-failed",
+    reason: known ? (reason as ApplyConstructionReason) : "body-construction-failed"
+  };
 }
 
 /**
@@ -106,4 +145,19 @@ export function classifyLcmReason(kind: string, reason: string | undefined): Lcm
   if (has("model-client-error") || has("local-model-error")) return { kind: "no-candidate", reason: "model-error" };
   if (has("refus") || has("no-proposal")) return { kind: "no-candidate", reason: "model-refusal" };
   return { kind: "no-candidate", reason: "unexpected-error" };
+}
+
+/**
+ * The engine declined without saying why LCM did not contribute: it degraded (not running, timed out,
+ * unverified), refused the whole request, or returned nothing usable. Without this the receipt was
+ * indistinguishable from one the engine never saw — the 0.6.11 rc2 benchmark lost 35 allowance
+ * refusals that way. Total and content-free: only the decline CLASS is read, never an engine string.
+ */
+export function classifyEngineDecline(decline: { reason: string; refusal?: "quota-exhausted" }): LcmOutcome {
+  if (decline.reason.startsWith("engine-degraded:")) return { kind: "not-attempted", reason: "engine-unavailable" };
+  if (decline.refusal === "quota-exhausted") return { kind: "rejected", reason: "allowance-insufficient" };
+  if (decline.reason === "engine-result:refused") return { kind: "error", reason: "engine-refused" };
+  // A no-op, an engine error, or an applied answer the seam could not use: the engine produced no
+  // result to apply and said nothing about why. Nothing is claimed beyond that.
+  return { kind: "error", reason: "engine-no-result" };
 }

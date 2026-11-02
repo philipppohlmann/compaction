@@ -847,8 +847,8 @@ describe("OnboardingTui <App> - plan choice (the 'authorize' step) and Community
     expect(ready).toContain("Claude Code   Input + output token reduction · Results: Claude status line");
     const renderedReady = plain(ready);
     expect(renderedReady).toContain("Illustrative examples, not your activity:");
-    expect(renderedReady).toContain("Subscription: compaction · input 8,388,356→7,212,095 (−14%) · output 14,393→10,795 (−25%, est.) · +~3.08m");
-    expect(renderedReady).toContain("API key: compaction · input 91,472→74,769 (−18%) · output 857→463 (−46%, est.) · −$0.05 (list price)");
+    expect(renderedReady).toContain("Subscription: compaction · input 8,388,356→7,212,095 (−14%) · output 14,393→10,795 (−25.0%, est.) · +~3.08m");
+    expect(renderedReady).toContain("API key: compaction · input 91,472→74,769 (−18%) · output 857→463 (−46.0%, est.) · −$0.05 (list price)");
   });
 
   it("Community WITHOUT a lease lands on `basic`, never `observe` — a Community chooser is never left below Open", async () => {

@@ -7,7 +7,7 @@
  *  - `observe` — no model-visible mutation. The per-turn line reads `apply off`. This is the default and
  *    the safe posture: Compaction only observes provider traffic and writes content-free receipts.
  *  - `basic`   — the ONE public deterministic output-shaping method (`concise_response`) is attached to
- *    supported requests BEFORE generation. The per-turn line reads `basic shaping`. Engine-free, no input
+ *    supported requests BEFORE generation. Engine-free, no input
  *    compaction, no account, no usage debit, no network. Original is retained where recovery is required.
  *  - `full`    — Community private-engine adaptive apply. It is LEASE-GATED: with a valid signed entitlement
  *    lease on this device it is enabled; without one, selecting `full` EXPLAINS what Community adds, points
@@ -84,14 +84,19 @@ const OPEN_MODE_LINE_LABEL: Record<"observe" | "basic", string> = {
 };
 
 /** One-line, claim-honest description of each mode for the status/help copy. */
-const MODE_DESCRIPTION: Record<ProductMode, string> = {
+/**
+ * The mode catalogue copy. EXPORTED so a test can pin it against the renderer that implements it:
+ * these strings used to promise per-turn labels (`basic shaping`, `full apply`) that the line stopped
+ * emitting, and nothing connected the copy to the runtime that would have caught it.
+ */
+export const MODE_DESCRIPTION: Record<ProductMode, string> = {
   observe: "observe only — no model-visible mutation (per-turn line: `apply off`).",
   basic:
     "basic output shaping — the one public deterministic method (`concise_response`) attached before " +
-    "generation on supported requests (per-turn line: `basic shaping`). Engine-free, no input compaction, " +
+    "generation on supported requests. Engine-free, no input compaction, " +
     "no account, no usage debit.",
   full:
-    "Community full apply — private-engine adaptive input + output (per-turn line: `full apply`). Requires " +
+    "Community full apply — private-engine adaptive input + output. Requires " +
     "a Community account, a valid entitlement lease on this device, and the private engine."
 };
 
@@ -125,9 +130,11 @@ async function printCurrentMode(env: NodeJS.ProcessEnv = process.env): Promise<v
       )
     );
   }
-  // THE SAME CLAIM, ON THE SAME COMMAND. `MODE_DESCRIPTION.full` states the per-turn line reads `full
-  // apply`, so a device carrying a stored `full` from before the selection-time gate below existed
-  // reads that promise here while the Gateway's dormant guard holds every turn on a local setting.
+  // THE SAME CLAIM, ON THE SAME COMMAND. A device carrying a stored `full` from before the
+  // selection-time gate below existed reads an unqualified `full` here while the Gateway's dormant guard
+  // holds every turn on a local setting, so the qualification below is what keeps the two honest.
+  // (`MODE_DESCRIPTION` no longer promises a per-turn posture label: the renderer stopped emitting
+  // `basic shaping` / `full apply`, and only `apply off` remains — see `tierClause`.)
   //
   // QUALIFIED, NOT RE-DECIDED. The engine case above degrades the reported mode because with no engine
   // nothing on any route can mutate; a local gate is narrower than that (it holds the apply-routing
@@ -302,7 +309,8 @@ function setOpenMode(mode: "observe" | "basic", env: NodeJS.ProcessEnv = process
  * described in this file's HARD RAILS (which may reach the entitlement service and install the signed
  * engine); on a device with no account it is local-only and says so:
  *  - With a VALID signed entitlement lease for this device+period → ENABLE full (persist `full`);
- *    dev-signed leases are loudly labeled. The per-turn line reads `full apply` on a real apply turn.
+ *    dev-signed leases are loudly labeled. A real apply turn shows its evidence (input before→after)
+ *    on the per-turn line; the line carries no posture word.
  *  - With NO valid lease → make NO full-apply claim, PRESERVE the current Open mode, explain what
  *    Community adds, and point at the onboarding stepper (`compaction`) — which sets up the account and
  *    the entitlement together, so nobody has to know a separate command exists.
@@ -475,7 +483,7 @@ async function handleFullMode(env: NodeJS.ProcessEnv = process.env): Promise<voi
       }
       console.log(chalk.dim("  Nothing is purchased automatically."));
     }
-    console.log(chalk.dim("  On a real apply turn, the per-turn receipt line reads `full apply`."));
+    console.log(chalk.dim("  On a real apply turn, the per-turn receipt line shows the input before→after it measured."));
     // NAMES EVERY PRECONDITION THIS COMMAND CHECKED. The optimization mode was missing from this
     // sentence while being one of the gates that silently sends a turn record-only, so the one line
     // that lists what full apply needs omitted the setting most likely to be holding it back.
@@ -562,8 +570,8 @@ export function registerModeCommand(program: Command): void {
     .command("mode [mode]")
     .description(
       "Show or set the product mode (open-core apply posture). `observe` = no model-visible mutation " +
-        "(line: `apply off`); `basic` = the one public deterministic output-shaping method (line: " +
-        "`basic shaping`), engine-free and account-free; `full` = Community private-engine apply, which " +
+        "(line: `apply off`); `basic` = the one public deterministic output-shaping method, " +
+        "engine-free and account-free; `full` = Community private-engine apply, which " +
         "requires the private engine, a valid entitlement lease on this device, the \"Full optimization\" " +
         "mode, and a per-tool apply authorization (with any of them missing it names which one, changes " +
         "nothing, and preserves your current Open mode — run `compaction` to set Community up). " +

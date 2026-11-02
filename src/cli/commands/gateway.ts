@@ -38,7 +38,7 @@ import {
   writeRoutingSlot,
   type RoutingSlotRecord
 } from "../../core/gateway/routing-registry.js";
-import { resolveApplyRoutingActivation } from "../../core/gateway/apply-routing-activation.js";
+import { resolveApplyRoutingActivationWithLeaseRepair } from "../../core/gateway/apply-routing-activation.js";
 import { compareGatewayProof, formatGatewayProof, proofSummaryFromReceipt, receiptsForGatewayProof } from "../../core/gateway/proof.js";
 import { computeCapabilityMatrix } from "../../core/gateway/capability-matrix.js";
 import { formatCapabilityMatrix } from "../../core/gateway/capability-view.js";
@@ -683,7 +683,12 @@ export function registerGatewayCommand(program: Command): void {
       // auth + explicit init + not-stopped; ANY miss (or any error) stays record-only (fail-closed).
       // The shim contract is unchanged: only the base URL prints on success, and any failure is
       // fail-open (the tool runs unrouted). Never throws.
-      const applyRouting = await resolveApplyRoutingActivation({ provider, cwd: process.cwd() });
+      // A LAPSED LEASE MUST NOT PIN THE WHOLE SESSION TO RECORD-ONLY. This decision is taken ONCE per
+      // `claude` launch (the shim substitutes the base URL and execs), so when the credential condition is
+      // the sole blocker on a signed-in device, the lease is repaired (bounded) and the guard re-resolved
+      // once. Every other dormant cause is returned unchanged. See
+      // `resolveApplyRoutingActivationWithLeaseRepair` for the exact rule.
+      const applyRouting = await resolveApplyRoutingActivationWithLeaseRepair({ provider, cwd: process.cwd() });
       const sessionToken = process.env.COMPACTION_SESSION_PIN;
       const sessionPair = sessionToken ? resolveSessionPin(defaultManagedRoot(), sessionToken) : undefined;
       if (sessionToken && !sessionPair) {

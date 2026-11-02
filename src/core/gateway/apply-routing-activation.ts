@@ -79,11 +79,35 @@ export const APPLY_ROUTING_PROVIDER = "anthropic" as const;
  * fail-closed + original-retained per request). Every not-engaged decision carries an honest reason.
  */
 export type ApplyRoutingDecision =
-  | { engage: false; reason: string; version: typeof APPLY_ROUTING_ACTIVATION_VERSION }
+  | {
+      engage: false;
+      reason: string;
+      /**
+       * WHICH condition declined, as a fixed token rather than prose.
+       *
+       * A caller that wants to REPAIR a recoverable cause has to know which one it was, and the only
+       * thing available before this was `reason` — a human sentence. Parsing it would make the sentence
+       * load-bearing, and our own refusal strings go stale silently. This is the machine-readable half;
+       * `reason` stays the explanation and neither is derived from the other.
+       */
+      cause: ApplyRoutingDormantCause;
+      version: typeof APPLY_ROUTING_ACTIVATION_VERSION;
+    }
   | { engage: true; workflow: typeof APPLY_ROUTING_WORKFLOW; version: typeof APPLY_ROUTING_ACTIVATION_VERSION };
 
-function dormant(reason: string): ApplyRoutingDecision {
-  return { engage: false, reason, version: APPLY_ROUTING_ACTIVATION_VERSION };
+/** The dormant causes, one per condition in the guard. Fixed vocabulary, content-free. */
+export type ApplyRoutingDormantCause =
+  | "provider-not-applicable"
+  | "engine-unreachable"
+  | "stopped"
+  | "credential-missing"
+  | "input-optimization-not-selected"
+  | "workflow-not-connected"
+  | "authorization-missing"
+  | "guard-error";
+
+function dormant(cause: ApplyRoutingDormantCause, reason: string): ApplyRoutingDecision {
+  return { engage: false, reason, cause, version: APPLY_ROUTING_ACTIVATION_VERSION };
 }
 
 export interface ResolveApplyRoutingParams {
@@ -119,6 +143,38 @@ function leaseVerdictLabel(env: NodeJS.ProcessEnv): string {
 }
 
 /**
+ * Conditions 2, 4 and 3 — the LOCAL opt-ins evaluated after the credential condition, in guard order.
+ * Returns the dormant decision for the first unmet one, or `undefined` when all hold. One definition,
+ * shared by the guard and by the lease-repair precheck, so "is the credential the ONLY blocker?" is
+ * answered by the same code that answers "does this run engage?".
+ */
+async function gatesAfterCredential(env: NodeJS.ProcessEnv): Promise<ApplyRoutingDecision | undefined> {
+  // 2. INPUT OPT chosen - the explicit Cache + context optimization mode. Plain `cache` ⇒ dormant.
+  if (readOptimizationMode(env) !== "cache-plus-context") {
+    return dormant("input-optimization-not-selected", "optimization mode is not 'cache-plus-context' - input optimization was not selected; record-only");
+  }
+
+  // 4. EXPLICIT INIT - `claude-code` connected via `compaction init --connect` (persisted enum-only).
+  if (!readConnectedWorkflows(env).includes(APPLY_ROUTING_WORKFLOW)) {
+    return dormant("workflow-not-connected", "claude-code is not a connected workflow (`compaction init --connect claude-code`) - record-only");
+  }
+
+  // 3. STORED AUTH - an enabled, narrow-scoped auto-apply authorization for claude-code must exist.
+  // DEVICE-scoped, and only device-scoped: the same opt-in is seen from `$HOME`, from an arbitrary
+  // repo and from a nested subdirectory, while nothing under the working directory can supply one.
+  // `params.cwd` is deliberately NOT passed — a checked-out `.compaction/policy-preferences.json`
+  // must never be able to arm mutation on a device whose owner never authorized it.
+  const authorization = await findStoredAuthorization({ scope: { tool: APPLY_ROUTING_WORKFLOW }, env });
+  if (!authorization) {
+    return dormant("authorization-missing", "no stored auto-apply authorization for claude-code on this device - record-only (authorize with `compaction init --authorize-auto-apply claude-code`)");
+  }
+  if (authorization.scope.policy_type !== DEDUPE_POLICY) {
+    return dormant("authorization-missing", `stored authorization policy '${authorization.scope.policy_type}' is not the deterministic policy '${DEDUPE_POLICY}' - record-only`);
+  }
+  return undefined;
+}
+
+/**
  * Resolve whether the transparent Claude Code routing gateway should engage the workflow-scoped apply
  * path for THIS ensure. Fail-closed to `route-record` on any missing condition or any error. Never
  * throws. Consulted by `ensureGateway` (via the `gateway ensure` CLI action) on the fail-open shim path.
@@ -134,7 +190,7 @@ export async function resolveApplyRoutingActivation(
 
     // Provider gate: only the Anthropic/Claude Code route may ever engage apply routing.
     if (params.provider !== APPLY_ROUTING_PROVIDER) {
-      return dormant(`provider '${params.provider}' is not the apply-routing provider '${APPLY_ROUTING_PROVIDER}'`);
+      return dormant("provider-not-applicable", `provider '${params.provider}' is not the apply-routing provider '${APPLY_ROUTING_PROVIDER}'`);
     }
 
     // 0. RUNTIME CAPABILITY - an adaptive engine must actually RESOLVE on this device, because the
@@ -158,12 +214,12 @@ export async function resolveApplyRoutingActivation(
     //    pinned, no engine fetched yet) and an installed-but-UNVERIFIED artifact BOTH stay dormant, so
     //    the guard keeps failing honestly whenever apply is not genuinely runnable.
     if (!(await fullOptimizationReachable(env))) {
-      return dormant("no adaptive engine resolves on this device (absent, not installed, or failed verify-before-run) - apply cannot change model-visible input; record-only");
+      return dormant("engine-unreachable", "no adaptive engine resolves on this device (absent, not installed, or failed verify-before-run) - apply cannot change model-visible input; record-only");
     }
 
     // 5. NOT STOPPED - the unified `compaction stop` disables apply routing too (record-only, no mutation).
     if (isShapingStopped(env as Record<string, string | undefined>)) {
-      return dormant("compaction is stopped (`compaction stop`) - apply routing is disabled; record-only");
+      return dormant("stopped", "compaction is stopped (`compaction stop`) - apply routing is disabled; record-only");
     }
 
     // 1. CREDENTIALED - an API key (presence only; never read) OR a verified entitlement lease.
@@ -174,32 +230,12 @@ export async function resolveApplyRoutingActivation(
     if (!anthropicKeyPresent(env)) {
       const leaseLabel = leaseVerdictLabel(env);
       if (leaseLabel !== "lease-valid") {
-        return dormant(`no ANTHROPIC_API_KEY and no verified entitlement lease (${leaseLabel}) - apply routing needs one of the two; record-only`);
+        return dormant("credential-missing", `no ANTHROPIC_API_KEY and no verified entitlement lease (${leaseLabel}) - apply routing needs one of the two; record-only`);
       }
     }
 
-    // 2. INPUT OPT chosen - the explicit Cache + context optimization mode. Plain `cache` ⇒ dormant.
-    if (readOptimizationMode(env) !== "cache-plus-context") {
-      return dormant("optimization mode is not 'cache-plus-context' - input optimization was not selected; record-only");
-    }
-
-    // 4. EXPLICIT INIT - `claude-code` connected via `compaction init --connect` (persisted enum-only).
-    if (!readConnectedWorkflows(env).includes(APPLY_ROUTING_WORKFLOW)) {
-      return dormant("claude-code is not a connected workflow (`compaction init --connect claude-code`) - record-only");
-    }
-
-    // 3. STORED AUTH - an enabled, narrow-scoped auto-apply authorization for claude-code must exist.
-    // DEVICE-scoped, and only device-scoped: the same opt-in is seen from `$HOME`, from an arbitrary
-    // repo and from a nested subdirectory, while nothing under the working directory can supply one.
-    // `params.cwd` is deliberately NOT passed — a checked-out `.compaction/policy-preferences.json`
-    // must never be able to arm mutation on a device whose owner never authorized it.
-    const authorization = await findStoredAuthorization({ scope: { tool: APPLY_ROUTING_WORKFLOW }, env });
-    if (!authorization) {
-      return dormant("no stored auto-apply authorization for claude-code on this device - record-only (authorize with `compaction init --authorize-auto-apply claude-code`)");
-    }
-    if (authorization.scope.policy_type !== DEDUPE_POLICY) {
-      return dormant(`stored authorization policy '${authorization.scope.policy_type}' is not the deterministic policy '${DEDUPE_POLICY}' - record-only`);
-    }
+    const localGate = await gatesAfterCredential(env);
+    if (localGate) return localGate;
 
     // Every condition holds: engage the workflow-scoped record gateway. The server's fail-closed
     // eligibility gates + original-retention still run per request before any mutation; the response
@@ -208,6 +244,89 @@ export async function resolveApplyRoutingActivation(
   } catch (error) {
     // FAIL-CLOSED (and fail-open for the workflow): any error resolving the guard means the default
     // byte-safe record gateway is ensured; apply routing never engages off a broken read.
-    return dormant(`apply-routing guard could not be evaluated (${(error as Error).message}) - record-only (fail-closed)`);
+    return dormant("guard-error", `apply-routing guard could not be evaluated (${(error as Error).message}) - record-only (fail-closed)`);
+  }
+}
+
+/** The two side effects the lease repair needs, injectable so the rule is testable without a network. */
+export interface LeaseRepairDeps {
+  /** Presence of stored account credentials (a local 0600 file read; the value is never used). */
+  hasCredentials: (env: NodeJS.ProcessEnv) => boolean;
+  /** One lease-only Community repair. Should honor `signal`; a throw is treated as a miss. */
+  repairLease: (env: NodeJS.ProcessEnv, signal: AbortSignal) => Promise<unknown>;
+  /** Wall-clock bound for the repair. */
+  timeoutMs: number;
+}
+
+async function defaultLeaseRepairDeps(): Promise<LeaseRepairDeps> {
+  // Dynamic imports keep the account client off the static graph of this engine-free module.
+  const { readStoredCredentials } = await import("../auth/credentials.js");
+  const { ensureCommunityRuntime, REQUEST_TIME_LEASE_RENEW_MS } = await import("../entitlement/community-runtime.js");
+  return {
+    hasCredentials: (env) => readStoredCredentials(env) !== undefined,
+    repairLease: (env, signal) => ensureCommunityRuntime(env, () => {}, { signal, leaseOnly: true }),
+    timeoutMs: REQUEST_TIME_LEASE_RENEW_MS
+  };
+}
+
+/**
+ * `resolveApplyRoutingActivation`, plus ONE bounded lease repair when the credential condition is the
+ * SOLE blocker.
+ *
+ * `gateway ensure` takes the routing decision once per tool launch, and the guard reads the lease off
+ * disk without repairing it. A lapsed lease on an otherwise fully set-up device therefore pinned that
+ * whole session to a record-only gateway, even when the lease would have been reissued a moment later.
+ *
+ * The repair runs only when ALL of these hold; otherwise the plain guard decision is returned with no
+ * network call:
+ *   - the guard declined with cause `credential-missing` (provider, engine and stop are checked first,
+ *     so a wrong provider, an absent engine or `compaction stop` never reach here);
+ *   - every LATER local opt-in (input optimization, connected workflow, stored authorization) already
+ *     holds, so the lease is the only thing between this launch and an engaged route;
+ *   - the device holds account credentials (an Open device has no lease to repair).
+ *
+ * Bounded by `timeoutMs` with a deadline race, so a repair that ignores its signal still cannot hold
+ * the launch. Re-resolves exactly once. Fail-open: any error, timeout or still-invalid verdict returns
+ * the original dormant decision. An authoritative denial is handled inside the repair by its existing
+ * contract (the lease is deleted, the guard stays dormant); a transient failure leaves any stored lease
+ * untouched. Never throws.
+ */
+export async function resolveApplyRoutingActivationWithLeaseRepair(
+  params: ResolveApplyRoutingParams,
+  deps?: LeaseRepairDeps
+): Promise<ApplyRoutingDecision> {
+  const first = await resolveApplyRoutingActivation(params);
+  if (first.engage || first.cause !== "credential-missing") return first;
+  try {
+    const env = params.env ?? process.env;
+    if ((await gatesAfterCredential(env)) !== undefined) return first;
+    const resolvedDeps = deps ?? (await defaultLeaseRepairDeps());
+    if (!resolvedDeps.hasCredentials(env)) return first;
+
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve();
+      }, resolvedDeps.timeoutMs);
+    });
+    try {
+      await Promise.race([
+        Promise.resolve()
+          .then(() => resolvedDeps.repairLease(env, controller.signal))
+          .then(
+            () => undefined,
+            () => undefined
+          ),
+        deadline
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+    const reResolved = await resolveApplyRoutingActivation(params);
+    return reResolved.engage ? reResolved : first;
+  } catch {
+    return first;
   }
 }

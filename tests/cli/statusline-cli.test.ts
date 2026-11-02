@@ -139,8 +139,7 @@ describe("computeStatusLine", () => {
       }), { readReceipt: async () => undefined, env });
 
       expect(line).not.toBe(STATUS_LINE_PLACEHOLDER);
-      expect(line).toContain("output N/A→88 (N/A%, est.)");
-      expect(line).toContain("basic shaping");
+      expect(line).toBe("compaction · output N/A→88 (N/A%, est.)");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -267,7 +266,7 @@ describe("computeStatusLine — gateway-shaped turns (no hook state on disk)", (
       mode: "apply",
       request_mutated: true,
       applied_components: ["output-shaping"],
-      // A gateway-shaped turn now records the durable provenance the arrow and the label both read.
+      // A gateway-shaped turn records the durable provenance the output estimate reads.
       output_shaping_state: "attached-this-pass",
       approval_status: "auto-applied-by-policy",
       recovery_id: "rec-1",
@@ -275,7 +274,7 @@ describe("computeStatusLine — gateway-shaped turns (no hook state on disk)", (
     });
   }
 
-  it("labels a gateway-shaped turn `basic shaping` even with no hook state", async () => {
+  it("shows a gateway-shaped turn's output evidence even with no hook state", async () => {
     const line = await computeStatusLine('{"cwd":"/some/proj"}', {
       readReceipt: async () => shapedReceipt(),
       env: { ...noHookState, COMPACTION_PRODUCT_MODE_TEST_ONLY: "" }
@@ -293,12 +292,8 @@ describe("computeStatusLine — gateway-shaped turns (no hook state on disk)", (
     expect(line).not.toMatch(/output [\d,]+→/);
     expect(line).not.toContain("755");
     expect(line).not.toContain("−47%");
-    // KNOWN VOCABULARY INCONSISTENCY, pinned deliberately rather than quietly fixed. Suppressing the
-    // tier label also drops the Open `observed input` prefix, because the shared renderer derives the
-    // input vocabulary from the same `tier` argument as the label. So a labelled line reads
-    // `observed input N` and an unlabelled one reads `input N`. Both are plain counts and neither
-    // claims a reduction, so this is a wording question, not a claim defect — and changing shared
-    // shared user-facing vocabulary is a deliberate product decision, not one to make inside a test.
+    // With no proven configured tier, the input axis keeps the legacy plain-count vocabulary. It is
+    // still a count rather than a reduction.
     expect(line).toContain("input 22,012");
   });
 
@@ -316,18 +311,14 @@ describe("computeStatusLine — gateway-shaped turns (no hook state on disk)", (
       });
       expect(line).toContain("output N/A→412 (N/A%, est.)");
       expect(line).not.toMatch(/output [\d,]+→412/);
-      expect(line).toContain("basic shaping");
+      expect(line).toContain("observed input 22,012");
+      expect(line).toContain("id a1b2c3d4");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("does NOT claim `basic shaping` on a turn the receipt shows was not shaped", async () => {
-    // THE PRECISE OVERCLAIM THIS CHANGE REMOVES. The label used to come from the stored preference, so
-    // a user whose persisted mode is `basic` saw `basic shaping` on EVERY turn — including turns that
-    // nothing had shaped (a held planning turn, an unsupported request shape, a record-mode turn).
-    // The mode must genuinely be `basic` here or the test proves nothing: with the default `observe`
-    // it would pass against the old code too.
+  it("does not draw an output saving on a basic-mode turn the receipt shows was not shaped", async () => {
     const dir = mkdtempSync(join(tmpdir(), "statusline-basic-"));
     try {
       const env = { COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv;
@@ -336,13 +327,14 @@ describe("computeStatusLine — gateway-shaped turns (no hook state on disk)", (
         readReceipt: async () => receipt(), // plain record turn: nothing applied, nothing mutated
         env
       });
-      expect(line, "no per-turn evidence ⇒ no shaping claim").not.toContain("basic shaping");
+      expect(line).toBe("compaction · input 22,012 · output 412 · id a1b2c3d4");
+      expect(line, "no per-turn evidence ⇒ no saving claim").not.toContain("→");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });
 
-  it("DOES claim `basic shaping` for a basic-mode user when the receipt proves the gateway shaped it", async () => {
+  it("shows the output estimate for a basic-mode user when the receipt proves the gateway shaped it", async () => {
     const dir = mkdtempSync(join(tmpdir(), "statusline-basic-shaped-"));
     try {
       const env = { COMPACTION_CONFIG_DIR: dir } as NodeJS.ProcessEnv;
@@ -351,8 +343,8 @@ describe("computeStatusLine — gateway-shaped turns (no hook state on disk)", (
         readReceipt: async () => shapedReceipt(),
         env
       });
-      expect(line).toContain("basic shaping");
       expect(line).toContain("observed input 22,012"); // Open vocabulary: a count, never a reduction
+      expect(line).toContain("output N/A→412 (N/A%, est.)");
       // Anchored to the INPUT clause: the old `/input .*→/` spanned into the output arrow.
       expect(line).not.toMatch(/observed input [\d,]+→/);
     } finally {
@@ -423,8 +415,8 @@ describe("computeStatusLine — per-session shaping evidence", () => {
         readReceipt: async () => sessionReceipt(SESSION_A, env),
         env
       });
-      expect(line).toMatch(/output [\d,]+→412 \(−\d+%, est\./);
-      expect(line).toContain("basic shaping");
+      expect(line).toMatch(/output [\d,]+→412 \(−\d+\.\d%, est\./);
+      expect(line).toContain("observed input 22,012");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -497,7 +489,7 @@ describe("computeStatusLine — per-session shaping evidence", () => {
         readReceipt: async () => sessionReceipt(SESSION_A, env), // record mode: request_mutated absent
         env
       });
-      expect(line).toMatch(/output [\d,]+→412 \(−\d+%, est\./);
+      expect(line).toMatch(/output [\d,]+→412 \(−\d+\.\d%, est\./);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -552,9 +544,9 @@ describe("computeStatusLine — exact-turn Codex scope", () => {
         env
       });
       expect(line, "a shaped Codex turn must keep its calibrated arrow").toMatch(
-        /output [\d,]+→412 \(−\d+%, est\./
+        /output [\d,]+→412 \(−\d+\.\d%, est\./
       );
-      expect(line).toContain("basic shaping");
+      expect(line).toContain("observed input 22,012");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -671,7 +663,8 @@ describe("computeStatusLine — Community allowance countdown", () => {
         }),
       env: communityDevice()
     });
-    expect(line).toContain("full apply");
+    expect(line).toContain("input 75,946→51,682 (−32%)");
+    expect(line).toContain("output N/A→300 (N/A%, est.)");
     expect(line).toContain("1.82M/2M left");
     expect(line).toMatch(CONTENT_FREE_LINE);
   });
@@ -718,8 +711,9 @@ describe("computeStatusLine — Community allowance countdown", () => {
       env
     });
     // 300 + round(300 × 0.40 / 0.60) = 500, from the seeded fold above — never the shipped prior.
-    expect(line).toContain("output 500→300 (−40%, est.)");
-    expect(line).toContain("full apply");
+    expect(line).toContain("input 75,946→51,682 (−32%)");
+    expect(line).toContain("output 500→300 (−40.0%, est.)");
+    expect(line).toContain("id a1b2c3d4");
   });
 
   it("renders NO arrow for a LEGACY receipt with no state, even though it is a real apply", async () => {
@@ -741,7 +735,9 @@ describe("computeStatusLine — Community allowance countdown", () => {
       readReceipt: async () => fullApplyReceipt(),
       env: communityDevice()
     });
-    expect(line).toContain("full apply");
+    expect(line).toContain("input 75,946→51,682 (−32%)");
+    expect(line).toContain("output N/A→300 (N/A%, est.)");
+    expect(line).toContain("id a1b2c3d4");
     expect(line).not.toContain("left");
   });
 });

@@ -251,8 +251,8 @@ describe("Claude task-notification provisional lifecycle", () => {
     expect((await readActivityEvents(join(f.cwd, ".compaction", "activity"))).events
       .filter((event) => event.activity_kind === "claude-stop")).toHaveLength(1);
 
-    // The next genuine prompt opens a new run. Its empty/open state must not resurrect this settled
-    // activity merely because it is the newest record for the same Claude session.
+    // The next genuine prompt opens a new run. While it is in flight the line holds THIS settled run's
+    // result (selected by its exact run identity, not as the newest record) until the next Stop.
     await captureClaudeCodeShapeFromPromptHook({
       env: f.env,
       now: () => "2026-09-04T10:03:00.000Z",
@@ -262,7 +262,7 @@ describe("Claude task-notification provisional lifecycle", () => {
     expect(await computeStatusLine(JSON.stringify({ cwd: f.cwd, session_id: SESSION }), {
       env: f.env,
       readReceipts: async () => []
-    })).toBe("compaction · recording");
+    })).toBe(finalLine);
 
     const storeRaw = await readFile(join(f.configDir, "runs", `${f.correlation}.json`), "utf8");
     for (const forbidden of [SESSION, "human-hook-only", "task-hook-only", "SECRET_TRANSCRIPT_CONTENT"]) {
@@ -296,15 +296,19 @@ describe("Claude task-notification provisional lifecycle", () => {
     const line = lines.find((candidate) => candidate.startsWith("compaction · "))!;
     expect(line).toContain("session cumulative");
     expect(line).toContain("observed input 1,900");
-    expect(line).toContain("output N/A→180 (N/A%, est.)");
-    expect(line).toContain("basic shaping");
-    expect(line).not.toContain("47%");
+    // A supported shaped turn resolves the family posterior rather than staying permanently `N/A`. The
+    // withdrawn 0.47 default prior is still forbidden — that is the assertion this case protects.
+    expect(line).toMatch(/output [\d,]+→180 \(−\d+\.\d%, est\.\)/);
+    expect(line).not.toMatch(/47(\.\d+)?%/);
     const event = (await readActivityEvents(join(f.cwd, ".compaction", "activity"))).events
       .find((candidate) => candidate.activity_kind === "claude-stop")!;
     expect(event.measurement_source).toBe("claude-transcript");
-    expect(event.output_estimate_state).toBe("unseeded");
-    expect(event.output_estimate_basis).toBeUndefined();
-    expect(event.estimated_output_tokens_saved).toBeUndefined();
+    expect(event.output_estimate_state).toBe("calibrated");
+    expect(event.output_estimate_basis).toBe("family-calibrated");
+    // The family-backed counterfactual now exists, and must arrive with its provenance attached.
+    expect(event.estimated_output_tokens_saved).toBeGreaterThan(0);
+    expect(event.output_calibration_family_version).toBeDefined();
+    expect(event.output_calibration_evidence_id).toBeDefined();
   });
 
   it("settles two genuine human tasks without carrying the first task's cumulative usage into the second", async () => {
@@ -510,7 +514,7 @@ describe("Claude task-notification provisional lifecycle", () => {
     const afterMtime = (await stat(storePath)).mtimeMs;
     expect(status).toContain("input 1,900→1,500");
     expect(status).toContain("output N/A→180 (N/A%, est.)");
-    expect(status).not.toContain("47%");
+    expect(status).not.toMatch(/47(\.\d+)?%/);
     expect(afterStatus).toBe(beforeStatus);
     expect(afterMtime).toBe(beforeMtime);
 
@@ -518,8 +522,8 @@ describe("Claude task-notification provisional lifecycle", () => {
     const watchLine = receiptLinesFromJsonl(`${JSON.stringify(tail)}\n`, { productTier: "full", env: f.env })[0]!;
     expect(inlineLine).toContain("output N/A→180 (N/A%, est.)");
     expect(watchLine).toContain("output N/A→80 (N/A%, est.)");
-    expect(inlineLine).not.toContain("47%");
-    expect(watchLine).not.toContain("47%");
+    expect(inlineLine).not.toMatch(/47(\.\d+)?%/);
+    expect(watchLine).not.toMatch(/47(\.\d+)?%/);
 
     const raw = await readFile(storePath, "utf8");
     for (const forbidden of [SESSION, "human-1", "task-1", "SECRET_TRANSCRIPT_CONTENT", "<task-notification>"]) {
@@ -647,7 +651,7 @@ describe("Claude task-notification provisional lifecycle", () => {
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("input 1,900→1,500");
     expect(lines[0]).toContain("output N/A→180 (N/A%, est.)");
-    expect(lines[0]).not.toContain("47%");
+    expect(lines[0]).not.toMatch(/47(\.\d+)?%/);
     const rawActivity = await readFile(join(f.cwd, ".compaction", "activity", "activity.jsonl"), "utf8");
     expect(rawActivity.trim().split("\n")).toHaveLength(2);
     const logicalActivity = await readActivityEvents(join(f.cwd, ".compaction", "activity"));

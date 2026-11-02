@@ -8,6 +8,8 @@ import { isProcessAlive, readGatewayPid, type GatewayPidRecord } from "./status.
 import { findUnregisteredGatewayProcess } from "../update/process-identity.js";
 
 export const GATEWAY_CONTROL_PATH = "/.compaction/control/v1";
+/** Drain scope sent only by the activation barrier; any other POST drain keeps the strict gate. */
+export const GATEWAY_DRAIN_SCOPE_UPDATE = "update";
 export type GatewayControlRecord = Pick<GatewayPidRecord, "pid" | "host" | "port" | "release">;
 export interface GatewayReleaseIdentity {
   instanceId: string;
@@ -56,8 +58,21 @@ export function isGatewayReleaseIdentity(value: unknown): value is GatewayReleas
 }
 
 export function gatewayQuiescent(state: GatewayUpdateState): boolean {
+  return gatewayDrainable(state) && state.unsettledRuns === 0;
+}
+
+/**
+ * The ACTIVATION drain's condition (`GATEWAY_DRAIN_SCOPE_UPDATE`). Only `gatewayBarrier` requests that
+ * scope, and activation/rollback reach it after proving no managed session lease and no tool process
+ * (`hasUntrackedToolProcesses`, whose coverage this relies on). With no tool alive an open run cannot
+ * advance until a later launch, which runs the new release on the same store, so it is dormant rather
+ * than in flight. Counting it made one abandoned session (ended before its `Stop`) defer every later
+ * update for as long as the persistent routing gateway lived. Session-start supersede drains
+ * (`ensure.ts`, `dev.ts`) run beside other live sessions and keep the strict `gatewayQuiescent` gate.
+ */
+export function gatewayDrainable(state: GatewayUpdateState): boolean {
   return !state.settlementUnknown && state.activeRequests === 0 && state.pendingBookkeeping === 0 &&
-    state.unsettledRuns === 0 && state.unsettledCodex === 0 && state.unsettledClaude === 0;
+    state.unsettledCodex === 0 && state.unsettledClaude === 0;
 }
 
 /** Reuse requires the authenticated listener's release to match the admitted session exactly. */
@@ -115,7 +130,8 @@ export function gatewayControlHandler(
       res.end(body);
     };
     if (req.method === "POST") {
-      if (draining || !gatewayQuiescent(snapshot)) {
+      const updateScope = req.headers["x-compaction-drain-scope"] === GATEWAY_DRAIN_SCOPE_UPDATE;
+      if (draining || !(updateScope ? gatewayDrainable(snapshot) : gatewayQuiescent(snapshot))) {
         reply(409);
         return true;
       }
@@ -131,7 +147,10 @@ export function gatewayControlHandler(
 }
 
 /** Proves the listener owns this exact recorded instance; a live PID/TCP port alone proves nothing. */
-export function queryGatewayIdentity(rec: GatewayControlRecord, drain = false): Promise<GatewayIdentityStatus | undefined> {
+export function queryGatewayIdentity(
+  rec: GatewayControlRecord,
+  drain: boolean | typeof GATEWAY_DRAIN_SCOPE_UPDATE = false
+): Promise<GatewayIdentityStatus | undefined> {
   const identity = rec.release;
   if (!isGatewayReleaseIdentity(identity) || !["127.0.0.1", "::1"].includes(rec.host) ||
     !Number.isSafeInteger(rec.port) || rec.port <= 0 || rec.port > 65535) return Promise.resolve(undefined);
@@ -148,7 +167,10 @@ export function queryGatewayIdentity(rec: GatewayControlRecord, drain = false): 
     const req = http.request({ hostname: rec.host, port: rec.port, path: GATEWAY_CONTROL_PATH,
       method, agent: false,
       headers: { "x-compaction-control": proof(identity.controlCapability, `${method}:${identity.instanceId}:${nonce}`),
-        "x-compaction-instance": identity.instanceId, "x-compaction-nonce": nonce }
+        "x-compaction-instance": identity.instanceId, "x-compaction-nonce": nonce,
+        // Outside the proof on purpose so an older gateway still authenticates the drain; it ignores
+        // the header and keeps its strict gate. Only capability holders can drain either way.
+        ...(drain === GATEWAY_DRAIN_SCOPE_UPDATE ? { "x-compaction-drain-scope": GATEWAY_DRAIN_SCOPE_UPDATE } : {}) }
     }, (res) => {
       let body = "";
       res.on("data", (chunk: Buffer) => {
@@ -187,7 +209,7 @@ export function registerGatewayInstance(root: string, rec: GatewayControlRecord)
   return () => { rmSync(target, { force: true }); };
 }
 
-/** Called UNDER the managed activation lock, after all admitted tool leases have cleared. */
+/** Called UNDER the managed activation lock, after all admitted tool leases have cleared and no tool process remains. */
 export async function gatewayBarrier(root: string, _currentPairId: string): Promise<{ ok: boolean; reason?: string }> {
   const directory = path.join(root, "gateways");
   let names: string[];
@@ -214,7 +236,7 @@ export async function gatewayBarrier(root: string, _currentPairId: string): Prom
       }
       const status = await queryGatewayIdentity(rec);
       if (!status) return { ok: false, reason: "gateway-identity-unverified" };
-      if (!gatewayQuiescent(status) || status.draining) return { ok: false, reason: "gateway-busy-or-unsettled" };
+      if (!gatewayDrainable(status) || status.draining) return { ok: false, reason: "gateway-busy-or-unsettled" };
       idle.push(rec);
       registeredPids.add(rec.pid);
     } catch { return { ok: false, reason: "gateway-registry-unreadable" }; }
@@ -228,7 +250,7 @@ export async function gatewayBarrier(root: string, _currentPairId: string): Prom
   if (unregistered !== false) return { ok: false, reason: unregistered === "unknown"
     ? "gateway-process-inventory-unknown" : "gateway-unregistered-stop-old-gateway" };
   for (const rec of idle) {
-    const result = await queryGatewayIdentity(rec, true);
+    const result = await queryGatewayIdentity(rec, GATEWAY_DRAIN_SCOPE_UPDATE);
     if (!result?.draining) return { ok: false, reason: "gateway-drain-deferred" };
   }
   return { ok: true };

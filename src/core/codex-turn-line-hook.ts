@@ -1,4 +1,9 @@
+import { compactionCommand, isCompactionCommand, type LauncherOwnership } from "./compaction-command.js";
+import { ownsLauncher } from "./update/launcher-ownership.js";
 import type { CodexHookGroup, CodexHooksConfig } from "./subscription-shaping-hooks.js";
+
+/** The arguments after `compaction` in the Codex per-turn line hook command. */
+export const CODEX_TURN_LINE_ARGS = "hooks line codex";
 
 /**
  * CODEX PER-TURN LINE HOOK (PUBLIC CLI/SDK core, engine-free, content-free, fail-open).
@@ -13,8 +18,8 @@ import type { CodexHookGroup, CodexHooksConfig } from "./subscription-shaping-ho
  *
  * The HOOK protocol is. Codex 0.153 supplies `session_id` and `turn_id` on UserPromptSubmit and Stop,
  * plus `transcript_path` and `model` on Stop; its output schema carries `systemMessage`. The matching
- * rollout's final `token_usage_record.turn_token_usage` is durable before Stop and is cumulative for
- * the full turn. These are the exact identity and count fields the adapter validates.
+ * rollout's final `token_usage_record.turn_token_usage` is cumulative for the full turn. Settlement
+ * allows a short bounded post-Stop visibility grace, then validates the exact identity and counts.
  *
  * The existing live acceptance proved Codex renders `systemMessage`; settlement now reads the exact
  * stopped turn rather than a cwd-latest receipt or an in-progress placeholder.
@@ -24,9 +29,9 @@ import type { CodexHookGroup, CodexHooksConfig } from "./subscription-shaping-ho
  * yields empty output rather than a broken turn.
  */
 
-/** The command a Codex `Stop` hook entry runs each turn. */
-export function codexTurnLineCommand(): string {
-  return "compaction hooks line codex";
+/** The command a Codex `Stop` hook entry runs each turn (naming the managed `launcher` when given). */
+export function codexTurnLineCommand(launcher?: string): string {
+  return compactionCommand(CODEX_TURN_LINE_ARGS, launcher);
 }
 
 /** Codex `Stop` hook timeout (seconds). Settlement is local and bounded, but large real runs can exceed 5s. */
@@ -41,9 +46,8 @@ export const CODEX_TURN_LINE_HOOK_TIMEOUT_SECONDS = 15;
  * writes and removes only a command it produced itself, so an exact comparison is both sufficient and
  * the only safe rule. Surrounding whitespace is tolerated because a hand-edited config often has it.
  */
-export function isCompactionTurnLineHookCommand(command: string | undefined): boolean {
-  if (typeof command !== "string") return false;
-  return command.trim() === codexTurnLineCommand();
+export function isCompactionTurnLineHookCommand(command: string | undefined, owns: LauncherOwnership = ownsLauncher): boolean {
+  return isCompactionCommand(command, CODEX_TURN_LINE_ARGS, owns);
 }
 
 /**
@@ -60,7 +64,7 @@ export function codexTurnLineStdout(line: string | undefined): string {
  * entry; idempotent; refuses rather than clobber a malformed `hooks` / `hooks.Stop`. Mirrors
  * `installCodexShapingHook` so both Codex hooks behave identically on a hand-edited config.
  */
-export function installCodexTurnLineHook(input: CodexHooksConfig): {
+export function installCodexTurnLineHook(input: CodexHooksConfig, launcher?: string): {
   config: CodexHooksConfig;
   changed: boolean;
   alreadyPresent: boolean;
@@ -87,7 +91,7 @@ export function installCodexTurnLineHook(input: CodexHooksConfig): {
   }
 
   groups.push({
-    hooks: [{ type: "command", command: codexTurnLineCommand(), timeout: CODEX_TURN_LINE_HOOK_TIMEOUT_SECONDS }]
+    hooks: [{ type: "command", command: codexTurnLineCommand(launcher), timeout: CODEX_TURN_LINE_HOOK_TIMEOUT_SECONDS }]
   });
   return { config, changed: true, alreadyPresent: false };
 }

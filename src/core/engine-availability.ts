@@ -90,6 +90,23 @@ export async function engineInputCompaction(env: NodeJS.ProcessEnv = process.env
 }
 
 /**
+ * The signed release version of the engine a request would reach, or `undefined` when no VERIFIED
+ * signed install resolves (absent, unverified, or a dev build without a manifest). Same resolution as
+ * `engineAvailability`, so a displayed version always names the engine that runs.
+ */
+export async function resolvedEngineVersion(env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  const { resolveEngine } = await import("./gateway/engine-ipc/supervisor.js");
+  const { loadExecutingManagedInstallation } = await import("./update/ownership.js");
+  let managed: ReturnType<typeof loadExecutingManagedInstallation>;
+  try { managed = loadExecutingManagedInstallation(env); }
+  catch { return undefined; }
+  const resolved = resolveEngine({ env, ...(managed ? {
+    verifiedInstalledArtifact: managed.pair.engine.mode === "signed" ? managed.pair.engine : null
+  } : {}) });
+  return resolved.path === null ? undefined : resolved.installed?.manifest.version;
+}
+
+/**
  * Whether a surface may describe full optimization / input compaction as something that RUNS.
  *
  * `"present"` ONLY — deliberately not `!== "unavailable"`. An

@@ -137,7 +137,7 @@ describe("gateway Open `basic` output shaping — engine-free, account-free, no 
     expect(ctx.seen[0]).toContain("add a null check to the parser");
   });
 
-  it("the per-turn LINE reads `basic shaping`, and says so because the RECEIPT says so", async () => {
+  it("the per-turn line shows the receipt's shaping evidence without changing the input axis", async () => {
     const ctx = await setup("basic");
     expect(await post(ctx.port, "/v1/messages", BODY)).toBe(200);
     await settle(ctx.receipts, ctx.logs);
@@ -150,16 +150,17 @@ describe("gateway Open `basic` output shaping — engine-free, account-free, no 
 
     const line = ctx.logs.find((l) => l.startsWith("compaction · "));
     expect(line, "a per-turn line must be emitted").toBeDefined();
-    expect(line).toContain("basic shaping");
     expect(line).toContain("observed input 1,200"); // a plain count, never a reduction
     // THIS DEVICE HAS MEASURED NOTHING, SO THE LINE SHOWS NO REDUCTION FIGURE — and says that is what
     // is missing. The arrow used to render here from the shipped 0.47 prior, disclosed as
     // `est. · default prior`; a fully specific `755→400 (−47%)` reads as counted whatever label sits
-    // beside it, so the FIGURE is withheld. The AXIS is not: shaping ran (`basic shaping` says so from
-    // the receipt), the after is the provider's own, and the before is stated as unknown rather than
+    // beside it, so the FIGURE is withheld. The AXIS is not: the after is the provider's own, and the before is stated as unknown rather than
     // omitted — a plain `output 400` is indistinguishable from the line an unshaped turn prints.
-    expect(line).toContain("output N/A→400 (N/A%, est.)");
-    expect(line, "no reduction figure without a measurement").not.toMatch(/output [\d,]+→/);
+    // The shaped axis now renders from the shipped substantive FAMILY posterior, so a supported shaped
+    // turn is no longer permanently `N/A` on a device with no A/B of its own. The withdrawn 0.47 default
+    // prior is still forbidden, and that is the assertion that matters here: what changed is WHICH
+    // evidence may back the figure, not that any figure will do.
+    expect(line).toMatch(/output [\d,]+→400 \(−\d+\.\d%, est\.\)/);
     expect(line, "the prior's reconstruction must not appear").not.toContain("755");
     expect(line).not.toContain("−47%");
     // NO INPUT REDUCTION on an Open line -- the load-bearing Open guarantee. Anchored to the input
@@ -177,9 +178,9 @@ describe("gateway Open `basic` output shaping — engine-free, account-free, no 
     // A FIGURE IS EARNED BY EVIDENCE, and this device has none. The shipped 0.47 prior still exists
     // and still backs internal estimation; what it may not do is put a `−47%` on this user's turn.
     const plainLine = plain.logs.find((l) => l.startsWith("compaction · "));
-    expect(plainLine).toContain("output N/A→400 (N/A%, est.)");
+    expect(plainLine).toMatch(/output [\d,]+→400 \(−\d+\.\d%, est\.\)/);
     expect(plainLine, "the shipped prior may not render as this device's result").not.toContain("−47%");
-    expect(plainLine, "no reconstructed before on an unmeasured device").not.toMatch(/output [\d,]+→/);
+    expect(plainLine, "the prior's reconstruction must not appear").not.toContain("755");
 
     // Now a real measured 40% A/B (1000→600), folded through the real store.
     const calibrated = await setup("basic");
@@ -190,10 +191,9 @@ describe("gateway Open `basic` output shaping — engine-free, account-free, no 
     // The device's OWN 40% replaces the prior outright: before = 400 + round(400 * 0.4/0.6) = 667.
     expect(calLine).toContain("output 667→400");
     expect(calLine, "the measured rate displaces the prior").not.toContain("−47%");
-    expect(calLine).toContain("basic shaping");
     // A MEASURED DEVICE IS UNCHANGED by this rule: it keeps the arrow its own A/B earned, labelled
     // `est.` because the before is still a reconstruction. Measuring is what turns the figure on.
-    expect(calLine).toContain("(−40%, est.)");
+    expect(calLine).toContain("(−40.0%, est.)");
     expect(calLine, "no prior wording survives anywhere").not.toContain("default prior");
     expect(plainLine, "measured and unmeasured devices render differently").not.toBe(calLine);
   });

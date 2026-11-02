@@ -12,7 +12,7 @@ import { defaultManagedRoot, inventoryRelease, loadManagedInstallation } from ".
 import { stageLatestUpdate } from "../../src/core/update/worker.js";
 import { tryActivate } from "../../src/core/update/activation.js";
 import { sessionFile } from "../../src/core/update/sessions.js";
-import { identifyProcess, hasUntrackedToolProcesses, hasUntrackedToolProcessesForLauncher } from "../../src/core/update/process-identity.js";
+import { identifyProcess, hasUntrackedToolProcesses, untrackedToolProcessInventoryForLauncher } from "../../src/core/update/process-identity.js";
 import { discoverVersion } from "../../src/core/update/registry.js";
 import { stageRegistryPackage } from "../../src/core/update/package-stage.js";
 import { selectCandidateEngine } from "../../src/core/update/engine-pair.js";
@@ -24,7 +24,7 @@ vi.mock("../../src/core/update/engine-pair.js", () => ({ selectCandidateEngine: 
 vi.mock("../../src/core/update/process-identity.js", async original => ({
   ...await original<typeof import("../../src/core/update/process-identity.js")>(),
   hasUntrackedToolProcesses: vi.fn(() => false),
-  hasUntrackedToolProcessesForLauncher: vi.fn(() => false)
+  untrackedToolProcessInventoryForLauncher: vi.fn(() => ({ state: "none" }))
 }));
 
 const roots: string[] = [];
@@ -121,7 +121,7 @@ describe("npm-global startup convergence", () => {
     vi.mocked(selectCandidateEngine).mockResolvedValue({ engine: { mode: "basic" }, reason: "no-account" });
     let latest = "0.6.10";
     vi.mocked(discoverVersion).mockImplementation(async (_channel, exactVersion) => ({ version: exactVersion ?? latest }));
-    vi.mocked(hasUntrackedToolProcessesForLauncher).mockReturnValue(false);
+    vi.mocked(untrackedToolProcessInventoryForLauncher).mockReturnValue({ state: "none" });
     vi.mocked(hasUntrackedToolProcesses).mockReturnValue(false);
 
     const execute = vi.fn(() => ({ code: 0, signal: null })); const notice = vi.fn();
@@ -167,7 +167,7 @@ describe("npm-global startup convergence", () => {
     vi.mocked(stageRegistryPackage).mockImplementation(async (_root, release) => managedCli(f, (release as { version: string }).version));
     vi.mocked(selectCandidateEngine).mockResolvedValue({ engine: { mode: "basic" }, reason: "no-account" });
     vi.mocked(discoverVersion).mockImplementation(async (_channel, exactVersion) => ({ version: exactVersion ?? "0.6.10" }));
-    vi.mocked(hasUntrackedToolProcessesForLauncher).mockReturnValue(false);
+    vi.mocked(untrackedToolProcessInventoryForLauncher).mockReturnValue({ state: "none" });
     const execute = vi.fn(() => ({ code: 0, signal: null }));
     expect(await convergeOfficialNpmGlobalInvocation(f.entry, ["status"], env, { execute })).toMatchObject({ handled: true });
     replaceWithOfficialNpm(f, "0.6.10");
@@ -181,7 +181,7 @@ describe("npm-global startup convergence", () => {
     const f = official("0.6.9"); const env = { HOME: f.root, COMPACTION_CONFIG_DIR: path.join(f.root, "config"), CI: "" };
     vi.mocked(stageRegistryPackage).mockResolvedValue(managedCli(f, "0.6.9"));
     vi.mocked(selectCandidateEngine).mockResolvedValue({ engine: { mode: "basic" }, reason: "no-account" });
-    vi.mocked(hasUntrackedToolProcessesForLauncher).mockReturnValue(false);
+    vi.mocked(untrackedToolProcessInventoryForLauncher).mockReturnValue({ state: "none" });
     const execute = vi.fn(() => ({ code: 0, signal: null }));
     expect(await convergeOfficialNpmGlobalInvocation(f.entry, ["status"], env, { execute })).toMatchObject({ handled: true });
     const stateFile = path.join(defaultManagedRoot(env), "state.json"); const before = readFileSync(stateFile);
