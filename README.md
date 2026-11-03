@@ -165,7 +165,7 @@ For example:
 compaction · observed input 91,472 · output N/A→463 (N/A%, est.) · id 5f539978
 ```
 
-Here `463` is the observed output. Compaction still reduced the output, but there is no applicable calibration for how large the reduction was, so we leave the missing value missing.
+Here `463` is the observed output. Output shaping was applied, but its actual effect is unknown: there is no applicable calibration, so we leave the missing value missing.
 
 Compaction surfaces the same result in the workflow where possible:
 
