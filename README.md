@@ -35,7 +35,7 @@ This is a real acceptance run through a normal Codex subscription session:
 ```text
 $ codex
 
-↳ compaction · input 8,388,356→7,212,095 (−14%) · output 14,393→10,795 (−25%, est.) · +~3.08m · full apply
+↳ compaction · input 8,388,356→7,212,095 (−14%) · output 14,393→10,795 (−25.0%, est.) · +~3.08m
 ```
 
 The input arrow is measured before→after evidence. The output before value is a calibrated counterfactual, so it stays marked `est.`. `+~3.08m` is the estimated equivalent active agent time preserved at the observed workload consumption rate. This is not a claim about a provider's hidden quota or rate limit formula.
@@ -137,19 +137,19 @@ What appears depends on what Compaction could actually measure on that run.
 Compaction can reduce output tokens but does not change the input:
 
 ```text
-compaction · observed input 91,472 · output 857→463 (−46%, est.) · basic shaping · id 5f539978
+compaction · observed input 91,472 · output 857→463 (−46.0%, est.) · id 5f539978
 ```
 
 Compaction can also reduce model-visible input:
 
 ```text
-compaction · input 91,472→74,769 (−18%) · output 857→463 (−46%, est.) · full apply · 1.92M/2M left · id 5f539978
+compaction · input 91,472→74,769 (−18%) · output 857→463 (−46.0%, est.) · 1.92M/2M left · id 5f539978
 ```
 
 On an API-key, where the provider bills at a published per token rate, Compaction can also show the estimated price impact:
 
 ```text
-compaction · input 91,472→74,769 (−18%) · output 857→463 (−46%, est.) · −$0.05 (list price) · full apply · 1.92M/2M left · id 5f539978
+compaction · input 91,472→74,769 (−18%) · output 857→463 (−46.0%, est.) · −$0.05 (list price) · 1.92M/2M left · id 5f539978
 ```
 
 We use a simple evidence rule:
@@ -162,10 +162,10 @@ We use a simple evidence rule:
 For example:
 
 ```text
-compaction · observed input 91,472 · output N/A→463 (N/A%, est.) · basic shaping · id 5f539978
+compaction · observed input 91,472 · output N/A→463 (N/A%, est.) · id 5f539978
 ```
 
-Here `463` is the observed output. Compaction still reduced the output, but there is no applicable calibration for how large the reduction was, so we leave the missing value missing.
+Here `463` is the observed output. Output shaping was applied, but its actual effect is unknown: there is no applicable calibration, so we leave the missing value missing.
 
 Compaction surfaces the same result in the workflow where possible:
 
