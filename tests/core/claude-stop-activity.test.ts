@@ -13,7 +13,7 @@ import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import type { UserRun } from "../../src/core/gateway/run-boundary.js";
 import { createUsageMetadata, missingUsageMetadata } from "../../src/core/usage-metadata.js";
 import { confirmedOutputCalibration } from "../helpers/output-calibration-fixture.js";
-import { buildHookOutputShapingTreatment } from "../../src/core/output-shaping.js";
+import { buildHookOutputShapingTreatment, buildOutputShapingPolicy } from "../../src/core/output-shaping.js";
 
 const CORRELATION = "1".repeat(32);
 const POLICY = `output-shaping.v1.sha256.${"a".repeat(64)}`;
@@ -98,6 +98,35 @@ describe("Claude whole-run Stop event", () => {
     expect(line).toContain("observed input 300");
     expect(line).toContain("output N/A→50 (N/A%, est.)");
     expect(line).not.toMatch(/47(\.\d+)?%/);
+  });
+
+  it("keeps a mixed hook/gateway-carrier run storable with its counters when no single carrier can be recorded", () => {
+    const hook = buildHookOutputShapingTreatment().policyVersion;
+    const gateway = buildOutputShapingPolicy().policyVersion;
+    expect(hook).not.toBe(gateway);
+    const event = buildClaudeStopActivityEvent({
+      run: RUN,
+      window: {
+        receipts: [
+          receipt({ receipt_id: "a", output_shaping_state: "already-active", output_shaping_policy_version: hook, output_shaping_regime: "default-shapeable" }),
+          receipt({
+            receipt_id: "b",
+            request_started_at: "2026-09-04T10:03:00.000Z",
+            captured_at: "2026-09-04T10:03:01.000Z",
+            tokens: { prompt_input: 200, output: 30 },
+            output_shaping_state: "attached-this-pass",
+            output_shaping_policy_version: gateway,
+            output_shaping_regime: "default-shapeable"
+          })
+        ],
+        truncated: false
+      },
+      calibrationResolver: resolver
+    })!;
+    expect(validateActivityEventForStore(event).problems).toEqual([]);
+    expect(event).toMatchObject({ input_before: 300, output_after: 50, output_shaping_state: "active" });
+    expect(event.policy_used).toBeUndefined();
+    expect(event.output_estimate_basis).not.toBe("family-calibrated");
   });
 
   it("records full posture only for stored-authorized input reduction", () => {

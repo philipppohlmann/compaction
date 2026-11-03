@@ -110,7 +110,7 @@ export function buildClaudeStopActivityEvent(input: {
 
   const aggregate = aggregateRun(receipts, { outputCalibrationResolver: input.calibrationResolver });
   if (!aggregate.input && !aggregate.output) return undefined;
-  const estimate = aggregate.shapedCallCount > 0
+  const runEstimate = aggregate.shapedCallCount > 0
     ? settledRunOutputEstimate(aggregate, receipts, input.calibrationResolver)
     : undefined;
   const posture = settledRunApplyPosture(receipts, aggregate);
@@ -125,6 +125,9 @@ export function buildClaudeStopActivityEvent(input: {
         )
         .map((receipt) => receipt.output_shaping_policy_version))
     : undefined;
+  // A family-calibrated estimate is storable only with one exact carrier in policy_used. A run that
+  // mixed hook and gateway carriers has none, so it keeps its counters and drops only the estimate.
+  const estimate = runEstimate?.basis === "family-calibrated" && !policy ? undefined : runEstimate;
 
   const eventBase: ActivityEvent = {
     surface: "claude_code",
