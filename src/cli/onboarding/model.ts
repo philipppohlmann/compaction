@@ -1695,21 +1695,23 @@ export type CommunityAuthFn = (
 ) => Promise<OnboardingAuthOutcome>;
 
 /**
- * The two LOCAL gates that can hold full apply back even with a perfectly valid entitlement lease.
- * Both are the user's own configuration, both are checked by the Gateway on every request, and
+ * The LOCAL gates that can hold full apply back even with a perfectly valid entitlement lease.
+ * All are the user's own configuration, all are checked by the Gateway on every request, and
  * neither was visible on the Ready screen before — which is how the screen came to announce `full
  * apply` for a default Output-only user whose every request stays on the non-apply path.
  *
  * Fixed, content-free strings: they name a setting, never a path, an id, or a count.
  */
 export const FULL_APPLY_PENDING_REASONS = {
+  /** No workflow is connected, so no routed turn can carry an apply authorization. */
+  workflowNotConnected: "no workflow is connected yet",
   /** The persisted optimization mode is `cache` — the Open/Pro "Output only" posture. */
   optimizationMode: "the optimization mode is Output only",
   /** No stored `auto-when-gates-pass` authorization covers an enabled workflow. */
   applyAuthorization: "no apply authorization for this workflow yet"
 } as const;
 
-/** Whether a pending reason is one of the two LOCAL gates (as opposed to an entitlement problem). */
+/** Whether a pending reason is one of the LOCAL gates (as opposed to an entitlement problem). */
 export function isLocalFullApplyGateReason(reason: string | undefined): boolean {
   return reason !== undefined && (Object.values(FULL_APPLY_PENDING_REASONS) as string[]).includes(reason);
 }

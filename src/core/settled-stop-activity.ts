@@ -111,33 +111,51 @@ export function settledRunApplyPosture(
   return aggregate.shapedCallCount > 0 ? "basic" : undefined;
 }
 
-/** Exact-key output estimate state for one already-aggregated run; never falls back to a prior. */
+/** Exact-first output estimate state for one run, with strict compatible-family fallback. */
 export function settledRunOutputEstimate(
   aggregate: RunAggregate,
   receipts: readonly GatewayReceipt[],
   resolver: OutputCalibrationResolver
 ): PerTurnEstimatedSaved {
   const output = aggregate.output;
-  if (output?.counterfactualAvailable === true && output.before > output.after) {
-    return {
-      calibrated: true,
-      tokensSaved: output.before - output.after,
-      basis: "measured",
-      state: "calibrated"
-    };
-  }
-  const states = receipts
-    .filter((receipt) =>
+  const shapedReceipts = receipts.filter((receipt) =>
       receipt.output_shaping_state === "attached-this-pass" ||
       receipt.output_shaping_state === "already-active"
-    )
-    .map((receipt) => outputCalibrationQuery({
+    );
+  const reductions = shapedReceipts.map((receipt) => {
+    const query = outputCalibrationQuery({
       policyVersion: receipt.output_shaping_policy_version,
       provider: receipt.provider,
       model: receipt.model,
       regime: receipt.output_shaping_regime
-    }))
-    .map((query) => query ? resolver(query).state : undefined);
+    });
+    return query ? resolver(query) : undefined;
+  });
+  const available = reductions.filter((candidate) => candidate?.availability !== "unavailable");
+  const bases = new Set(available.map((candidate) => candidate?.basis));
+  const evidenceIds = new Set(available.map((candidate) => candidate?.evidenceId));
+  const familyVersions = new Set(available.map((candidate) => candidate?.treatmentFamilyVersion));
+  if (
+    output?.counterfactualAvailable === true &&
+    output.before > output.after &&
+    available.length === shapedReceipts.length &&
+    bases.size === 1 &&
+    evidenceIds.size <= 1 &&
+    familyVersions.size <= 1
+  ) {
+    const first = available[0];
+    return {
+      calibrated: true,
+      tokensSaved: output.before - output.after,
+      basis: first?.basis,
+      state: "calibrated",
+      ...(first?.treatmentFamilyVersion
+        ? { treatmentFamilyVersion: first.treatmentFamilyVersion }
+        : {}),
+      ...(first?.evidenceId ? { evidenceId: first.evidenceId } : {})
+    };
+  }
+  const states = reductions.map((candidate) => candidate?.state);
   const state: CalibrationState =
     states.length > 0 && states.every((candidate) => candidate === "measured-no-effect")
       ? "measured-no-effect"
@@ -145,6 +163,39 @@ export function settledRunOutputEstimate(
         ? "calibrating"
         : "unseeded";
   return { calibrated: false, state };
+}
+
+/** Freeze estimator provenance into one settled activity event without changing renderer copy. */
+export function settledOutputEstimateActivityFields(
+  estimate: PerTurnEstimatedSaved | undefined
+): Pick<
+  ActivityEvent,
+  | "estimated_output_tokens_saved"
+  | "output_estimate_basis"
+  | "output_estimate_state"
+  | "output_calibration_family_version"
+  | "output_calibration_evidence_id"
+> {
+  if (
+    estimate?.calibrated === true &&
+    estimate.tokensSaved &&
+    (estimate.basis === "measured" || estimate.basis === "family-calibrated") &&
+    (estimate.basis !== "family-calibrated" ||
+      (estimate.treatmentFamilyVersion !== undefined && estimate.evidenceId !== undefined))
+  ) {
+    return {
+      estimated_output_tokens_saved: estimate.tokensSaved,
+      output_estimate_basis: estimate.basis,
+      output_estimate_state: "calibrated",
+      ...(estimate.treatmentFamilyVersion
+        ? { output_calibration_family_version: estimate.treatmentFamilyVersion }
+        : {}),
+      ...(estimate.evidenceId
+        ? { output_calibration_evidence_id: estimate.evidenceId }
+        : {})
+    };
+  }
+  return estimate?.state ? { output_estimate_state: estimate.state } : {};
 }
 
 /** One canonical renderer for both persisted Codex and Claude whole-run Stop events. */
@@ -175,8 +226,9 @@ export function settledStopLineFromActivityEvent(event: ActivityEvent): string |
       shapedCallCount: shaped ? 1 : 0
     },
     ...(event.apply_posture ? { tier: event.apply_posture } : {}),
-    ...(event.output_estimate_basis === "measured" && typeof saved === "number"
-      ? { outputBasis: "measured" as const }
+    ...((event.output_estimate_basis === "measured" || event.output_estimate_basis === "family-calibrated") &&
+    typeof saved === "number"
+      ? { outputBasis: event.output_estimate_basis }
       : {}),
     ...(shaped && event.output_estimate_state
       ? { outputState: event.output_estimate_state }

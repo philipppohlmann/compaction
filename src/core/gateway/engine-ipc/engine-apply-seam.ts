@@ -39,6 +39,8 @@ export type EngineApplyDecision =
        * degrade, a refusal, or an older engine (unknown, no claim).
        */
       lcmOutcome?: { kind: string; reason: string };
+      /** Set only when the engine refused at the caller's declared remaining allowance. */
+      refusal?: "quota-exhausted";
       /** Provenance for the unchanged body when the engine pipeline produced a no-op. */
       outputShapingState?: EngineIpcOutputShapingState;
       /** Exact identity paired with the no-op's already-active provenance, when known. */
@@ -96,6 +98,7 @@ export async function decideEngineApply(
       decision: "forward-original",
       reason: `engine-result:${response.result}`,
       ...(response.lcm_outcome !== undefined ? { lcmOutcome: response.lcm_outcome } : {}),
+      ...(response.result === "refused" && response.failure_reason === "quota-exhausted" ? { refusal: "quota-exhausted" as const } : {}),
       ...(response.result === "noop" && response.output_shaping_state !== undefined
         ? {
           outputShapingState: response.output_shaping_state,

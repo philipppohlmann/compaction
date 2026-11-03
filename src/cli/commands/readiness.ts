@@ -18,7 +18,7 @@
  *    shadow-only; a connected Codex shim routes normally under the existing ChatGPT login, while explicit
  *    `--subscription` routes remain available. Evidence is reported only from observed artifacts.
  */
-import { existsSync, accessSync, constants as fsConstants, readFileSync } from "node:fs";
+import { existsSync, accessSync, constants as fsConstants, readFileSync, realpathSync } from "node:fs";
 import { claudeSettingsReadPaths } from "../../core/claude-code-connect.js";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -37,6 +37,27 @@ import {
 import type { SubscriptionHookTool } from "../../core/subscription-shaping-hooks.js";
 import { isReceiptLineEnabled } from "../../core/gateway/receipt-line.js";
 import { SHIM_TOOLS, verifyShimActive, resolveExecutableOnPath, type ShimTool } from "../../core/tool-shim.js";
+import { gatewayCliVersion } from "../../core/gateway/update-identity.js";
+import { automaticUpdatesEnabled } from "../../core/update/scheduler.js";
+import { defaultManagedRoot, loadManagedInstallation } from "../../core/update/ownership.js";
+import { OFFICIAL_INSTALLER_COMMAND } from "./update.js";
+
+/**
+ * Do two paths denote the same executable? Compared through `realpathSync`, because a STRING compare
+ * false-alarms the healthy case: `resolveExecutableOnPath` does not follow symlinks, so a PATH entry that
+ * is a symlink TO the managed launcher (or a symlinked PATH directory, or a differently-spelled HOME)
+ * would warn on an install whose hooks DO run the managed runtime — alarming a correctly-configured user,
+ * which is worse than the silence this warning replaced. Falls back to a string compare when either path
+ * cannot be resolved. Same convention as `tool-shim.ts`'s shim-identity check.
+ */
+function samePath(a: string, b: string): boolean {
+  if (a === b) return true;
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
 import { getGatewayStatus, readReceipts } from "../../core/gateway/status.js";
 import { GATEWAY_RECOVERY_DIR } from "../../core/gateway/recovery.js";
 import { liveVerificationsForMatrix } from "../../core/gateway/verification-store.js";
@@ -51,6 +72,7 @@ import { DEDUPE_POLICY } from "../../core/gateway/request-shape.js";
 import {
   readOptimizationMode,
   readConnectedWorkflows,
+  readUpdatePreferences,
   type OptimizationModePreference
 } from "../../core/onboarding-preferences.js";
 import { DEFAULT_ACTIVITY_DIRECTORY, ACTIVITY_LOG_FILENAME } from "../../core/activity-store.js";
@@ -124,6 +146,47 @@ export interface ReadinessReport {
     };
     codex: ShimConnectState;
     cursor: ShimConnectState;
+  };
+  /**
+   * WHICH `compaction` WILL ACTUALLY RUN, and whether it is the managed one.
+   *
+   * Installed hooks and shims invoke a bare `compaction` resolved from `PATH` at run time. That is safe
+   * ONLY once managed adoption has happened, because adoption makes the managed launcher occupy the very
+   * path `compaction` resolves to. When adoption has NOT happened — and it can fail silently and
+   * indefinitely, because it refuses while any connected tool session is live and reports that as a
+   * TTY-only notice — the human-facing CLI and the hooks can be served by an OLD global install while
+   * every screen reads healthy. This section is the one place that says so.
+   *
+   * Read-only: resolves a path and reads local files. No network, no adoption attempt.
+   */
+  runtime: {
+    /** The `compaction` that `PATH` resolves to for this user, if any. */
+    resolvedBinary?: string;
+    /** True when a verified managed installation owns this machine's launcher. */
+    managed: boolean;
+    /**
+     * The managed launcher's own path, when a verified managed installation exists.
+     *
+     * Present so the report can compare it against `resolvedBinary`. `isManagedInstallation` verifies the
+     * launcher's ownership and sha256 but NEVER that `PATH` resolves to it — so a managed install sitting
+     * behind a stale earlier `PATH` entry satisfied every managed check while hooks ran the stale binary.
+     * Reporting "managed (auto-updates on)" there would reassure the user in precisely the failure mode this
+     * section exists to expose.
+     */
+    launcherPath?: string;
+    /**
+     * The PERSISTED automatic-update preference of a managed install (`compaction update --auto on|off`,
+     * or the installer's `COMPACTION_AUTO_UPDATE=0`). Absent when not managed. Reported as stored, so an
+     * install pinned with auto-updates off never reads "auto-updates".
+     */
+    autoUpdates?: boolean;
+    /**
+     * Whether automatic updates actually run for THIS environment: the persisted preference AND no
+     * runtime opt-out (`COMPACTION_AUTO_UPDATE=0`, `CI`) - the scheduler's own predicate. Absent when not managed.
+     */
+    autoUpdatesEffective?: boolean;
+    /** The version of the CLI rendering this report. */
+    reportingVersion: string;
   };
   gateway: {
     running: boolean;
@@ -395,6 +458,36 @@ export async function collectReadinessReport(
     // does not un-start it. The header must keep disclosing it.
   }
 
+  // WHICH RUNTIME WILL ACTUALLY SERVE A HOOK. Resolve-only; never attempts adoption.
+  let runtime: ReadinessReport["runtime"] = { managed: false, reportingVersion: gatewayCliVersion() };
+  try {
+    const resolved = resolveExecutableOnPath("compaction", env);
+    const root = defaultManagedRoot(env);
+    // ONE load, with `verifyFiles: false`. `isManagedInstallation` is `loadManagedInstallation(root, true)`,
+    // whose `validatePair` walks and sha256s EVERY file in the managed release — node_modules included —
+    // and this is a user-facing read command that was then loading the installation a SECOND time for the
+    // launcher path. `verifyFiles: false` is the codebase's own convention for a read-only launcher lookup
+    // (`tool-shim.ts`). Ownership, the receipt and the launcher's own sha256 are still checked.
+    let managed = false;
+    let launcherPath: string | undefined;
+    try {
+      launcherPath = loadManagedInstallation(root, false).receipt.launcherPath;
+      managed = true;
+    } catch {
+      managed = false;
+      launcherPath = undefined;
+    }
+    runtime = {
+      ...(resolved ? { resolvedBinary: resolved } : {}),
+      managed,
+      ...(launcherPath ? { launcherPath } : {}),
+      ...(managed ? { autoUpdates: readUpdatePreferences(env).autoUpdates, autoUpdatesEffective: automaticUpdatesEnabled(env) } : {}),
+      reportingVersion: gatewayCliVersion()
+    };
+  } catch {
+    runtime = { managed: false, reportingVersion: gatewayCliVersion() };
+  }
+
   // Gateway health (local pidfile + local port probe only).
   let gateway: ReadinessReport["gateway"] = { running: false, receiptsCount: 0 };
   try {
@@ -488,6 +581,7 @@ export async function collectReadinessReport(
   }
 
   const report: ReadinessReport = {
+    runtime,
     tools: {
       claudeCode: {
         sessionsFound,
@@ -687,6 +781,18 @@ function codexApprovalLine(r: ReadinessReport): string | undefined {
   return undefined;
 }
 
+/** Managed, but `PATH` resolves `compaction` to a different binary, so hooks skip the managed runtime. */
+export function managedLauncherShadowed(r: ReadinessReport): boolean {
+  return r.runtime.managed && r.runtime.launcherPath !== undefined && r.runtime.resolvedBinary !== undefined
+    && !samePath(r.runtime.resolvedBinary, r.runtime.launcherPath);
+}
+
+/** The managed install's update state, as a user reads it (`managed (…)`): persisted, then effective. */
+export function managedUpdateLabel(autoUpdates: boolean | undefined, effective?: boolean): string {
+  if (autoUpdates === false) return "auto-updates off";
+  return effective === false ? "auto-updates off in this environment" : "auto-updates on";
+}
+
 export function renderReadinessReport(r: ReadinessReport): string {
   const lines: string[] = [];
   // THE HEADER DESCRIBES THIS INVOCATION, not the command in general. `--check-codex` deliberately
@@ -697,6 +803,38 @@ export function renderReadinessReport(r: ReadinessReport): string {
       ? "compaction status - readiness (local, content-free; --check-codex started Codex, which writes its own state)"
       : "compaction status - readiness (local, read-only, content-free)"
   );
+  lines.push("");
+  // RUNTIME FIRST, because every line below it is a statement about whichever `compaction` the hooks and
+  // shims will actually resolve. A machine that never completed managed adoption keeps serving hooks from
+  // an old global install while this report reads healthy, and nothing used to say which one it was.
+  lines.push("Runtime");
+  lines.push(
+    `  CLI ${r.runtime.reportingVersion} · install: ${r.runtime.managed ? `managed (${managedUpdateLabel(r.runtime.autoUpdates, r.runtime.autoUpdatesEffective)})` : "not managed"}${
+      r.runtime.resolvedBinary ? ` · \`compaction\` on PATH: ${r.runtime.resolvedBinary}` : " · `compaction` NOT on PATH"
+    }`
+  );
+  if (!r.runtime.managed) {
+    // Not an error — an un-adopted install works. It is a statement that auto-update is NOT in force, so
+    // installed hooks keep running whatever this PATH entry resolves to until someone updates it by hand.
+    lines.push("  Automatic updates are not enabled on this install, so hooks run whatever `compaction`");
+    lines.push("  resolves to on PATH, and stay on it until this install is updated by hand.");
+    // The remedy must be one that WORKS from here. `compaction update` does NOT: with no managed
+    // installation it falls through to `externalUpdateInstruction` (and `--auto on` refuses outright,
+    // "Automatic-update preferences require an owned managed invocation"), so printing it told the user to
+    // run a command that cannot do the thing the sentence promised. Adoption comes from the install
+    // entrypoint, or automatically on a later CLI run once no connected tool session is holding it back.
+    lines.push(`  Managed updates come from the installer:  ${OFFICIAL_INSTALLER_COMMAND}`);
+  } else if (r.runtime.launcherPath !== undefined && managedLauncherShadowed(r)) {
+    // MANAGED, BUT NOT THE ONE THAT RUNS. This is the state the section exists to expose and the one it
+    // would otherwise reassure: every managed check passes, auto-update maintains the launcher, and a
+    // stale earlier PATH entry means hooks never execute it. Naming both paths is the whole diagnosis.
+    lines.push(`  WARNING: PATH resolves to a DIFFERENT binary than the managed launcher`);
+    lines.push(`  (${r.runtime.launcherPath}), so hooks do not run the auto-updated runtime.`);
+    // ONE remedy, and it is the one that works. `compaction update` was offered here too and does not
+    // fix this: it stages and activates a release and never touches PATH, so it would leave the user in
+    // exactly the state they started in. Same false-remedy class as the un-managed branch above.
+    lines.push(`  Put ${path.dirname(r.runtime.launcherPath)} ahead of the other entry on PATH.`);
+  }
   lines.push("");
   lines.push("Tools");
   lines.push(

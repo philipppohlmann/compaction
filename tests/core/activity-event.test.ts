@@ -31,6 +31,7 @@ import {
   type ActivityEvent
 } from "../../src/core/activity-event.js";
 import type { StandardCrossSurfaceEvent } from "../../src/core/cross-surface-event.js";
+import { buildHookOutputShapingTreatment } from "../../src/core/output-shaping.js";
 
 /* ------------------------------------------------------------------------------------------------
  * TYPE-LEVEL guardrails (never executed, compiled only).
@@ -260,6 +261,67 @@ describe("validator: auto-apply is OFF by default (mirror of the type-level arm)
       approval_status: "not-required"
     });
     expect(problems.some((p) => p.includes('only possible on surface "api_metered"'))).toBe(true);
+  });
+});
+
+describe("validator: settled family-calibrated output provenance", () => {
+  const familyEvent = {
+    surface: "codex",
+    provider: "openai",
+    model_label: "gpt-5.6-sol",
+    workflow_id: "codex-stop",
+    session_id: `codex-session-${"a".repeat(32)}`,
+    run_id: `codex-stop-${"b".repeat(32)}`,
+    output_after: 100,
+    token_source: {
+      input: { source: "unavailable", unavailable_reason: "not reported" },
+      output: { source: "provider-reported" }
+    },
+    policy_used: buildHookOutputShapingTreatment().policyVersion,
+    claim_scope: "run-scoped",
+    evidence_level: "provider-reported cumulative Codex turn usage",
+    approval_status: "not-required",
+    recovery: { original_retained: false },
+    sync_status: "local-only",
+    activity_kind: "codex-stop",
+    recorded_at: "2026-10-04T17:01:00.000Z",
+    run_started_at: "2026-10-04T17:00:00.000Z",
+    measurement_source: "codex-rollout",
+    output_shaping_state: "active",
+    estimated_output_tokens_saved: 22,
+    output_estimate_basis: "family-calibrated",
+    output_estimate_state: "calibrated",
+    output_calibration_family_version: buildHookOutputShapingTreatment().treatmentFamilyVersion,
+    output_calibration_evidence_id: `output-shaping.evidence.v1.sha256.${"e".repeat(64)}`,
+    apply_posture: "basic"
+  } as const;
+
+  it("accepts exact carrier plus distinct family/evidence identities", () => {
+    expect(validateActivityEvent(familyEvent).problems).toEqual([]);
+  });
+
+  it("rejects a family basis missing any durable provenance identity", () => {
+    const { policy_used: _policy, output_calibration_family_version: _family, output_calibration_evidence_id: _evidence, ...base } = familyEvent;
+    for (const candidate of [
+      { ...base, output_calibration_family_version: familyEvent.output_calibration_family_version,
+        output_calibration_evidence_id: familyEvent.output_calibration_evidence_id },
+      { ...base, policy_used: familyEvent.policy_used,
+        output_calibration_evidence_id: familyEvent.output_calibration_evidence_id },
+      { ...base, policy_used: familyEvent.policy_used,
+        output_calibration_family_version: familyEvent.output_calibration_family_version }
+    ]) {
+      expect(validateActivityEvent(candidate).problems.some((problem) =>
+        problem.includes("family-calibrated output estimate")
+      )).toBe(true);
+    }
+  });
+
+  it("rejects an exact carrier paired with a different substantive family", () => {
+    const problems = validateActivityEvent({
+      ...familyEvent,
+      output_calibration_family_version: `output-shaping.family.v1.sha256.${"f".repeat(64)}`
+    }).problems;
+    expect(problems.some((problem) => problem.includes("carrier and family identity are incompatible"))).toBe(true);
   });
 });
 

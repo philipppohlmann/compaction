@@ -44,7 +44,7 @@
 import type { GatewayReceipt } from "./receipt.js";
 import { isRealApply, receiptCompactedInput } from "./receipt-line.js";
 import { outputCalibrationQuery } from "../output-shaping-calibration-store.js";
-import type { OutputCalibrationResolver } from "../output-shaping-savings.js";
+import { refineOutputRateForRun, type OutputCalibrationResolver } from "../output-shaping-savings.js";
 
 export interface RunAggregate {
   /** Calls that belonged to this run (the aggregate's denominator, including no-op calls). */
@@ -97,9 +97,9 @@ function shapingProvenActive(receipt: GatewayReceipt): boolean {
 
 export interface RunAggregateOptions {
   /**
-   * Shared exact-key calibration resolver. Each shaped call resolves from its own policy/provider/model/
-   * regime metadata; unshaped calls contribute zero savings. Omitted or unmatched shaped evidence makes
-   * the whole run counterfactual unavailable.
+   * Shared exact-first calibration resolver. Each shaped call resolves from its own policy/provider/model/
+   * regime metadata, with family fallback only when the resolver proves compatibility; unshaped calls
+   * contribute zero savings. Omitted or unmatched shaped evidence makes the run counterfactual unavailable.
    */
   outputCalibrationResolver?: OutputCalibrationResolver;
 }
@@ -117,6 +117,27 @@ export function aggregateRun(receipts: GatewayReceipt[], options: RunAggregateOp
   let shapedCallCount = 0;
   let allowance: RunAggregate["allowance"];
   let pausedCall: RunAggregate["pausedCall"];
+
+  // RUN MORPHOLOGY PRE-PASS. A calibrated rate is a single number; which end of the evidence corpus a
+  // given run belongs to is a property of the WHOLE run (how verbose its shaped turns were), so it cannot
+  // be read off one receipt while iterating. This pass counts only what the main loop already counts —
+  // shaped calls and their provider-reported output tokens — then `refineOutputRateForRun` turns the
+  // calibrated anchor into this run's figure. Unshaped calls need no term here: the loop below adds
+  // their output with no counterfactual, which already dilutes the run-level figure exactly.
+  // Counting, not content: two integers. Deterministic, so a settled run re-aggregates identically.
+  let morphologyShapedCalls = 0;
+  let morphologyShapedOutput = 0;
+  for (const receipt of receipts) {
+    if (!shapingProvenActive(receipt)) continue;
+    const output = receipt.tokens?.output;
+    if (!isNonNegativeSafeInteger(output)) continue;
+    morphologyShapedCalls++;
+    morphologyShapedOutput += output;
+  }
+  const runMorphology = {
+    shapedCallCount: morphologyShapedCalls,
+    shapedOutputTokens: morphologyShapedOutput
+  };
 
   for (const receipt of receipts) {
     // INPUT — every call contributes; a call with no usable pair contributes an honest zero-delta.
@@ -152,7 +173,18 @@ export function aggregateRun(receipts: GatewayReceipt[], options: RunAggregateOp
       const reduction = query && options.outputCalibrationResolver
         ? options.outputCalibrationResolver(query)
         : undefined;
-      const rate = reduction?.availability === "measured" ? reduction.reductionPct / 100 : undefined;
+      // WHICH RATES MORPHOLOGY MAY REFINE. Only the FAMILY posterior. An exact `measured` rate is this
+      // provider+model's own confirmed A/B evidence and is already the most specific thing we know, so it
+      // passes through untouched — refining it would be structure overruling measurement. A family rate
+      // is one number standing in for a whole corpus, and rendering it unchanged on every run is what
+      // made the figure look like a fixed constant; that is the one this run's structure places.
+      // With no usable structure the refinement returns the anchor, so a figure that resolved before
+      // always still resolves.
+      const rate = reduction === undefined || reduction.availability === "unavailable"
+        ? undefined
+        : reduction.availability === "family-calibrated"
+          ? refineOutputRateForRun(reduction.reductionPct, runMorphology).ratePct / 100
+          : reduction.reductionPct / 100;
       if (shaped && rate !== undefined && rate > 0 && rate < 1) {
         // Accumulated UNROUNDED and rounded once by the caller-visible total below: rounding each
         // call and then summing compounds up to half a token of error per call across a long run.

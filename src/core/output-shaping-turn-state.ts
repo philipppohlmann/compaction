@@ -54,7 +54,7 @@ export const LEGACY_SHAPING_TURN_STATE_FILE = "last-shaping-decision.json";
  * Claude Code Stop deliberately does not end its record, and that is load-bearing. Claude Code swallows hook stdout, so
  * the status line is the only per-turn surface a user reads — and it renders AGAIN after the Stop hook has
  * run. When Stop deleted the record, that last render found nothing and the finished turn's line collapsed
- * from `observed input 259,985 · output 2,853→1,512 (−47%, est.) · basic shaping` to a bare
+ * from `observed input 259,985 · output 2,853→1,512 (−47.0%, est.) · basic shaping` to a bare
  * `input 259,985 · output 1,512`: evidence that demonstrably existed during the turn, destroyed at the
  * moment the turn became final. An ended turn's record stays readable because the receipt it was paired
  * with is still the newest one, so the claim and the counts describe the same turn.

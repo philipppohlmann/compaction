@@ -94,6 +94,8 @@ export interface OnboardingResult {
 const BLUE = "#3231cd";
 const ACCENT = "#6666ff";
 const DIM = "gray";
+// Row text uses the terminal's own foreground so it stays legible on dark and light themes;
+// ACCENT marks only the selection cursor, and DIM is kept for inactive secondary lines and hints.
 const NARROW_MIN = 44;
 
 type Screen = "target" | "plan" | "setup" | "license" | "auth" | "waitlist" | "ready";
@@ -149,8 +151,9 @@ function TargetScreen({
           const title = tool?.title ?? w.title;
           const marker = selectable ? (selection.has(w.key) ? "[x]" : "[ ]") : "[-]";
           return (
-            <Text key={w.key} color={active ? ACCENT : selectable ? "white" : DIM} bold={active}>
-              {`${active ? "› " : "  "}${marker} ${title}  · ${stateWord}${tool ? `  · ${tool.selectionSummary}` : ""}`}
+            <Text key={w.key} color={selectable ? undefined : DIM} bold={active}>
+              <Text color={ACCENT}>{active ? "› " : "  "}</Text>
+              {`${marker} ${title}  · ${stateWord}${tool ? `  · ${tool.selectionSummary}` : ""}`}
             </Text>
           );
         })}
@@ -221,11 +224,12 @@ function PlanScreen({
           const active = i === planIndex;
           return (
             <Box key={p.key} flexDirection="column">
-              <Text color={active ? ACCENT : DIM} bold={active}>
-                {`${active ? "› " : "  "}${p.title}${p.key === "pro" ? " · waitlist" : ""}${p.key === recommendedPlan ? "  (recommended)" : ""}${p.key === "community" && communityAuthorized ? "  · Community active" : p.key === "community" && signedIn ? "  · signed in" : ""}  ${p.summary}`}
+              <Text bold={active}>
+                <Text color={ACCENT}>{active ? "› " : "  "}</Text>
+                {`${p.title}${p.key === "pro" ? " · waitlist" : ""}${p.key === recommendedPlan ? "  (recommended)" : ""}${p.key === "community" && communityAuthorized ? "  · Community active" : p.key === "community" && signedIn ? "  · signed in" : ""}  ${p.summary}`}
               </Text>
               {p.details?.map((detail) => (
-                <Text key={detail} color={active ? ACCENT : DIM}>{`     ${detail}`}</Text>
+                <Text key={detail} color={active ? undefined : DIM}>{`     ${detail}`}</Text>
               ))}
             </Box>
           );
@@ -438,8 +442,8 @@ function ReadyScreen({
       {showIllustrativeExamples ? (
         <Box marginTop={1} flexDirection="column">
           <Text color="white">Illustrative examples, not your activity:</Text>
-          <Text color={DIM}>Subscription: compaction · input 8,388,356→7,212,095 (−14%) · output 14,393→10,795 (−25%, est.) · +~3.08m</Text>
-          <Text color={DIM}>API key: compaction · input 91,472→74,769 (−18%) · output 857→463 (−46%, est.) · −$0.05 (list price)</Text>
+          <Text color={DIM}>Subscription: compaction · input 8,388,356→7,212,095 (−14%) · output 14,393→10,795 (−25.0%, est.) · +~3.08m</Text>
+          <Text color={DIM}>API key: compaction · input 91,472→74,769 (−18%) · output 857→463 (−46.0%, est.) · −$0.05 (list price)</Text>
         </Box>
       ) : null}
       <Box marginTop={1} flexDirection="column">

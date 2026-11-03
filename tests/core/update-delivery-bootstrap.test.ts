@@ -8,10 +8,10 @@ import { currentReleaseCompatibility } from "../../src/core/update/compatibility
 import { inventoryRelease, loadManagedInstallation, sha256 } from "../../src/core/update/ownership.js";
 import { stageLocalArtifact, stageRegistryPackage } from "../../src/core/update/package-stage.js";
 import { addConnectedWorkflows, readUpdatePreferences, writeOptimizationMode, writeProductMode, writeUpdatePreferences } from "../../src/core/onboarding-preferences.js";
-import { hasUntrackedToolProcessesForLauncher } from "../../src/core/update/process-identity.js";
+import { untrackedToolProcessInventoryForLauncher } from "../../src/core/update/process-identity.js";
 import type { PairDescriptor } from "../../src/core/update/types.js";
 vi.mock("../../src/core/update/package-stage.js", () => ({ stageLocalArtifact: vi.fn(), stageRegistryPackage: vi.fn() }));
-vi.mock("../../src/core/update/process-identity.js", async original => ({ ...await original<typeof import("../../src/core/update/process-identity.js")>(), hasUntrackedToolProcessesForLauncher: vi.fn(() => false) }));
+vi.mock("../../src/core/update/process-identity.js", async original => ({ ...await original<typeof import("../../src/core/update/process-identity.js")>(), untrackedToolProcessInventoryForLauncher: vi.fn(() => ({ state: "none" })) }));
 const homes: string[] = [];
 afterEach(() => { vi.clearAllMocks(); for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true }); });
 function fixture() {
@@ -84,8 +84,8 @@ describe("managed bootstrap coordinator (controlled acquisition, real files and 
   });
   it("defers explicit recognized legacy adoption while old integration sessions may remain", async () => {
     const f = fixture(); f.officialNpm();
-    vi.mocked(hasUntrackedToolProcessesForLauncher).mockReturnValueOnce(true);
-    await expect(bootstrapManaged({ ...f, adoptSelectedNpmPrefix: true })).rejects.toThrow("sessions may still be active");
+    vi.mocked(untrackedToolProcessInventoryForLauncher).mockReturnValueOnce({ state: "live" });
+    await expect(bootstrapManaged({ ...f, adoptSelectedNpmPrefix: true })).rejects.toThrow("session connected to Compaction is still running");
     expect(stageLocalArtifact).not.toHaveBeenCalled(); expect(existsSync(path.join(f.root, "install.json"))).toBe(false);
   });
 

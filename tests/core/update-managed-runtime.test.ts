@@ -8,17 +8,18 @@ import { bootstrapManagedInstall, inventoryRelease, loadExecutingManagedInstalla
 import { currentReleaseCompatibility } from "../../src/core/update/compatibility.js";
 import { rollbackPair, stagePair as stageManagedPair, tryActivate } from "../../src/core/update/activation.js";
 import { activeSessions, resolveSessionPin, readSession, sessionFile } from "../../src/core/update/sessions.js";
-import { identifyProcess, processIdentityStatus, hasUntrackedToolProcesses, findUnregisteredGatewayProcess, listUnregisteredGatewayProcessIds } from "../../src/core/update/process-identity.js";
+import { identifyProcess, processIdentityStatus, hasUntrackedToolProcesses, findUnregisteredGatewayProcess, listUnregisteredGatewayProcessIds, toolProcessInventoryRefusal } from "../../src/core/update/process-identity.js";
 import { atomicWrite, readState, withManagedLock } from "../../src/core/update/state.js";
 import { migrateOwnedIntegrations, rollbackIntegrationMigration } from "../../src/core/update/migrations.js";
 import { generateShimScript } from "../../src/core/tool-shim.js";
 import type { PairDescriptor } from "../../src/core/update/types.js";
-import { processMetadataParser, readToolProcessMetadata } from "../../src/core/update/process-metadata.js";
+import { inspectToolProcesses, processMetadataParser, readToolProcessMetadata } from "../../src/core/update/process-metadata.js";
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { createInterface } from "node:readline";
 import { writeUpdatePreferences } from "../../src/core/onboarding-preferences.js";
+import { collectReadinessReport, renderReadinessReport } from "../../src/cli/commands/readiness.js";
 
 const project = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const roots: string[] = [];
@@ -112,6 +113,30 @@ describe("Linux terminal snapshot boundary (synthetic kernel faults)", () => {
   });
 });
 
+describe("macOS unreadable unrelated processes (real kernel)", () => {
+  it.skipIf(process.platform !== "darwin")("skips only a ps-reported zombie the kernel confirms, and names any other uninspectable PID", async () => {
+    // `sleep 0` exits under a parent that execs into a non-reaping `sleep`, leaving a real zombie.
+    const parent = spawn("/bin/bash", ["-c", "/bin/sleep 0 & echo $!; exec /bin/sleep 30"], { stdio: ["ignore", "pipe", "ignore"] });
+    children.push(parent);
+    const zombie = Number((await createInterface({ input: parent.stdout! })[Symbol.asyncIterator]().next()).value);
+    await until(() => execFileSync("/bin/ps", ["-o", "stat=", "-p", String(zombie)], { encoding: "utf8" }).trim().startsWith("Z"));
+    // Without the ps nomination the zombie still fails the inventory closed - now with its PID.
+    expect(inspectToolProcesses([zombie], [])).toEqual({ ok: false, pid: zombie });
+    // Nominated and kernel-confirmed: it no longer blocks the scan of everything else.
+    expect(readToolProcessMetadata([zombie, process.pid], [], [zombie])).toEqual([]);
+    // A nomination never excuses a live process: it is inspected as usual (and here holds no tool).
+    expect(readToolProcessMetadata([parent.pid!], [], [parent.pid!])).toEqual([]);
+    parent.kill("SIGKILL");
+  });
+
+  it("words a verified live session and an incomplete inventory differently", () => {
+    expect(toolProcessInventoryRefusal({ state: "live" })).toMatch(/still running; close it/);
+    const incomplete = toolProcessInventoryRefusal({ state: "unknown", pid: 4242 });
+    expect(incomplete).toMatch(/process inventory could not be completed \(process 4242 could not be inspected\)/);
+    expect(incomplete).not.toMatch(/still running/);
+  });
+});
+
 describe("Linux owned terminal processes (real kernel)", () => {
   async function bounded<T>(operation: Promise<T>, timeout = 5_000): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -202,6 +227,21 @@ function fixture(root: string, version: string): PairDescriptor {
       process.stdout.write(JSON.stringify({stdinTTY:!!process.stdin.isTTY,stdoutTTY:!!process.stdout.isTTY,ttyOpen}) + '\\n');
     }
     if (process.argv.includes('--emit-stderr')) process.stderr.write('fixture stderr retained\\n');
+    if (process.argv[2] === '--interactive') {
+      // A TTY-sensitive tool: it must own the terminal foreground group, enter raw mode, and see
+      // keys and resizes exactly as the real interactive Claude Code UI does.
+      const groups = spawnSync('ps', ['-o', 'pgid=,tpgid=', '-p', String(process.pid)], { encoding: 'utf8' }).stdout.trim().split(/\\s+/);
+      process.stdout.write('GROUP ' + (groups[0] === groups[1] ? 'foreground' : 'background') + '\\r\\n');
+      process.stdin.setRawMode(true);
+      process.stdout.write('READY\\r\\n');
+      process.on('SIGWINCH', () => process.stdout.write('RESIZE ' + process.stdout.columns + '\\r\\n'));
+      process.stdin.on('data', (bytes) => {
+        const key = bytes.toString('latin1');
+        if (key === '\\x1b[A') process.stdout.write('KEY up\\r\\n');
+        else if (key === '\\x03') process.stdout.write('KEY ctrl-c\\r\\n');
+        else if (key === '\\r') { process.stdout.write('KEY enter\\r\\n'); process.stdin.setRawMode(false); process.exit(0); }
+      });
+    }
     if (process.argv[2] === '--hold') {
       fs.writeFileSync(process.argv[3], JSON.stringify({pid:process.pid,pin:process.env.COMPACTION_SESSION_PIN}));
       setInterval(() => { if (fs.existsSync(process.argv[4])) process.exit(0); }, 20);
@@ -488,6 +528,70 @@ describe("stable shim session envelope", () => {
     expect(stderr.stdout).toBe("0.6.8\n");
     expect(stderr.stderr).toBe("fixture stderr retained\n");
   });
+  it.each([
+    ["a direct launch", "exec \"$0\" --interactive"],
+    // `claude 2>errors.log`: the launch's own stderr is not the terminal.
+    ["a launch with stderr redirected away from the terminal", "exec \"$0\" --interactive 2>/dev/null"],
+    // The installer's `curl | sh` handoff: stdin is the download pipe until reattached to /dev/tty.
+    ["the installer onboarding handoff", "true | /bin/sh -c 'exec \"$0\" --interactive < /dev/tty' \"$0\""]
+  ])("hands the terminal foreground to an interactive raw-mode tool via %s so keys, Ctrl+C and resize reach it", async (_shape, shell) => {
+    // Regression: the envelope once left the tool in a background process group, so its first
+    // raw-mode switch stopped it: the managed `claude` showed a blank, unresponsive terminal and
+    // installer onboarding echoed ^[[A, ignored Enter, and failed setRawMode with EIO on exit.
+    const { home, root, launcher } = await installation();
+    const driver = String.raw`
+import fcntl, os, pty, select, struct, sys, termios, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv("/bin/sh", ["/bin/sh", "-c", sys.argv[2], sys.argv[1]])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
+out, steps, deadline = b"", [(b"READY", None), (None, "resize"), (b"RESIZE 132", b"\x1b[A"), (b"KEY up", b"\x03"), (b"KEY ctrl-c", b"\r")], time.time() + 8
+while time.time() < deadline:
+    if select.select([fd], [], [], 0.05)[0]:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            chunk = b""
+        if not chunk:
+            break
+        out += chunk
+    if steps and (steps[0][0] is None or steps[0][0] in out):
+        action = steps.pop(0)[1]
+        if action == "resize":
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 132, 0, 0))
+        elif action:
+            os.write(fd, action)
+# EOF on the master can precede the exit of an intermediate shell; wait for it within the deadline.
+done, status = os.waitpid(pid, os.WNOHANG)
+while done == 0 and time.time() < deadline + 2:
+    time.sleep(0.05)
+    done, status = os.waitpid(pid, os.WNOHANG)
+if done == 0:
+    os.killpg(pid, 9); os.waitpid(pid, 0); status = 9 << 8
+sys.stdout.write(out.decode("latin1") + "\nEXIT %d\n" % (status >> 8))
+`;
+    const result = spawnSync("python3", ["-c", driver, launcher, shell], { encoding: "utf8", timeout: 15_000,
+      env: { ...process.env, COMPACTION_HOME: home, COMPACTION_CONFIG_DIR: home, COMPACTION_AUTO_UPDATE: "0" } });
+    expect(result.status, result.stderr).toBe(0);
+    const lines = result.stdout.split(/\r*\n/).filter((line) => /^(GROUP|READY|RESIZE|KEY|EXIT)/.test(line));
+    expect(lines).toEqual(["GROUP foreground", "READY", "RESIZE 132", "KEY up", "KEY ctrl-c", "KEY enter", "EXIT 0"]);
+    expect(result.stdout).not.toContain("^[[A");
+    expect(activeSessions(root)).toEqual([]);
+  });
+  it.each([[true, "managed (auto-updates on)"], [false, "managed (auto-updates off)"]] as const)(
+    "status reports the persisted update preference of a managed install (auto-updates %s)", async (enabled, label) => {
+      const { home } = await installation();
+      const env = { ...process.env, COMPACTION_HOME: home, COMPACTION_CONFIG_DIR: home };
+      writeUpdatePreferences({ autoUpdates: enabled }, env);
+      const report = await collectReadinessReport(home, { ...env, CI: "" }, path.join(home, "no-projects"));
+      expect(report.runtime).toMatchObject({ managed: true, autoUpdates: enabled, autoUpdatesEffective: enabled });
+      expect(renderReadinessReport(report)).toContain(`install: ${label}`);
+      // A runtime opt-out disables the scheduler, so status must not claim auto-updates are on.
+      const suppressed = await collectReadinessReport(home, { ...env, COMPACTION_AUTO_UPDATE: "0" }, path.join(home, "no-projects"));
+      expect(suppressed.runtime).toMatchObject({ autoUpdates: enabled, autoUpdatesEffective: false });
+      expect(renderReadinessReport(suppressed)).toContain(enabled ? "install: managed (auto-updates off in this environment)" : "install: managed (auto-updates off)");
+      expect(renderReadinessReport(suppressed)).not.toContain("auto-updates on");
+    });
   it("admits hook-only calls with the same locked pair and an opaque inherited reference, without checking updates", async () => {
     const { home, root, a, b, launcher } = await installation();
     await stagePair(root, b);
@@ -594,6 +698,103 @@ describe("stable shim session envelope", () => {
   });
 });
 
+describe("macOS processes whose executable file was unlinked (real kernel)", () => {
+  // An app updated under a still-running helper (an orphaned crashpad handler, a WhatsApp ServiceExtension)
+  // leaves an image proc_pidpath can no longer report: the updater swaps a new bundle in and deletes the old
+  // one. A clone of node reproduces that exactly.
+  function cloneNode(image: string): void {
+    mkdirSync(path.dirname(image), { recursive: true });
+    fs.copyFileSync(process.execPath, image, fs.constants.COPYFILE_FICLONE);
+    // A shared-library node build (Homebrew) loads libnode through @loader_path.
+    const lib = path.join(path.dirname(realpathSync(process.execPath)), "../lib");
+    for (const name of existsSync(lib) ? readdirSync(lib).filter((file) => /^libnode\b.*\.dylib$/.test(file)) : []) {
+      if (!existsSync(path.join(path.dirname(image), name))) symlinkSync(path.join(lib, name), path.join(path.dirname(image), name));
+    }
+  }
+  async function start(command: string, args: string[]): Promise<number> {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "ignore"] }); children.push(child);
+    expect((await createInterface({ input: child.stdout! })[Symbol.asyncIterator]().next()).value).toBe("ready");
+    return child.pid!;
+  }
+  /** Runs `bundle/relative`, then swaps a new bundle holding a regular file at the same path in and deletes the old one. */
+  async function updatedUnder(bundle: string, relative: string, args: string[], after: (bundle: string) => void = () => {}): Promise<number> {
+    cloneNode(path.join(bundle, relative));
+    const pid = await start(path.join(bundle, relative), args);
+    const next = `${bundle}.next`; mkdirSync(path.dirname(path.join(next, relative)), { recursive: true });
+    writeFileSync(path.join(next, relative), "#!/bin/sh\n", { mode: 0o755 });
+    fs.renameSync(bundle, `${bundle}.old`); fs.renameSync(next, bundle); rmSync(`${bundle}.old`, { recursive: true });
+    after(bundle);
+    return pid;
+  }
+  const holder = ["-e", "process.stdout.write('ready\\n'); setInterval(() => {}, 1000)"];
+  async function managed(realBin?: string) {
+    const fixture = await installation();
+    const script = path.join(fixture.home, "known-claude-script.js");
+    writeFileSync(script, "process.stdout.write('ready\\n'); setInterval(() => {}, 1000);");
+    const shimDir = path.join(fixture.home, "shims"); mkdirSync(shimDir);
+    writeFileSync(path.join(shimDir, "claude"), generateShimScript("claude-code", realBin ?? script, fixture.launcher));
+    writeFileSync(path.join(shimDir, ".shim-record.json"), JSON.stringify({ shims: { "claude-code": { realBin: realBin ?? script } } }));
+    await stagePair(fixture.root, fixture.b);
+    return { ...fixture, script };
+  }
+  function inventoryOf(pid: number): void {
+    const execute = childProcess.execFileSync; const uid = process.getuid!();
+    vi.spyOn(childProcess, "execFileSync").mockImplementation(((...args: Parameters<typeof execute>) =>
+      args[0] === "/bin/ps" && (args[1] as string[] | undefined)?.[0] === "-axo"
+        ? `${uid} ${uid} ${pid} S\n` as ReturnType<typeof execute> : execute(...args)) as typeof execute);
+    syncBuiltinESMExports();
+  }
+  async function activation(root: string, pid: number) {
+    inventoryOf(pid);
+    return tryActivate(root, { gatewayBarrier: barrier });
+  }
+
+  it.skipIf(process.platform !== "darwin")("does not let an unrelated helper of an updated app hold activation", async () => {
+    const { home, root, script } = await managed();
+    const pid = await updatedUnder(path.join(home, "Apps/Messenger.app"), "PlugIns/ServiceExtension", holder);
+    expect(inspectToolProcesses([pid], [{ path: script, tool: "claude" }])).toEqual({ ok: true, processes: [] });
+    expect((await activation(root, pid)).status).toBe("active");
+  });
+
+  it.skipIf(process.platform !== "darwin").each(["claude", "codex", "cursor-agent"])("keeps an updated %s image blocking activation", async (name) => {
+    const { home, root, script } = await managed();
+    const pid = await updatedUnder(path.join(home, "tools"), name, holder);
+    expect(inspectToolProcesses([pid], [{ path: script, tool: "claude" }])).toEqual({ ok: false, pid });
+    expect((await activation(root, pid)).reason).toBe("untracked-tool-process");
+  });
+
+  it.skipIf(process.platform !== "darwin")("keeps an updated interpreter running the owned tool script blocking", async () => {
+    const { home, root, script } = await managed();
+    const pid = await updatedUnder(path.join(home, "runtime"), "node", [script]);
+    expect((await activation(root, pid)).reason).toBe("untracked-tool-process");
+  });
+
+  it.skipIf(process.platform !== "darwin")("keeps a superseded version-named binary beside the known tool blocking", async () => {
+    const versions = path.join(temporary(), "claude/versions"), current = path.join(versions, "2.1.311");
+    const { root } = await managed(current);
+    const pid = await updatedUnder(versions, "2.1.310", holder, () => writeFileSync(current, "#!/bin/sh\n", { mode: 0o755 }));
+    expect((await activation(root, pid)).reason).toBe("untracked-tool-process");
+  });
+
+  it.skipIf(process.platform !== "darwin")("keeps an image launched through a link blocking: the link no longer names the image", async () => {
+    // An interpreter reached through an alias, then upgraded away (brew/nvm): the exec path's name is not the image's.
+    const base = temporary(), real = path.join(base, "real/node"), alias = path.join(base, "bin/node-lts");
+    cloneNode(real); mkdirSync(path.dirname(alias)); symlinkSync(real, alias);
+    const { root, script } = await managed();
+    const pid = await start(alias, [script]);
+    rmSync(path.dirname(real), { recursive: true });
+    expect((await activation(root, pid)).reason).toBe("untracked-tool-process");
+  });
+
+  it.skipIf(process.platform !== "darwin")("keeps an image whose exec path is now empty blocking: its final component may have been a link", async () => {
+    const { home, root } = await managed();
+    const bundle = path.join(home, "Apps/Removed.app"); cloneNode(path.join(bundle, "Helper"));
+    const pid = await start(path.join(bundle, "Helper"), holder);
+    rmSync(path.join(bundle, "Helper"));
+    expect((await activation(root, pid)).reason).toBe("untracked-tool-process");
+  });
+});
+
 describe("installation-scoped untracked process ownership", () => {
   it("excludes only the exact Claude Chrome native-host dispatch so a staged pair can activate", async () => {
     const { home, root, launcher, b } = await installation();
@@ -611,7 +812,7 @@ describe("installation-scoped untracked process ownership", () => {
       const execute = childProcess.execFileSync; const uid = process.getuid!();
       vi.spyOn(childProcess, "execFileSync").mockImplementation(((...args: Parameters<typeof execute>) =>
         args[0] === "/bin/ps" && (args[1] as string[] | undefined)?.[0] === "-axo"
-          ? `${uid} ${uid} ${nativeHost.pid}\n` as ReturnType<typeof execute> : execute(...args)) as typeof execute);
+          ? `${uid} ${uid} ${nativeHost.pid} S\n` as ReturnType<typeof execute> : execute(...args)) as typeof execute);
       syncBuiltinESMExports();
       const metadata = readToolProcessMetadata([nativeHost.pid!], [{ path: script, tool: "claude" }]);
       expect(metadata?.[0]?.dispatch).toBe("chrome-native-host");
@@ -639,7 +840,7 @@ describe("installation-scoped untracked process ownership", () => {
       const execute = childProcess.execFileSync; const uid = process.getuid!();
       vi.spyOn(childProcess, "execFileSync").mockImplementation(((...args: Parameters<typeof execute>) =>
         args[0] === "/bin/ps" && (args[1] as string[] | undefined)?.[0] === "-axo"
-          ? `${uid} ${uid} ${ordinary.pid}\n` as ReturnType<typeof execute> : execute(...args)) as typeof execute);
+          ? `${uid} ${uid} ${ordinary.pid} S\n` as ReturnType<typeof execute> : execute(...args)) as typeof execute);
       syncBuiltinESMExports();
       expect(readToolProcessMetadata([ordinary.pid!], [{ path: script, tool: "claude" }])?.[0]?.dispatch).toBe("ordinary");
       expect(hasUntrackedToolProcesses(root, new Set(), env)).toBe(true);

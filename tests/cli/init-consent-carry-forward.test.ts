@@ -173,7 +173,7 @@ describe("Finding 1 - the Cache + context consent is carried to activation, neve
     await runInit(["--connect", "codex", "--mode", "cache-plus-context"]);
     // Three more Compaction processes, all in the ORIGINAL shell where the shim does not resolve.
     await runCli(["activity"], pathShimInactive());
-    await runCli(["status"], pathShimInactive());
+    await runCli(["status", "--verbose"], pathShimInactive());
     await runCli(["activity"], pathShimInactive());
     expect(authorizedTools()).toEqual([]);
     expect(existsSync(pendingPath())).toBe(true);

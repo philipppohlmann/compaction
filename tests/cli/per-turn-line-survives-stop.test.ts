@@ -100,7 +100,7 @@ async function runStopHook(sessionId: string, cwd: string, env: NodeJS.ProcessEn
 }
 
 describe("the per-turn status line across a top-level turn's Stop", () => {
-  it("keeps the reduction and the label on the render AFTER Stop", async () => {
+  it("keeps the reduction evidence on the render AFTER Stop", async () => {
     const env = await basicModeEnv();
     const cwd = await mkdtemp(path.join(tmpdir(), "per-turn-cwd-"));
     const deps = { env, cwd, readReceipt: async () => recordModeReceipt(SESSION, env) };
@@ -109,7 +109,6 @@ describe("the per-turn status line across a top-level turn's Stop", () => {
     const during = await computeStatusLine(statusStdin(SESSION, cwd), deps);
     expect(during, "the running turn shows what the hook decided").toContain("output N/A→1,512 (N/A%, est.)");
     expect(during).toContain("observed input 259,985");
-    expect(during).toContain("basic shaping");
 
     await runStopHook(SESSION, cwd, env);
 
@@ -156,7 +155,9 @@ describe("the per-turn status line across a top-level turn's Stop", () => {
 
     await runStopHook(SESSION, cwd, env);
 
-    expect(await computeStatusLine(statusStdin(OTHER_SESSION, cwd), deps)).toContain("basic shaping");
+    expect(await computeStatusLine(statusStdin(OTHER_SESSION, cwd), deps)).toContain(
+      "output N/A→1,512 (N/A%, est.)"
+    );
   });
 
   it("a turn the gate HELD still draws no arrow, before or after Stop", async () => {

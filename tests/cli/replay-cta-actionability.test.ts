@@ -160,7 +160,7 @@ describe.runIf(CLI_BUILT)("the replayed line on the surfaces that replay", () =>
   it("a CURRENT-period pause is replayed WITH the conversion path", () => {
     const env = entitledDevice();
     const cwd = cwdWithPausedTurn(currentPeriodId());
-    for (const args of [["watch", "--once"], ["status"]]) {
+    for (const args of [["watch", "--once"], ["status", "--verbose"]]) {
       const line = receiptLineIn(run(env, cwd, args));
       expect(line, args.join(" ")).toContain(UPGRADE_CTA_LABEL);
       expect(line, args.join(" ")).toContain(proUrl(process.env));
@@ -170,7 +170,7 @@ describe.runIf(CLI_BUILT)("the replayed line on the surfaces that replay", () =>
   it("a STALE pause is replayed WITHOUT the conversion path", () => {
     const env = entitledDevice();
     const cwd = cwdWithPausedTurn(previousPeriodId());
-    for (const args of [["watch", "--once"], ["status"]]) {
+    for (const args of [["watch", "--once"], ["status", "--verbose"]]) {
       const out = run(env, cwd, args);
       expect(out, args.join(" ")).not.toContain(UPGRADE_CTA_LABEL);
       expect(out, args.join(" ")).not.toContain(proUrl(process.env));
@@ -184,7 +184,7 @@ describe.runIf(CLI_BUILT)("the replayed line on the surfaces that replay", () =>
     // has nothing to do with replay.
     const env = await measuredEntitledDevice();
     const cwd = cwdWithPausedTurn(stale);
-    for (const args of [["watch", "--once"], ["status"]]) {
+    for (const args of [["watch", "--once"], ["status", "--verbose"]]) {
       const line = receiptLineIn(run(env, cwd, args));
       expect(line, args.join(" ")).toContain("input paused");
       // THE RECORDED DATE, NOT TODAY'S. A replayed line states what that turn recorded; the existing
@@ -213,7 +213,7 @@ describe.runIf(CLI_BUILT)("the replayed line on the surfaces that replay", () =>
     for (const periodId of [currentPeriodId(), previousPeriodId()]) {
       const cwd = cwdWithPausedTurn(periodId);
       expect(receiptLineIn(run(env, cwd, ["watch", "--once"])), periodId).toBe(
-        receiptLineIn(run(env, cwd, ["status"]))
+        receiptLineIn(run(env, cwd, ["status", "--verbose"]))
       );
     }
   });

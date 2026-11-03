@@ -17,10 +17,9 @@ import { loadOutputCalibrationResolver } from "../../src/core/output-shaping-sav
  * THE GATEWAY MUST DESCRIBE A TURN THE SAME WAY EVERY OTHER SURFACE DOES.
  *
  * `watch`, `compaction statusline` and the Claude Code Stop hook all route a full-tier device's REAL
- * apply through `communityFullApplyReceiptLine`. The gateway's own inline line did not: it fell through
- * to the unlabelled Open rendering, so the process that PERFORMED the apply said the least about it -
- * no `full apply` label, no output arrow - while three replay surfaces rendered the same receipt in
- * full. One receipt, two descriptions, and the weaker one came from the strongest evidence.
+ * apply through `communityFullApplyReceiptLine`. The gateway's own inline line once fell through to the
+ * Open rendering and lost the output arrow. These tests keep the input, output, price and receipt evidence
+ * aligned across inline and replay surfaces while the internal tier still selects the correct builder.
  *
  * These drive the renderer directly. Reaching a real full apply through `createGatewayServer` needs the
  * private engine and a valid lease, so an end-to-end test could only exercise the Open branch - the one
@@ -125,18 +124,17 @@ afterEach(() => {
   rmSync(configDir, { recursive: true, force: true });
 });
 
-describe("gateway inline line - a REAL full apply renders the canonical full line", () => {
-  it("carries the input arrow, the `full apply` label and the receipt id", async () => {
+describe("gateway inline line - a REAL full apply renders the canonical evidence", () => {
+  it("carries the input arrow and the receipt id", async () => {
     writeFullTierDevice();
     const line = await perTurnLineFromReceipt(realApplyReceipt(), { entitlementEnv: env() });
     expect(line).toContain("input 12,000→9,000 (−25%)");
-    expect(line).toContain("full apply");
     expect(line).toContain("id 8f4c2f6e");
   });
 
   /**
    * THE HALF THAT WAS MISSING. The input arrow survived the old path (the Open renderer prints it); the
-   * `full apply` label and the OUTPUT arrow did not. The output before is reconstructed from the
+   * OUTPUT arrow did not. The output before is reconstructed from the
    * calibrated rate, so it must carry an estimate label and never the bare measured `(−PP%)` the input
    * arrow uses.
    */
@@ -144,9 +142,8 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
     writeFullTierDevice();
     await writeCalibration(1000, 790); // a measured 21% reduction on THIS device
     const line = await perTurnLineFromReceipt(realApplyReceipt(512), { entitlementEnv: env() });
-    expect(line).toMatch(/output [\d,]+→512 \(−\d+%, est\.\)/);
+    expect(line).toMatch(/output [\d,]+→512 \(−\d+\.\d%, est\.\)/);
     expect(line).not.toContain("default prior");
-    expect(line).toContain("full apply");
     // The input arrow stays UNLABELLED: it is a real before→after, not a reconstruction.
     expect(line).toContain("input 12,000→9,000 (−25%)");
   });
@@ -168,13 +165,17 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
   it("with no calibration on this device: an UNKNOWN output before, and the measured input arrow is untouched", async () => {
     writeFullTierDevice();
     const line = await perTurnLineFromReceipt(realApplyReceipt(512), { entitlementEnv: env() });
-    expect(line).toContain("output N/A→512 (N/A%, est.)");
-    expect(line, "no reconstruction without this device's own measurement").not.toMatch(/output [\d,]+→/);
-    expect(line, "the prior's reconstructed before must not appear in any form").not.toContain("966");
+    // This device has no calibration OF ITS OWN, but the turn's carrier belongs to the shipped
+    // substantive shaping family, so the family's cross-model posterior stands in rather than leaving a
+    // permanent `N/A` on a supported shaped turn. It is still an estimate and still says so. The genuine
+    // N/A reservation is unchanged and is covered by the next case, where the receipt cannot form an
+    // exact key at all.
+    expect(line).toMatch(/output [\d,]+→512 \(−\d+\.\d%, est\.\)/);
+    expect(line, "the withdrawn default prior's reconstruction must not appear in any form").not.toContain("966");
     // The MEASURED input arrow is untouched, and its unlabelled `−47%` is not confused with the
     // output axis's absent one — the two axes are independently evidenced on the same line.
     expect(line).toContain("input 12,000→9,000 (−25%)");
-    expect(line).toContain("full apply");
+    expect(line).toContain("id 8f4c2f6e");
   });
 
   it("keeps the shaped output axis N/A when legacy receipt metadata cannot form an exact key", async () => {
@@ -185,7 +186,7 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
     const line = await perTurnLineFromReceipt(receipt, { entitlementEnv: env() });
     expect(line).toContain("output N/A→512 (N/A%, est.)");
     expect(line).not.toMatch(/output [\d,]+→512/);
-    expect(line).toContain("full apply");
+    expect(line).toContain("input 12,000→9,000 (−25%)");
   });
 
   it.each(["missing", "absent"] as const)(
@@ -204,7 +205,7 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
       expect(line).not.toContain("→512");
       expect(line).not.toContain("est.");
       expect(line).toContain("input 12,000→9,000 (−25%)");
-      expect(line).toContain("full apply");
+      expect(line).toContain("id 8f4c2f6e");
     }
   );
 
@@ -231,7 +232,7 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
     });
 
     expect(inline).toBe(watched);
-    if (receipt.output_shaping_regime) expect(inline).toContain("output 648→512 (−21%, est.)");
+    if (receipt.output_shaping_regime) expect(inline).toContain("output 648→512 (−21.0%, est.)");
     else expect(inline).toContain("output N/A→512 (N/A%, est.)");
   });
 
@@ -262,7 +263,7 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
     const line = await perTurnLineFromReceipt(receipt, { entitlementEnv: env() });
     expect(line).not.toMatch(/output [\d,]+→/);
     expect(line).toContain("input 12,000→9,000 (−25%)");
-    expect(line).toContain("full apply");
+    expect(line).toContain("−$0.01 (list price)");
   });
 
   /**
@@ -278,28 +279,23 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
     await writeCalibration(1000, 790);
     const line = await perTurnLineFromReceipt(realApplyReceipt(512), { entitlementEnv: env() });
     expect(line).toBe(
-      "compaction · input 12,000→9,000 (−25%) · output 648→512 (−21%, est.) · " +
-        "−$0.01 (list price) · full apply · id 8f4c2f6e"
+      "compaction · input 12,000→9,000 (−25%) · output 648→512 (−21.0%, est.) · " +
+        "−$0.01 (list price) · id 8f4c2f6e"
     );
   });
 
-  /**
-   * `full apply` is an ENTITLEMENT statement. A device that is not on the full tier may not print it,
-   * even holding a receipt that carries a real apply - the label would assert an entitlement the device
-   * does not have. The measured reduction the receipt DOES carry still renders.
-   */
-  it("a non-full device never prints `full apply`, but keeps the measured input reduction", async () => {
+  it("a non-full device keeps the measured receipt evidence without adding a posture label", async () => {
     writeBasicTierDevice();
     const line = await perTurnLineFromReceipt(realApplyReceipt(), { entitlementEnv: env() });
     expect(line).not.toContain("full apply");
     expect(line).toContain("input 12,000→9,000 (−25%)");
+    // Tier decides POSTURE LABELS, never whether the evidence axes render: a basic-tier device shows the
+    // same shaped-output estimate, from the same family posterior, as any other.
+    expect(line).toMatch(/output [\d,]+→512 \(−\d+\.\d%, est\.\)/);
+    expect(line).toContain("id 8f4c2f6e");
   });
 
-  /**
-   * The builder's own refusal must survive being called from here: a record receipt on a full-tier
-   * device must not acquire a `full apply` label from the gateway any more than from `watch`.
-   */
-  it("a RECORD receipt on a full-tier device is never labelled `full apply`", async () => {
+  it("a RECORD receipt on a full-tier device remains a plain observed turn", async () => {
     writeFullTierDevice();
     const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 100, outputTokens: 412, model: "gpt-4o" };
     const receipt = buildGatewayReceipt({
@@ -312,14 +308,14 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
       now: fixedNow
     });
     const line = await perTurnLineFromReceipt(receipt, { entitlementEnv: env() });
+    expect(line).toContain("input 100");
+    expect(line).toContain("output 412");
+    expect(line).toContain("id 8f4c2f6e");
+    expect(line).not.toContain("→");
     expect(line ?? "").not.toContain("full apply");
   });
 
-  /**
-   * An apply that ran but mutated NOTHING (a no-op / dry-run-shaped receipt) is not a full apply. It
-   * carries no before→after, so there is nothing to label and nothing to reduce.
-   */
-  it("an apply that did not mutate is never labelled `full apply`", async () => {
+  it("an apply that did not mutate carries no before→after reduction", async () => {
     writeFullTierDevice();
     const usage: OpenAiUsageBreakdown = { present: true, promptInputTokens: 50, outputTokens: 20, model: "gpt-4o" };
     const receipt = buildApplyReceipt({
@@ -333,6 +329,8 @@ describe("gateway inline line - a REAL full apply renders the canonical full lin
       now: fixedNow
     });
     const line = await perTurnLineFromReceipt(receipt, { entitlementEnv: env() });
+    expect(line).toContain("output 20");
+    expect(line).not.toContain("→");
     expect(line ?? "").not.toContain("full apply");
   });
 });

@@ -12,16 +12,28 @@ import {
   type EnvLike,
   type ResolvedTarget
 } from "../../core/api-client/index.js";
-import { collectReadinessReport, renderReadinessReport } from "./readiness.js";
+import {
+  collectReadinessReport,
+  managedLauncherShadowed,
+  managedUpdateLabel,
+  renderReadinessReport,
+  type ReadinessReport
+} from "./readiness.js";
 import { allowanceNoticeInput, lastReceiptLines } from "./watch.js";
 import type { AllowancePauseReason } from "../../core/upgrade-cta.js";
 import { upgradeNoticeLines } from "../../core/gateway/receipt-line.js";
 import {
   resolveOpenTier,
   readProductMode,
+  readConnectedWorkflows,
   type AllowancePauseScope,
   type ProductMode
 } from "../../core/onboarding-preferences.js";
+import { pendingFullApplyGate } from "./full-apply-gate.js";
+import { isShapingStopped } from "../../core/subscription-shaping-state.js";
+import { listRoutingSlots } from "../../core/gateway/routing-registry.js";
+import { isProcessAlive } from "../../core/gateway/status.js";
+import { APPLY_ROUTING_PROVIDER } from "../../core/gateway/apply-routing-activation.js";
 import { readStoredCredentials } from "../../core/auth/credentials.js";
 import {
   leaseNeedsRenewal,
@@ -31,6 +43,7 @@ import {
 import {
   engineAvailability,
   engineInputCompaction,
+  resolvedEngineVersion,
   type EngineAvailability,
   type EngineInputCompaction
 } from "../../core/engine-availability.js";
@@ -207,6 +220,14 @@ export const REFRESH_COMMUNITY_REMEDY =
 export const COMMUNITY_DENIED_REMEDY =
   "This device is no longer entitled to Community. Sign in again with `compaction login`, or continue on Open.";
 export const COMPACTION_ACTIVE_FOOTER = "Compaction is active.";
+/**
+ * Printed beneath the footer while a plain (`--workflow none`) routing gateway is still alive. The route
+ * is fixed when a tool session launches, so a session that started before this device was ready stays
+ * on that gateway; the footer describes the DEVICE and must not read as an upgrade of that session.
+ * Vocabulary is the running gateway's own one-time log line.
+ */
+export const RECORD_ONLY_SESSION_NOTE =
+  "A tool session started before this was ready stays record-only for input; a new tool session re-evaluates routing.";
 
 /**
  * THE LINE THAT WOULD HAVE SHOWN THE OUTAGE. Printed only when the resolved engine's SIGNED manifest
@@ -237,7 +258,7 @@ export const INPUT_COMPACTION_UNSUPPORTED_REMEDY =
  * human render path. The device token is never read for any purpose. Raw identifiers live only on the
  * separate `--json` object, which is the sanctioned diagnostic surface.
  */
-interface AccountAccessState {
+export interface AccountAccessState {
   /** Credentials file present (presence only — never account id / email / token). Drives the Account line. */
   connected: boolean;
   /** A signed entitlement lease verifies as VALID on THIS device (current period, not expired). */
@@ -262,6 +283,46 @@ interface AccountAccessState {
    * and still gets no input compaction from it. Drives the input-compaction line.
    */
   inputCompactionUnsupported: boolean;
+  /**
+   * The remaining LOCAL gate between this device and a routed turn that actually compacts input, or
+   * `undefined` when none is unmet.
+   *
+   * WHY THE TIER WAS NOT ENOUGH. `tier` answers product mode + lease. The gateway additionally requires
+   * the input-optimization mode AND a stored per-tool apply authorization, and it was possible for all
+   * of: credentials, a valid lease, a verified engine and `tier === "full"` to hold while the
+   * optimization mode was plain `cache` — so this screen printed `Optimization: Full` and
+   * `Compaction is active.` on a device the gateway declined on every single turn. Asked through the
+   * SAME predicate the gateway answers with, so the two cannot diverge.
+   */
+  fullApplyPendingReason?: string;
+  /**
+   * `compaction stop` is in effect. The gateway declines every request while stopped (the unified
+   * switch), so the healthy footer must not render. Same predicate the guard and the server read.
+   */
+  stopped: boolean;
+  /** The local-gate read itself failed. Fail closed: an unreadable gate never yields the healthy footer. */
+  localGateUnreadable: boolean;
+  /** A live plain (`--workflow none`) Claude Code routing gateway exists: some session is pinned record-only. */
+  liveRecordOnlyRoutingGateway: boolean;
+}
+
+/**
+ * Whether a live routing gateway WITHOUT a workflow identity exists for the apply-routing provider.
+ * Reads the same routing registry `gateway ensure` reads; liveness is the pid check, no socket, no
+ * network. Any failure answers false (the note is an aid, never a reason the surface breaks).
+ */
+function hasLiveRecordOnlyRoutingGateway(env: EnvLike): boolean {
+  try {
+    return listRoutingSlots(env as NodeJS.ProcessEnv).some(
+      (slot) =>
+        slot.record.provider === APPLY_ROUTING_PROVIDER &&
+        slot.record.workflow === undefined &&
+        slot.record.quarantine === undefined &&
+        isProcessAlive(slot.record.pid)
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -320,6 +381,17 @@ async function collectAccountAccess(
   const entitled = verdict.label === "lease-valid";
   const engine = await engineAvailability(env as NodeJS.ProcessEnv);
   const inputCompaction = await engineInputCompaction(env as NodeJS.ProcessEnv);
+  // Never let a diagnostic read fail the status command.
+  let pendingReason: string | undefined;
+  let localGateUnreadable = false;
+  let stopped = false;
+  try {
+    pendingReason = await pendingFullApplyGate(readConnectedWorkflows(env as NodeJS.ProcessEnv), env as NodeJS.ProcessEnv);
+    stopped = isShapingStopped(env);
+  } catch {
+    pendingReason = undefined;
+    localGateUnreadable = true;
+  }
   return {
     connected,
     entitled,
@@ -328,7 +400,11 @@ async function collectAccountAccess(
     communityGap: communityGapFrom(connected, entitled, verdict.label, renewReason),
     tier,
     engineReady: engine === "present",
-    inputCompactionUnsupported: inputCompaction === "unsupported"
+    inputCompactionUnsupported: inputCompaction === "unsupported",
+    ...(pendingReason === undefined ? {} : { fullApplyPendingReason: pendingReason }),
+    stopped,
+    localGateUnreadable,
+    liveRecordOnlyRoutingGateway: hasLiveRecordOnlyRoutingGateway(env)
   };
 }
 
@@ -389,10 +465,132 @@ function renderAccountAccessSection(s: AccountAccessState): string[] {
   // state that pairs with `Optimization: Full`. Gating on `full` (not merely
   // entitled) prevents an `observe`/`basic` device — which the gateway deliberately keeps record-only
   // — from claiming `Compaction is active.` (the turn is not being optimized).
-  if (s.connected && s.entitled && s.engineReady && s.tier === "full") {
-    lines.push("");
-    lines.push(COMPACTION_ACTIVE_FOOTER);
+  // ...AND no local gate is still unmet. `tier === "full"` alone was not the same question the gateway
+  // answers, so this footer could claim the device was active while every turn was declined.
+  const footer = accountFooterLines(s);
+  if (footer.length > 0) lines.push("", ...footer);
+  return lines;
+}
+
+/** Full input optimization is reachable for a routed, authorized tool: the healthy-footer condition. */
+function fullApplyActive(s: AccountAccessState): boolean {
+  return s.connected && s.entitled && s.engineReady && s.tier === "full" && s.fullApplyPendingReason === undefined
+    && !s.stopped && !s.inputCompactionUnsupported && !s.localGateUnreadable;
+}
+
+function accountFooterLines(s: AccountAccessState): string[] {
+  if (!(s.connected && s.entitled && s.engineReady && s.tier === "full")) return [];
+  // The honest alternative, from the SAME reason string `mode`/`init` already print, so one unmet
+  // gate is not described three different ways.
+  if (s.fullApplyPendingReason !== undefined) return [s.fullApplyPendingReason];
+  // The remaining declines the gateway applies on EVERY request: `compaction stop`, an engine whose
+  // metering contract this client cannot place (explained by the input-compaction line), and an
+  // unreadable local gate (fail closed). None of them may yield the healthy footer.
+  if (!fullApplyActive(s)) return [];
+  return s.liveRecordOnlyRoutingGateway ? [COMPACTION_ACTIVE_FOOTER, RECORD_ONLY_SESSION_NOTE] : [COMPACTION_ACTIVE_FOOTER];
+}
+
+export const STATUS_VERBOSE_HINT = "Details: compaction status --verbose";
+
+type ConciseTool = "claude-code" | "codex" | "cursor";
+
+/**
+ * One tool's capability as the default status states it. Input reduction is claimed only where the
+ * gateway would actually compact a routed turn (healthy Full posture + a routable, authorized tool);
+ * output only where the shaping hook is verified active. Codex shaping that was not probed is said to
+ * be unchecked rather than assumed.
+ */
+function conciseToolLine(key: ConciseTool, r: ReadinessReport, s: AccountAccessState, allowance?: ConciseAllowance): { text: string; input: boolean } {
+  const connected = key === "claude-code" ? r.tools.claudeCode.connected
+    : key === "codex" ? r.tools.codex.shim === "active" : r.tools.cursor.shim === "active";
+  // Each capability axis is read on its own: a shaping hook or routing shim can stay active while
+  // another connect artifact is missing (a hook-only install, a partial disconnect), and such a tool
+  // must not be reported as disconnected while it still changes what the model sees.
+  // Claude Code's input path is its routing shim; the Stop hook alone (what `connected` means) never
+  // carries a request to the Gateway. A spent allowance pauses input on the routes it names.
+  const routed = key === "claude-code" ? r.tools.claudeCode.routingShim === "active"
+    : key === "codex" ? r.tools.codex.shim === "active" : false;
+  let output: "yes" | "no" | "unchecked" | "needs-approval" | "disabled" = "no";
+  if (key === "claude-code") output = r.tools.claudeCode.shapingActive ? "yes" : "no";
+  else if (key === "cursor") output = r.tools.cursor.shapingActive ? "yes" : "no";
+  else {
+    const state = r.tools.codex.shapingState;
+    output = state === "active" ? "yes" : state === "approval-required" ? "needs-approval" : state === "disabled" ? "disabled"
+      : r.tools.codex.shapingConfigured ? "unchecked" : "no";
   }
+  // Only an ACTIVE axis (a routing shim, or verified shaping) keeps a tool from reading as disconnected;
+  // leftover hook configuration that Codex has not approved or checked is not an active capability.
+  if (!connected && !routed && output !== "yes") {
+    const sessions = r.tools.claudeCode.sessionsFound;
+    const found = key === "claude-code" ? sessions === "unknown" || sessions > 0
+      : key === "codex" ? r.tools.codex.binaryFound : r.tools.cursor.binaryFound;
+    return { text: found ? "not connected" : "not found", input: false };
+  }
+  const state = connected ? "connected" : "partly connected";
+  if (s.stopped) return { text: `${state} · paused (compaction stop)`, input: false };
+  const allPaused = allowance !== undefined && allowance.scope !== "api-key-route";
+  const eligible = key !== "cursor" && routed && fullApplyActive(s) && r.routes[key] === "routable" && r.authorizations[key].authorized;
+  const input = eligible && !allPaused;
+  const pausedNote = eligible && allPaused ? " · input paused (allowance)"
+    : input && allowance?.scope === "api-key-route" ? " · API-key route paused (allowance)" : "";
+  if (output === "yes") return { text: `${state} · ${input ? "input + output" : "output only"}${pausedNote}`, input };
+  // Unprobed Codex trust is not counted as output: only `--check-codex` can establish it.
+  const outputNote = output === "unchecked" ? " · output not checked (compaction status --check-codex)"
+    : output === "needs-approval" ? " · output needs Codex hook approval"
+    : output === "disabled" ? " · output hook disabled in Codex" : "";
+  return { text: `${state} · ${input ? "input only" : "not optimizing"}${outputNote}${pausedNote}`, input };
+}
+
+/**
+ * The DEFAULT `compaction status`: a short product-level summary. Every line is derived from the same
+ * report and account state the detailed `--verbose` readiness report prints, never a separate guess.
+ */
+type ConciseAllowance = { reason: AllowancePauseReason; resetsOn?: string; scope?: AllowancePauseScope };
+
+export function renderConciseStatus(
+  r: ReadinessReport,
+  s: AccountAccessState,
+  engineVersion: string | undefined,
+  allowanceNotice?: ConciseAllowance
+): string[] {
+  const row = (label: string, value: string) => `${label.padEnd(16)}${value}`;
+  const lines: string[] = [];
+  const install = r.runtime.managed ? `managed (${managedUpdateLabel(r.runtime.autoUpdates, r.runtime.autoUpdatesEffective)})` : "not managed";
+  lines.push(`Compaction ${r.runtime.reportingVersion} · ${install}`);
+  if (managedLauncherShadowed(r)) lines.push("Warning: `compaction` on PATH is not the managed launcher.");
+  if (!r.runtime.resolvedBinary) lines.push("Warning: `compaction` is not on PATH.");
+  lines.push("");
+  if (!s.connected) {
+    lines.push(row("Plan", "Open"), `  ${SET_UP_COMMUNITY_REMEDY}`);
+  } else if (s.entitled) {
+    lines.push(row("Community", s.communityDevSigned ? "active (DEV-SIGNED)" : "active"));
+  } else if (s.communityGap === "denied") {
+    lines.push(row("Community", "not entitled"), `  ${COMMUNITY_DENIED_REMEDY}`);
+  } else if (s.communityGap === "refresh-failed") {
+    lines.push(row("Community", "authorization needs refresh"), `  ${REFRESH_COMMUNITY_REMEDY}`);
+  } else {
+    lines.push(row("Community", "needs activation"), `  ${RESTORE_COMMUNITY_REMEDY}`);
+  }
+  // Full is a Community posture: never print it beside an Open plan line (e.g. a lease left behind
+  // after `compaction logout`), whatever the tier clamp says.
+  if (s.tier === "full" && s.connected && s.entitled) lines.push(row("Optimization", "Full"));
+  else if (s.tier === "basic") lines.push(row("Optimization", "Basic"));
+  if (s.engineReady) lines.push(row("Engine", engineVersion ? `${engineVersion} · ready` : "ready"));
+  if (s.inputCompactionUnsupported) lines.push(`  ${INPUT_COMPACTION_UNSUPPORTED}`, `  ${INPUT_COMPACTION_UNSUPPORTED_REMEDY}`);
+  // A paused allowance changes what every turn does, so it is state, not a diagnostic.
+  if (allowanceNotice) for (const line of upgradeNoticeLines(allowanceNotice)) lines.push(line === "" ? "" : `  ${line}`);
+  lines.push("");
+  const tools = (["claude-code", "codex", "cursor"] as const).map((key) => ({ key, ...conciseToolLine(key, r, s, allowanceNotice) }));
+  for (const tool of tools) lines.push(row(tool.key === "claude-code" ? "Claude Code" : tool.key === "codex" ? "Codex" : "Cursor", tool.text));
+  lines.push("");
+  lines.push(row("Gateway", r.gateway.running ? "running" : "starts on demand"));
+  // The healthy footer claims optimization is running, so it needs a tool row that actually gets input
+  // optimization: none does under an all-routes allowance pause, or when every integration is gone.
+  const footer = tools.some((tool) => tool.input)
+    ? accountFooterLines(s)
+    : accountFooterLines(s).filter((line) => line !== COMPACTION_ACTIVE_FOOTER && line !== RECORD_ONLY_SESSION_NOTE);
+  if (footer.length > 0) lines.push("", ...footer);
+  lines.push("", STATUS_VERBOSE_HINT);
   return lines;
 }
 
@@ -467,7 +665,7 @@ function hostedReasonLine(health: HealthResult): string {
  * the account id, the device token, or the API key on the human path. Always exits 0.
  */
 export async function runStatus(
-  opts: { env?: EnvLike; version?: string; json?: boolean; projectsDir?: string; checkCodex?: boolean } = {}
+  opts: { env?: EnvLike; version?: string; json?: boolean; verbose?: boolean; projectsDir?: string; checkCodex?: boolean } = {}
 ): Promise<void> {
   const env = opts.env ?? process.env;
   const version = opts.version ?? "unknown";
@@ -522,12 +720,18 @@ export async function runStatus(
     return;
   }
 
-  console.log(renderReadinessReport(report));
-  console.log("");
-  for (const line of renderLastTurnsSection(lastTurns, await allowanceNoticeInput(env, process.cwd()))) console.log(line);
-  console.log("");
   const accountAccess = await collectAccountAccess(env, tier, renewReason);
-  for (const line of renderAccountAccessSection(accountAccess)) console.log(line);
+  const allowanceNotice = await allowanceNoticeInput(env, process.cwd());
+  if (opts.verbose) {
+    console.log(renderReadinessReport(report));
+    console.log("");
+    for (const line of renderLastTurnsSection(lastTurns, allowanceNotice)) console.log(line);
+    console.log("");
+    for (const line of renderAccountAccessSection(accountAccess)) console.log(line);
+  } else {
+    const engineVersion = await resolvedEngineVersion(env as NodeJS.ProcessEnv);
+    for (const line of renderConciseStatus(report, accountAccess, engineVersion, allowanceNotice)) console.log(line);
+  }
 
   // INVARIANT: with no hosted endpoint configured (the common case), the `Account & access` section
   // above is the WHOLE state surface — an entitled device is not "local-only", and endpoint
@@ -605,12 +809,14 @@ export function registerStatusCommand(program: Command): void {
   program
     .command("status")
     .description(
-      "Readiness report: detected tools + connect status, gateway health, storage, credential " +
+      "Concise summary: plan, optimization, engine, connected tools, and gateway. --verbose prints the " +
+        "full readiness report: detected tools + connect status, gateway health, storage, credential " +
         "PRESENCE (set/unset only - never values), stored auto-apply authorizations, what routes vs " +
         "measures-only, the exact next commands, and whether a hosted endpoint is configured + " +
         "reachable. Local, read-only, content-free; always exits 0."
     )
     .option("--json", "Print the content-free report as JSON.")
+    .option("-v, --verbose", "Print the full readiness report (diagnostics, routes, next commands).")
     .option("--projects-dir <dir>", "Claude Code projects directory to detect against (default: the standard local location)")
     .option(
       "--check-codex",
@@ -619,10 +825,11 @@ export function registerStatusCommand(program: Command): void {
         "and Codex writes to its own home and refreshes its model catalogue over the network - which " +
         "the rest of this command never does. With no such hook configured nothing is started."
     )
-    .action(async (options: { json?: boolean; projectsDir?: string; checkCodex?: boolean }) => {
+    .action(async (options: { json?: boolean; verbose?: boolean; projectsDir?: string; checkCodex?: boolean }) => {
       await runStatus({
         version: program.version() ?? "unknown",
         json: options.json,
+        verbose: options.verbose,
         projectsDir: options.projectsDir,
         checkCodex: options.checkCodex
       });

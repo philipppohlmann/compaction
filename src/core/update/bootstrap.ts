@@ -12,7 +12,7 @@ import { stageLocalArtifact, stageRegistryPackage } from "./package-stage.js";
 import { createPair } from "./pair.js";
 import { discoverVersion, registryRelease, type UpdateChannel } from "./registry.js";
 import { readState } from "./state.js";
-import { hasUntrackedToolProcessesForLauncher } from "./process-identity.js";
+import { toolProcessInventoryRefusal, untrackedToolProcessInventoryForLauncher } from "./process-identity.js";
 import { classifyOfficialNpmGlobalEntry, type OfficialNpmGlobalInstallation } from "./npm-global-ownership.js";
 
 export interface BootstrapOptions {
@@ -43,6 +43,12 @@ function automaticUpdatesAfterBootstrap(options: BootstrapOptions, env: NodeJS.P
   if (env.COMPACTION_AUTO_UPDATE === "0") return false;
   if (options.exactVersion || options.localArtifact) return options.automaticUpdates ?? false;
   return options.automaticUpdates ?? readUpdatePreferences(env).autoUpdates;
+}
+
+/** Launcher replacement waits for every connected tool session; the refusal says which case blocked it. */
+function assertNoUntrackedToolProcesses(launcher: string, env: NodeJS.ProcessEnv): void {
+  const inventory = untrackedToolProcessInventoryForLauncher(launcher, new Set(), env);
+  if (inventory.state !== "none") throw new Error(toolProcessInventoryRefusal(inventory));
 }
 
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : "unknown error"; }
@@ -110,7 +116,7 @@ export async function bootstrapManaged(options: BootstrapOptions = {}, dependenc
       || classified.prefix !== path.resolve(options.prefix ?? "") || classified.launcherPath !== launcher) {
       throw new Error("Refusing to replace an unknown launcher; choose an empty user-writable prefix.");
     }
-    if (hasUntrackedToolProcessesForLauncher(launcher, new Set(), env)) throw new Error("Legacy integration sessions may still be active; close them before migrating this launcher.");
+    assertNoUntrackedToolProcesses(launcher, env);
     adoption = classified;
   }
   const cli = options.localArtifact
@@ -126,7 +132,7 @@ export async function bootstrapManaged(options: BootstrapOptions = {}, dependenc
         const current = classifyOfficialNpmGlobalEntry(adoption.entryPath);
         if (current.kind !== "official-npm-global" || current.prefix !== adoption.prefix
           || current.launcherPath !== launcher) throw new Error("npm-global launcher ownership changed during adoption.");
-        if (hasUntrackedToolProcessesForLauncher(launcher, new Set(), env)) throw new Error("Legacy integration sessions may still be active; close them before migrating this launcher.");
+        assertNoUntrackedToolProcesses(launcher, env);
         backup = `${launcher}.before-managed-${randomUUID()}`; renameSync(launcher, backup);
       } } : {}) }); }
     catch (error) {

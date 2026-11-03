@@ -16,10 +16,12 @@ import { realpathSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { compactionCommand } from "./compaction-command.js";
+import { owningManagedLauncher } from "./update/ownership.js";
 import {
-  CLAUDE_CODE_HOOK_COMMAND,
-  CLAUDE_CODE_SHAPING_HOOK_COMMAND,
-  CLAUDE_CODE_STATUS_LINE_COMMAND,
+  SHAPING_HOOK_ARGS,
+  STATUS_LINE_ARGS,
+  STOP_HOOK_ARGS,
   hasCompactionShapingHook,
   hasCompactionStatusLine,
   hasCompactionStopHook,
@@ -259,6 +261,8 @@ export interface ConnectClaudeCodeOptions {
   settingsPath: string;
   /** Preview only: compute + report the merge, write NOTHING. */
   dryRun?: boolean;
+  /** Managed launcher a new entry names; defaults to the launcher owning this invocation, if any. */
+  launcher?: string;
 }
 
 /**
@@ -269,18 +273,20 @@ export interface ConnectClaudeCodeOptions {
  */
 export async function connectClaudeCodeHook(options: ConnectClaudeCodeOptions): Promise<ConnectClaudeCodeResult> {
   const { settingsPath, dryRun = false } = options;
+  const launcher = options.launcher ?? owningManagedLauncher();
+  const hookCommand = compactionCommand(STOP_HOOK_ARGS, launcher);
   const { settings, existed } = await readSettings(settingsPath);
 
   let merged;
   try {
-    merged = installStopHook(settings);
+    merged = installStopHook(settings, launcher);
   } catch (error) {
     return {
       status: "error",
       settingsPath,
       existed,
       verified: false,
-      hookCommand: CLAUDE_CODE_HOOK_COMMAND,
+      hookCommand,
       error: error instanceof Error ? error.message : String(error)
     };
   }
@@ -291,7 +297,7 @@ export async function connectClaudeCodeHook(options: ConnectClaudeCodeOptions): 
       settingsPath,
       existed,
       verified: true, // the hook is present in the file we just read
-      hookCommand: CLAUDE_CODE_HOOK_COMMAND
+      hookCommand
     };
   }
 
@@ -301,7 +307,7 @@ export async function connectClaudeCodeHook(options: ConnectClaudeCodeOptions): 
       settingsPath,
       existed,
       verified: false,
-      hookCommand: CLAUDE_CODE_HOOK_COMMAND,
+      hookCommand,
       wouldWrite: merged.settings
     };
   }
@@ -316,7 +322,7 @@ export async function connectClaudeCodeHook(options: ConnectClaudeCodeOptions): 
     settingsPath,
     existed,
     verified,
-    hookCommand: CLAUDE_CODE_HOOK_COMMAND
+    hookCommand
   };
 }
 
@@ -365,28 +371,30 @@ export async function isShapingHookInstalled(settingsPath: string): Promise<bool
  */
 export async function connectClaudeCodeShapingHook(options: ConnectClaudeCodeOptions): Promise<ConnectShapingHookResult> {
   const { settingsPath, dryRun = false } = options;
+  const launcher = options.launcher ?? owningManagedLauncher();
+  const hookCommand = compactionCommand(SHAPING_HOOK_ARGS, launcher);
   const { settings, existed } = await readSettings(settingsPath);
 
   let merged;
   try {
-    merged = installShapingHook(settings);
+    merged = installShapingHook(settings, launcher);
   } catch (error) {
     return {
       status: "error",
       settingsPath,
       existed,
       verified: false,
-      hookCommand: CLAUDE_CODE_SHAPING_HOOK_COMMAND,
+      hookCommand,
       error: error instanceof Error ? error.message : String(error)
     };
   }
 
   if (merged.alreadyPresent) {
-    return { status: "already-present", settingsPath, existed, verified: true, hookCommand: CLAUDE_CODE_SHAPING_HOOK_COMMAND };
+    return { status: "already-present", settingsPath, existed, verified: true, hookCommand };
   }
 
   if (dryRun) {
-    return { status: "dry-run", settingsPath, existed, verified: false, hookCommand: CLAUDE_CODE_SHAPING_HOOK_COMMAND, wouldWrite: merged.settings };
+    return { status: "dry-run", settingsPath, existed, verified: false, hookCommand, wouldWrite: merged.settings };
   }
 
   await writeSettings(settingsPath, merged.settings);
@@ -397,7 +405,7 @@ export async function connectClaudeCodeShapingHook(options: ConnectClaudeCodeOpt
     settingsPath,
     existed,
     verified,
-    hookCommand: CLAUDE_CODE_SHAPING_HOOK_COMMAND
+    hookCommand
   };
 }
 
@@ -462,21 +470,23 @@ export async function isStatusLineInstalled(settingsPath: string): Promise<boole
  */
 export async function connectClaudeCodeStatusLine(options: ConnectClaudeCodeOptions): Promise<ConnectStatusLineResult> {
   const { settingsPath, dryRun = false } = options;
+  const launcher = options.launcher ?? owningManagedLauncher();
+  const statusLineCommand = compactionCommand(STATUS_LINE_ARGS, launcher);
   const { settings } = await readSettings(settingsPath);
-  const merged = installStatusLine(settings);
+  const merged = installStatusLine(settings, launcher);
 
   if (merged.status === "already-present") {
-    return { status: "already-present", settingsPath, verified: true, statusLineCommand: CLAUDE_CODE_STATUS_LINE_COMMAND };
+    return { status: "already-present", settingsPath, verified: true, statusLineCommand };
   }
   if (merged.status === "user-owned") {
-    return { status: "user-owned", settingsPath, verified: false, statusLineCommand: CLAUDE_CODE_STATUS_LINE_COMMAND };
+    return { status: "user-owned", settingsPath, verified: false, statusLineCommand };
   }
   if (dryRun) {
     return {
       status: "dry-run",
       settingsPath,
       verified: false,
-      statusLineCommand: CLAUDE_CODE_STATUS_LINE_COMMAND,
+      statusLineCommand,
       wouldWrite: merged.settings
     };
   }
@@ -488,7 +498,7 @@ export async function connectClaudeCodeStatusLine(options: ConnectClaudeCodeOpti
     status: verified ? "installed" : "verify-failed",
     settingsPath,
     verified,
-    statusLineCommand: CLAUDE_CODE_STATUS_LINE_COMMAND
+    statusLineCommand
   };
 }
 

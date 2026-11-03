@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { computeStatusLine, STATUS_LINE_PLACEHOLDER } from "../../src/cli/commands/statusline.js";
+import { computeStatusLine, STATUS_LINE_PLACEHOLDER, STATUS_LINE_WORKING } from "../../src/cli/commands/statusline.js";
 import { sessionCorrelationId } from "../../src/core/gateway/session-correlation.js";
 import { endUserRun, startUserRun } from "../../src/core/gateway/run-boundary.js";
 import type { GatewayReceipt } from "../../src/core/gateway/receipt.js";
@@ -11,6 +11,7 @@ import { currentPeriodId, periodEndUtc } from "../../src/core/entitlement/lease.
 import { communityLimitClause, UPGRADE_CTA_LABEL } from "../../src/core/upgrade-cta.js";
 import { seedOutputCalibration, TEST_OUTPUT_POLICY_VERSION } from "../helpers/output-calibration-fixture.js";
 import { writeProductMode } from "../../src/core/onboarding-preferences.js";
+import { buildHookOutputShapingTreatment, buildOutputShapingPolicy } from "../../src/core/output-shaping.js";
 
 /**
  * THE PRIMARY REGRESSION. The persistent line must describe the RUN, not whichever provider call
@@ -85,29 +86,67 @@ const STDIN = JSON.stringify({ cwd: "/some/proj", session_id: SESSION });
 const STDIN_WITH_OUTPUT = JSON.stringify({ cwd: "/some/proj", session_id: SESSION, output_tokens: 500 });
 
 describe("the persistent line describes the RUN, not the last provider call", () => {
-  it("holds one cumulative posture across apply → record → apply → record → apply", async () => {
+  /**
+   * THE LINE IS ONE COMPLETED RUN, NOT A LIVE COUNTER (0.6.11 product requirement). While a run is in
+   * flight its calls keep landing, so nothing drawn from them may reach the line: it holds the newest
+   * settled run (or a quiet non-numeric `working`), changes ONCE at Stop, and holds again for the next run.
+   */
+  it("never shows a provisional number during a run, and changes exactly once at Stop", async () => {
     const env = fullDevice();
+    await measureDevice(env);
     const c = sessionCorrelationId(SESSION, env)!;
+    const other = sessionCorrelationId("22222222-2222-4222-8222-222222222222", env)!;
+    const run1 = ledger(c);
+    // A concurrent session in the same cwd, landing inside both of this session's runs.
+    const foreign = (at: string) => receipt({
+      receipt_id: `foreign${at.slice(14, 16)}`, captured_at: at, mode: "apply", request_mutated: true,
+      estimated_input_tokens_before: 900_000, estimated_input_tokens_after: 100_000,
+      applied_components: ["lcm-compaction"], tokens: { prompt_input: 900_000, output: 50 }, session_correlation_id: other
+    });
+    const render = (receipts: GatewayReceipt[], stdin = STDIN_WITH_OUTPUT) =>
+      computeStatusLine(stdin, { env, readReceipts: async () => receipts, readReceipt: async () => receipts.at(-1) });
+
+    // First run in flight, nothing settled yet: quiet and non-numeric for EVERY landed call, and the
+    // live stdin output count never stands in for it.
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
-    const all = ledger(c);
-    const lines: string[] = [];
-    // Render after each call lands, exactly as Claude Code re-renders the status line.
-    for (let n = 1; n <= all.length; n++) {
-      const line = await computeStatusLine(STDIN, { env, readReceipts: async () => all.slice(0, n) });
-      lines.push(line ?? "");
+    const firstRun: string[] = [];
+    for (let n = 1; n <= run1.length; n++) firstRun.push((await render([...run1.slice(0, n), foreign("2026-09-01T10:56:05.000Z")]))!);
+    expect(new Set(firstRun)).toEqual(new Set([STATUS_LINE_WORKING]));
+
+    // Stop settles the run: the line changes once, to the final aggregate (input + calibrated output + minutes).
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env);
+    const settled1 = (await render([...run1, foreign("2026-09-01T10:56:05.000Z")]))!;
+    expect(settled1).toContain("input 4,550→3,800");
+    expect(settled1).toMatch(/output [\d,]+→570 \(−39\.\d%, est\.\) · \+~[\d.]+m/);
+    expect(settled1).not.toMatch(/N\/A|full apply|basic shaping|900,000|output 500/);
+
+    // The next run starts and its calls land: the settled run-1 line holds, byte for byte.
+    startUserRun(c, "2026-09-01T11:00:00.000Z", env);
+    const run2 = [
+      receipt({ receipt_id: "run2call1", captured_at: "2026-09-01T11:00:30.000Z", mode: "apply", request_mutated: true,
+        model_visible_bytes_changed: true, estimated_input_tokens_before: 1000, estimated_input_tokens_after: 900,
+        applied_components: ["lcm-compaction"], tokens: { prompt_input: 1000, output: 10 },
+        approval_status: "auto-applied-by-policy", authorization_id: "pref-1234567890abcdef12345678", session_correlation_id: c }),
+      receipt({ receipt_id: "run2call2", captured_at: "2026-09-01T11:00:45.000Z", model: "claude-sonnet-5",
+        tokens: { prompt_input: 700, output: 20 }, session_correlation_id: c })
+    ];
+    for (let n = 1; n <= run2.length; n++) {
+      expect(await render([...run1, foreign("2026-09-01T11:00:40.000Z"), ...run2.slice(0, n)])).toBe(settled1);
     }
-    // NO FLICKER: the posture never changes, and `apply off` never appears.
-    for (const line of lines) expect(line).toContain("full apply");
-    for (const line of lines) expect(line).not.toContain("apply off");
-    // CUMULATIVE: the input total grows as calls land, it does not jump to the latest call's numbers.
-    const totals = lines.map((l) => Number(/input ([\d,]+)/.exec(l)?.[1]?.replace(/,/g, "") ?? 0));
-    for (let i = 1; i < totals.length; i++) expect(totals[i]).toBeGreaterThan(totals[i - 1]);
+
+    // Run 2's Stop: one change, to run 2's own aggregate only.
+    endUserRun(c, "2026-09-01T11:01:00.000Z", env);
+    const settled2 = (await render([...run1, foreign("2026-09-01T11:00:40.000Z"), ...run2]))!;
+    expect(settled2).not.toBe(settled1);
+    expect(settled2).toContain("input 1,700→1,600");
+    expect(settled2).not.toMatch(/4,550|900,000/);
   });
 
   it("a record/no-op receipt cannot overwrite the run line with `apply off`", async () => {
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const all = ledger(c);
     // The exact frame that used to render `apply off`: the sonnet record call is the LATEST receipt.
     // `readReceipt` is supplied so that DISABLING the run path reproduces the old per-call rendering
@@ -119,7 +158,6 @@ describe("the persistent line describes the RUN, not the last provider call", ()
       readReceipt: async () => all[1]
     });
     expect(line).not.toContain("apply off");
-    expect(line).toContain("full apply");
     // And it is the RUN's numbers, not that call's 600.
     expect(line).toContain("1,600");
   });
@@ -132,7 +170,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     const line = await computeStatusLine(STDIN, { env, readReceipts: async () => ledger(c) });
     // 4,550 → 3,800 across the whole run.
     expect(line).toContain("input 4,550→3,800");
-    expect(line).toContain("full apply");
+    expect(line).toContain("output N/A→570 (N/A%, est.)");
   });
 
   it("fails closed on malformed persisted run counts while preserving independent Full input evidence", async () => {
@@ -140,6 +178,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
       const env = fullDevice();
       const c = sessionCorrelationId(SESSION, env)!;
       startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+      endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
       const malformedOutput = receipt({
         receipt_id: `badout${String(output).replace(/\D/g, "")}`,
         captured_at: "2026-09-01T10:56:00.000Z",
@@ -156,7 +195,6 @@ describe("the persistent line describes the RUN, not the last provider call", ()
       });
       const line = await computeStatusLine(STDIN, { env, readReceipts: async () => [malformedOutput] });
       expect(line).toContain("input 100→80");
-      expect(line).toContain("full apply");
       expect(line).not.toContain("output");
     }
 
@@ -167,6 +205,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
       const env = fullDevice();
       const c = sessionCorrelationId(SESSION, env)!;
       startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+      endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
       const malformedInput = receipt({
         receipt_id: "badinput",
         captured_at: "2026-09-01T10:56:00.000Z",
@@ -193,6 +232,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const malformedComponents = receipt({
       receipt_id: "badcomps",
       captured_at: "2026-09-01T10:56:00.000Z",
@@ -226,6 +266,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
       const env = fullDevice();
       const c = sessionCorrelationId(SESSION, env)!;
       startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+      endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
       const nonInputApply = receipt({
         receipt_id: "notapply",
         captured_at: "2026-09-01T10:56:00.000Z",
@@ -247,6 +288,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const legacyApply = receipt({
       receipt_id: "legacy01",
       captured_at: "2026-09-01T10:56:00.000Z",
@@ -263,7 +305,32 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     expect(legacyLine).not.toContain("full apply");
   });
 
-  it("a NEW UserPromptSubmit resets the aggregate for the new run", async () => {
+  it("an empty or not-yet-written settled run never replaces the last real result with a numberless frame", async () => {
+    const env = fullDevice();
+    const c = sessionCorrelationId(SESSION, env)!;
+    const run1 = ledger(c);
+    let reads = 0;
+    const render = () => computeStatusLine(STDIN_WITH_OUTPUT, { env,
+      readReceipts: async () => { reads++; return run1; }, readReceipt: async () => run1.at(-1) });
+    startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env);
+    const settled1 = (await render())!;
+    expect(settled1).toContain("input 4,550→3,800");
+    // Run 2 makes no provider call (a slash command, an immediate abort) - or is a hook-only run whose
+    // Stop event has not been written yet. It is open, then closed, with nothing to show.
+    startUserRun(c, "2026-09-01T11:00:00.000Z", env);
+    expect(await render()).toBe(settled1);
+    endUserRun(c, "2026-09-01T11:00:05.000Z", env);
+    expect(await render()).toBe(settled1);
+    // Run 3 in flight still holds run 1, the newest run with a result.
+    startUserRun(c, "2026-09-01T11:01:00.000Z", env);
+    reads = 0;
+    expect(await render()).toBe(settled1);
+    // Looking back past the empty run costs no extra ledger read: one read per render.
+    expect(reads).toBe(1);
+  });
+
+  it("a NEW run replaces the previous settled aggregate only at its own Stop", async () => {
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
@@ -276,8 +343,12 @@ describe("the persistent line describes the RUN, not the last provider call", ()
       applied_components: ["lcm-compaction"], tokens: { prompt_input: 1000, output: 10 },
       session_correlation_id: c
     });
+    // In flight, the new run shows nothing of its own: the previous settled run holds.
+    const open = await computeStatusLine(STDIN, { env, readReceipts: async () => [...first, second] });
+    expect(open).toContain("input 4,550→3,800");
+    // At its Stop the line resets to ONLY the new run's numbers; the previous run's 4,550 is gone.
+    endUserRun(c, "2026-09-01T11:01:00.000Z", env);
     const line = await computeStatusLine(STDIN, { env, readReceipts: async () => [...first, second] });
-    // Only the NEW run's numbers; the previous run's 4,550 is gone.
     expect(line).toContain("input 1,000→900");
     expect(line).not.toContain("4,550");
   });
@@ -287,6 +358,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     const mine = sessionCorrelationId(SESSION, env)!;
     const other = sessionCorrelationId("11111111-2222-3333-4444-555555555555", env)!;
     startUserRun(mine, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(mine, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const foreign = receipt({
       receipt_id: "foreign1", captured_at: "2026-09-01T10:56:00.000Z", mode: "apply", request_mutated: true,
       estimated_input_tokens_before: 900_000, estimated_input_tokens_after: 100_000,
@@ -326,6 +398,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const line = (await computeStatusLine(STDIN, { env, readReceipts: async () => ledger(c) }))!;
     // 100 + 10 + 150 + 10 + 300, as the provider reported it — the AFTER is exact on either rendering.
     expect(line).toContain("output N/A→570 (N/A%, est.)");
@@ -344,20 +417,89 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     await measureDevice(env);
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const line = (await computeStatusLine(STDIN, { env, readReceipts: async () => ledger(c) }))!;
     // The three proven-shaped calls use the exact 40% cohort; the two unshaped calls pass through,
     // so the whole-run reduction rounds to 39%.
-    expect(line).toMatch(/output [\d,]+→570 \(−39%, est\.\)/);
+    expect(line).toMatch(/output [\d,]+→570 \(−39\.\d%, est\.\)/);
     expect(line).not.toContain("default prior");
+  });
+
+  it("keeps compatible family provenance on the live run path without changing the output grammar", async () => {
+    const env = fullDevice();
+    const c = sessionCorrelationId(SESSION, env)!;
+    startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:56:00.000Z", env);
+    const familyCarrier = receipt({
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      receipt_id: "family01",
+      captured_at: "2026-09-01T10:55:30.000Z",
+      mode: "apply",
+      request_mutated: true,
+      model_visible_bytes_changed: true,
+      estimated_input_tokens_before: 200,
+      estimated_input_tokens_after: 100,
+      applied_components: ["lcm-compaction", "output-shaping"],
+      output_shaping_state: "already-active",
+      output_shaping_policy_version: buildHookOutputShapingTreatment().policyVersion,
+      output_shaping_regime: "default-shapeable",
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      tokens: { prompt_input: 100, output: 100 },
+      session_correlation_id: c
+    });
+
+    const line = (await computeStatusLine(STDIN, { env, readReceipts: async () => [familyCarrier] }))!;
+    // The family posterior is refined by this run's structure (one short shaped turn), so the run states
+    // its own figure instead of the posterior verbatim. The GRAMMAR is what this test guards, and it is
+    // unchanged: a before→after pair with a labelled estimated percent.
+    expect(line).toContain("output 119→100 (−16.0%, est.)");
+    // Family evidence may size the output counterfactual, but it must not enter the exact-only output
+    // term of the active-workload calculation. Its 0.5m comes solely from the exact input reduction;
+    // incorrectly relabelling the family rate as measured would render 0.61m instead.
+    expect(line).toContain("+~0.5m");
+    expect(line).not.toContain("family");
+  });
+
+  it("keeps exact evidence measured on the live run path", async () => {
+    const env = fullDevice();
+    const c = sessionCorrelationId(SESSION, env)!;
+    startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:56:00.000Z", env);
+    const exactCarrier = receipt({
+      provider: "openai",
+      model: "gpt-5.6-sol",
+      receipt_id: "exact001",
+      captured_at: "2026-09-01T10:55:30.000Z",
+      mode: "apply",
+      request_mutated: true,
+      model_visible_bytes_changed: true,
+      estimated_input_tokens_before: 200,
+      estimated_input_tokens_after: 100,
+      applied_components: ["lcm-compaction", "output-shaping"],
+      output_shaping_state: "already-active",
+      output_shaping_policy_version: buildOutputShapingPolicy().policyVersion,
+      output_shaping_regime: "default-shapeable",
+      approval_status: "auto-applied-by-policy",
+      authorization_id: "pref-1234567890abcdef12345678",
+      tokens: { prompt_input: 100, output: 100 },
+      session_correlation_id: c
+    });
+
+    const line = (await computeStatusLine(STDIN, { env, readReceipts: async () => [exactCarrier] }))!;
+    expect(line).toContain("output 133→100 (−24.8%, est.)");
+    expect(line).toContain("+~0.67m");
+    expect(line).not.toContain("family");
   });
 
   it("an `observe` setting cannot relabel a durably proven stored/full run", async () => {
     const env = openDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const line = (await computeStatusLine(STDIN, { env, readReceipts: async () => ledger(c) }))!;
     expect(line).toContain("input 4,550→3,800");
-    expect(line).toContain("full apply");
     expect(line).not.toContain("apply off");
   });
 
@@ -365,9 +507,10 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     const env = openDevice("basic");
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const line = (await computeStatusLine(STDIN, { env, readReceipts: async () => ledger(c) }))!;
     expect(line).toContain("input 4,550→3,800");
-    expect(line).toContain("full apply");
+    expect(line).toContain("output N/A→570 (N/A%, est.)");
   });
 
   /**
@@ -380,6 +523,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const line = (await computeStatusLine(STDIN, {
       env, readReceipts: async () => ({ receipts: ledger(c).slice(2), truncated: true })
     }))!;
@@ -387,13 +531,13 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     expect(line).not.toContain("→");
     expect(line).not.toContain("%");
     expect(line).toContain("output 460");
-    expect(line).toContain("full apply");
   });
 
   it("a truncated window that still reaches back before the run began is complete for this run", async () => {
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const older = receipt({ receipt_id: "older001", captured_at: "2026-09-01T10:40:00.000Z", tokens: { prompt_input: 5, output: 1 }, session_correlation_id: c });
     const line = (await computeStatusLine(STDIN, {
       env, readReceipts: async () => ({ receipts: [older, ...ledger(c)], truncated: true })
@@ -415,6 +559,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     const env = { ...fullDevice(), COMPACTION_HYPERLINKS: "0" } as NodeJS.ProcessEnv;
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const period = currentPeriodId();
     const resetsOn = periodEndUtc(period);
     const paused = receipt({
@@ -454,6 +599,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     const env = { ...fullDevice(), COMPACTION_HYPERLINKS: "0" } as NodeJS.ProcessEnv;
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const paused = receipt({
       receipt_id: "paused01", captured_at: "2026-09-01T10:55:30.000Z", tokens: { prompt_input: 10, output: 1 }, session_correlation_id: c,
       allowance_pause: { reason: "insufficient", period_id: currentPeriodId(), resets_on: periodEndUtc(currentPeriodId()) }
@@ -485,6 +631,7 @@ describe("the persistent line describes the RUN, not the last provider call", ()
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, "2026-09-01T10:55:00.000Z", env);
+    endUserRun(c, "2026-09-01T10:58:00.000Z", env); // settled: the line shows completed runs only
     const unknown = ledger(c).map((r) => {
       const copy = { ...r } as Partial<GatewayReceipt>;
       delete copy.output_shaping_state;
@@ -535,7 +682,6 @@ describe("the line holds across the gap between runs", () => {
     }))!;
     // Run N's settled aggregate, unchanged by the new prompt.
     expect(line).toContain("input 4,550→3,800");
-    expect(line).toContain("full apply");
     expect(line).not.toContain("apply off");
     // The micro-call is genuinely in the window AND is what the tail read returns — it still never
     // reaches the surface. Proof that it WOULD have: the same receipt on a session with no run state.
@@ -546,18 +692,19 @@ describe("the line holds across the gap between runs", () => {
     expect(perCall).toContain("650");
   });
 
-  it("hands the line to run N+1 as soon as its first receipt lands", async () => {
+  it("keeps run N's settled line when run N+1's first receipt lands: no provisional run N+1 number", async () => {
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, RUN1_START, env);
     endUserRun(c, RUN1_END, env);
     const all = ledger(c);
     startUserRun(c, RUN2_START, env);
-    const line = (await computeStatusLine(STDIN, {
+    const line = (await computeStatusLine(STDIN_WITH_OUTPUT, {
       env, readReceipts: async () => [...all, run2Receipt(c)], readReceipt: async () => all[3]!
     }))!;
-    expect(line).toContain("input 1,000→900");
-    expect(line).not.toContain("4,550");
+    expect(line).toContain("input 4,550→3,800");
+    expect(line).not.toContain("1,000→900");
+    expect(line).not.toContain("output 500");
   });
 
   it("settles on run N+1's completed aggregate at its Stop", async () => {
@@ -572,7 +719,8 @@ describe("the line holds across the gap between runs", () => {
       env, readReceipts: async () => [...all, run2Receipt(c)], readReceipt: async () => all[3]!
     }))!;
     expect(line).toContain("input 1,000→900");
-    expect(line).toContain("full apply");
+    expect(line).toContain("output 10");
+    expect(line).toContain("+~0.11m");
     expect(line).not.toContain("4,550");
   });
 
@@ -582,7 +730,7 @@ describe("the line holds across the gap between runs", () => {
    * must not take the surface, because it describes a single provider call rather than the user's run.
    * With no stdin count to fall back on either, the honest render is silence.
    */
-  it("renders the quiet placeholder, not the last receipt, when no run has receipts", async () => {
+  it("renders the quiet working/placeholder state, not the last receipt, when no run has receipts", async () => {
     const env = fullDevice();
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, RUN1_START, env);
@@ -590,7 +738,10 @@ describe("the line holds across the gap between runs", () => {
     const line = await computeStatusLine(STDIN, {
       env, readReceipts: async () => [], readReceipt: async () => micro
     });
-    expect(line).toBe(STATUS_LINE_PLACEHOLDER);
+    expect(line).toBe(STATUS_LINE_WORKING);
+    endUserRun(c, RUN1_END, env);
+    expect(await computeStatusLine(STDIN, { env, readReceipts: async () => [], readReceipt: async () => micro }))
+      .toBe(STATUS_LINE_PLACEHOLDER);
     // Proof the receipt WOULD have rendered: the same receipt on a session with no run state.
     expect(micro.tokens?.prompt_input).toBe(650);
     const perCall = (await computeStatusLine(JSON.stringify({ cwd: "/some/proj" }), {
@@ -600,30 +751,21 @@ describe("the line holds across the gap between runs", () => {
   });
 
   /**
-   * THE HOOKS-ONLY DEVICE MUST KEEP ITS LINE. Run ownership is scoped to the per-call receipt rung; the
-   * stdin OUTPUT-ONLY rung stays reachable because it reports the host's own count for the very turn
-   * being rendered, so it can resurrect no past call.
-   *
-   * This is not a corner case — it is the whole subscription/output-shaping segment. `UserPromptSubmit`
-   * opens a run on EVERY prompt, and `connect` installs that hook alongside this status line, while a
-   * device with no gateway writes no receipts at all. Gating this rung on run ownership too rendered the
-   * placeholder on every turn, permanently, for the devices whose only apply lever is output shaping.
+   * A HOOKS-ONLY RUN NEVER SHOWS THE LIVE STDIN COUNT. Claude Code's `current_usage.output_tokens` is the
+   * host's count for the response in flight; it moves during the task and is not a run result. A
+   * hooks-only run settles through its Stop transcript event (see the task-notification suite); with no
+   * such event the line stays quiet rather than presenting a per-response count as the run.
    */
-  it("renders the stdin output-only line for a hooks-only device: run state, no receipts ever", async () => {
+  it("a hooks-only run with a run boundary never renders the moving stdin output count", async () => {
     const env = openDevice("basic");
     const c = sessionCorrelationId(SESSION, env)!;
     startUserRun(c, RUN1_START, env);
-    const open = (await computeStatusLine(STDIN_WITH_OUTPUT, {
-      env, readReceipts: async () => [], readReceipt: async () => undefined
-    }))!;
-    expect(open).toContain("output 500");
-    expect(open).not.toBe(STATUS_LINE_PLACEHOLDER);
-    // And after `Stop`, when the run is settled and there is still nothing in any ledger to aggregate.
+    const open = await computeStatusLine(STDIN_WITH_OUTPUT, { env, readReceipts: async () => [], readReceipt: async () => undefined });
+    expect(open).toBe(STATUS_LINE_WORKING);
     endUserRun(c, RUN1_END, env);
-    const settled = (await computeStatusLine(STDIN_WITH_OUTPUT, {
-      env, readReceipts: async () => [], readReceipt: async () => undefined
-    }))!;
-    expect(settled).toContain("output 500");
+    const settled = await computeStatusLine(STDIN_WITH_OUTPUT, { env, readReceipts: async () => [], readReceipt: async () => undefined });
+    expect(settled).toBe(STATUS_LINE_PLACEHOLDER);
+    expect(settled).not.toContain("output 500");
   });
 
   it("a session with NO run-boundary state still reaches the stdin output-only fallback", async () => {

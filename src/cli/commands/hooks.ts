@@ -20,9 +20,12 @@ import { homedir } from "node:os";
 import path from "node:path";
 import chalk from "chalk";
 import { Command } from "commander";
+import { codexHookReviewNotice } from "../../core/codex-hook-trust.js";
+import { compactionCommand } from "../../core/compaction-command.js";
+import { owningManagedLauncher } from "../../core/update/ownership.js";
 import {
-  CLAUDE_CODE_HOOK_COMMAND,
-  CLAUDE_CODE_BEFORE_CALL_HOOK_COMMAND,
+  BEFORE_CALL_HOOK_ARGS,
+  STOP_HOOK_ARGS,
   installStopHook,
   installBeforeCallHook,
   uninstallStopHook,
@@ -129,9 +132,10 @@ async function installSubscriptionShapingHook(tool: SubscriptionHookTool, option
 
   const event = tool === "codex" ? "UserPromptSubmit (per-prompt)" : "sessionStart (session-level)";
   console.log(`  target config:   ${file}${existed ? "" : " (will be created)"}`);
-  console.log(`  shaping hook:    ${shapingHookCommand(tool)}  (${event})`);
+  const launcher = owningManagedLauncher();
+  console.log(`  shaping hook:    ${shapingHookCommand(tool, launcher)}  (${event})`);
   if (tool === "codex") {
-    console.log(`  Stop line:       ${codexTurnLineCommand()}  (settled evidence only when recorded; otherwise no message)`);
+    console.log(`  Stop line:       ${codexTurnLineCommand(launcher)}  (settled evidence only when recorded; otherwise no message)`);
   }
   console.log("  posture:         content-free; fail-open (never breaks the tool); merge-not-replace; AUTO-APPLY (default-on).");
   // Report what THIS build's hook actually does, for THIS tool, and promise nothing beyond it.
@@ -183,6 +187,7 @@ async function installSubscriptionShapingHook(tool: SubscriptionHookTool, option
     return;
   }
   console.log(chalk.green(`  Installed.${result.backupPath ? ` Backup: ${result.backupPath}` : ""}`));
+  if (tool === "codex" && (result.pinned ?? 0) > 0) console.log(`  ${codexHookReviewNotice()}`);
   console.log(chalk.gray(`  Uninstall anytime: compaction hooks uninstall --tool ${tool}${options.settings ? ` --settings ${file}` : options.local && tool === "codex" ? " --local" : ""}`));
 }
 
@@ -260,11 +265,12 @@ export function registerHooksCommand(program: Command): void {
       console.log(chalk.cyan("compaction hooks install"));
       const file = resolveSettingsPath(options);
       const { settings, existed } = await readSettings(file);
+      const launcher = owningManagedLauncher();
       let result;
       try {
-        result = installStopHook(settings);
+        result = installStopHook(settings, launcher);
         // The before-call hook merges on TOP of the Stop result (both merge-not-replace, both idempotent).
-        if (options.beforeCall) result = installBeforeCallHook(result.settings);
+        if (options.beforeCall) result = installBeforeCallHook(result.settings, launcher);
       } catch (error) {
         console.error(chalk.red(`  Not installed: ${error instanceof Error ? error.message : String(error)}`));
         process.exitCode = 1;
@@ -272,9 +278,9 @@ export function registerHooksCommand(program: Command): void {
       }
 
       console.log(`  target settings: ${file}${existed ? "" : " (will be created)"}`);
-      console.log(`  Stop hook:       ${CLAUDE_CODE_HOOK_COMMAND}  (measurement, content-free, post-session)`);
+      console.log(`  Stop hook:       ${compactionCommand(STOP_HOOK_ARGS, launcher)}  (measurement, content-free, post-session)`);
       if (options.beforeCall) {
-        console.log(`  before-call:     ${CLAUDE_CODE_BEFORE_CALL_HOOK_COMMAND}  (UserPromptSubmit; recommendation-only, content-free, silent)`);
+        console.log(`  before-call:     ${compactionCommand(BEFORE_CALL_HOOK_ARGS, launcher)}  (UserPromptSubmit; recommendation-only, content-free, silent)`);
       }
       console.log("  posture:         content-free; fail-open (never breaks Claude Code); merge-not-replace; nothing is applied to your prompts.");
 

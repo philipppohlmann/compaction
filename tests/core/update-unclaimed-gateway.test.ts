@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import fs, { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { assertEmptyUnclaimedGatewayRegistry, bootstrapManagedInstall, inventoryRelease, loadManagedInstallation } from "../../src/core/update/ownership.js";
+import { assertEmptyUnclaimedGatewayRegistry, assertOwnedDirectory, bootstrapManagedInstall, inventoryRelease, loadManagedInstallation } from "../../src/core/update/ownership.js";
 import { currentReleaseCompatibility } from "../../src/core/update/compatibility.js";
 import { createPair } from "../../src/core/update/pair.js";
 import { stageLocalArtifact } from "../../src/core/update/package-stage.js";
@@ -169,5 +170,69 @@ describe("empty external Gateway registry during explicit managed adoption", () 
     expect(readFileSync(path.join(f.root, "install.json"))).toEqual(before);
     if (kind === "file") expect(readFileSync(f.directory, "utf8")).toBe("preserve");
     if (["wrong-owner", "0770", "0702"].includes(kind)) expect(readFileSync(path.join(f.directory, "registered.json"), "utf8")).toBe("preserve");
+  });
+});
+
+describe("stale Gateway records left by dead processes", () => {
+  /** A record shaped exactly like `registerGatewayInstance` writes, for the given PID. */
+  function record(directory: string, pid: number, mode = 0o600): string {
+    const instanceId = randomBytes(24).toString("hex");
+    const target = path.join(directory, `${instanceId}.json`);
+    writeFileSync(target, JSON.stringify({ pid, host: "127.0.0.1", port: 1, release: { instanceId,
+      controlCapability: randomBytes(32).toString("hex"), cliVersion: "0.6.10", protocolVersion: 1, pairId: "pair" } }) + "\n", { mode });
+    chmodSync(target, mode);
+    return target;
+  }
+  /** A PID the OS has definitively reaped. */
+  function deadPid(): number {
+    const pid = spawnSync("/bin/sh", ["-c", "exit 0"]).pid;
+    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    return pid;
+  }
+
+  it("removes only structurally valid private records whose process is gone, then admits adoption", async () => {
+    const f = fixture(); mkdirSync(f.directory, { mode: 0o700 });
+    for (let i = 0; i < 20; i++) record(f.directory, deadPid());
+    assertEmptyUnclaimedGatewayRegistry(f.root);
+    expect(readdirSync(f.directory)).toEqual([]);
+    await bootstrapManagedInstall(f.root, f.pair(), { launcherPath: f.launcher });
+    expect(existsSync(path.join(f.root, "install.json"))).toBe(true);
+  });
+
+  it("keeps live, malformed, unrecognized, and non-private records and stays fail-closed", () => {
+    const f = fixture(); mkdirSync(f.directory, { mode: 0o700 });
+    const dead = record(f.directory, deadPid());
+    const kept = [
+      record(f.directory, process.pid),
+      record(f.directory, deadPid(), 0o644),
+      path.join(f.directory, `${randomBytes(24).toString("hex")}.json`),
+      path.join(f.directory, "registered.json")
+    ];
+    writeFileSync(kept[2], JSON.stringify({ pid: deadPid() }), { mode: 0o600 });
+    // Dead PID and a plausible identity, but not the full registered shape: not provably ours.
+    const partialId = randomBytes(24).toString("hex");
+    const partial = path.join(f.directory, `${partialId}.json`);
+    writeFileSync(partial, JSON.stringify({ pid: deadPid(), release: { instanceId: partialId, controlCapability: randomBytes(32).toString("hex") } }), { mode: 0o600 });
+    kept.push(partial);
+    writeFileSync(kept[3], "preserve", { mode: 0o600 });
+    expect(() => assertEmptyUnclaimedGatewayRegistry(f.root)).toThrow(/still holds 5 record\(s\).*Stop any running Compaction Gateway/);
+    expect(existsSync(dead)).toBe(false);
+    for (const target of kept) expect(existsSync(target)).toBe(true);
+  });
+});
+
+describe("owned-directory refusal names the directory and the safe fix", () => {
+  it("keeps refusing a group-writable launcher directory and says exactly why", () => {
+    const f = fixture(); const directory = path.join(path.dirname(f.root), "shared-bin");
+    mkdirSync(directory); chmodSync(directory, 0o775);
+    expect(() => assertOwnedDirectory(directory)).toThrow(
+      `Managed storage directory ownership or permissions cannot be verified: ${directory} is writable by group or others (mode 0775). `
+      + `Remove that access with \`chmod go-w '${directory}'\`, or install into a prefix only you can write (COMPACTION_PREFIX).`);
+    chmodSync(directory, 0o755);
+    expect(() => assertOwnedDirectory(directory)).not.toThrow();
+    // A quote in the path stays inside one shell argument in the printed remedy.
+    const quoted = path.join(path.dirname(f.root), "it's; touch pwned");
+    mkdirSync(quoted); chmodSync(quoted, 0o775);
+    expect(() => assertOwnedDirectory(quoted)).toThrow(`chmod go-w '${path.dirname(f.root)}/it'\\''s; touch pwned'`);
   });
 });

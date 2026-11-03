@@ -2,16 +2,25 @@ import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { generateShimScript, resolveShimDir, SHIM_TOOLS, type ShimTool } from "../tool-shim.js";
+import { pinOwnedNativeHookCommands } from "./native-hook-pinning.js";
 import { containedPath, loadManagedInstallation, sha256 } from "./ownership.js";
 import { atomicWrite, withManagedLock } from "./state.js";
 
 interface MigrationEntry { target: string; backup: string; before: string; after: string; status: "prepared" | "written" | "reverted" | "conflict" }
 interface MigrationRecord { schema: 1; id: string; integrationSchema: 1; entries: MigrationEntry[] }
 
-/** Exact owned-shim migration. Native hook commands already use stable `compaction` identity. */
+/**
+ * Point owned integrations at the managed launcher: Claude Code and Cursor native hook/status-line
+ * commands (rewritten in place, never journaled; the launcher form stays valid across every version the
+ * launcher selects) and shims (exact owned-shim migration, journaled for rollback). Codex hooks are not
+ * pinned here: this path runs silently and a rewritten Codex hook stays inert until reviewed in Codex.
+ * Returns the shim migration id, if any.
+ */
 export async function migrateOwnedIntegrations(root: string, env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
   return withManagedLock(root, () => {
     const { receipt } = loadManagedInstallation(root, false);
+    // Codex is left to explicit update/connect, which can tell the user about Codex's hook review.
+    pinOwnedNativeHookCommands(receipt.launcherPath, { codex: false }, env);
     const directory = resolveShimDir(env);
     const recordPath = path.join(directory, ".shim-record.json");
     if (!existsSync(recordPath)) return undefined;

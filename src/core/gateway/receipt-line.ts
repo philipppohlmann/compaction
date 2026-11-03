@@ -7,14 +7,11 @@
  *
  * Grammar (fields OMITTED when unavailable, never fabricated):
  *   compaction · [observed input N | input B→A (−PP%) | input paused] · output N · [<value-clause>] ·
- *     [<tier-label>] · [Community limit resets <YYYY-MM-DD>[ · Upgrade to Pro ↗]] · id <8hex>
+ *     [apply off] · [Community limit resets <YYYY-MM-DD>[ · Upgrade to Pro ↗]] · id <8hex>
  *
- * TIER LABELS (open-core):
- *   - `apply off`      (Open observe)   — no model-visible mutation.
- *   - `basic shaping`  (Open basic)     — the ONE public deterministic output-shaping method.
- *   - `full apply`     (Community full) — private-engine adaptive apply; the label may ONLY ride a REAL
- *     full-apply receipt (a real input before→after). It is
- *     emitted ONLY from the community full-apply builder (never synthesized on an Open line).
+ * TIER DISPLAY (open-core):
+ *   - `apply off` (Open observe) — no model-visible mutation.
+ *   - Basic and full tiers remain part of the receipt state but do not add a posture label to this line.
  * Open lines carry the `observed input N` prefix (Open never compacts input, so it never shows a
  * before→after reduction). The `input B→A (−PP%)` reduction form is reserved for a REAL apply.
  *
@@ -22,7 +19,7 @@
  *  - The input REDUCTION clause (`input 41,210→21,876 (−47%)`) appears ONLY for a REAL apply before→after
  *    (apply mode, request actually mutated) that already exists on the receipt. The `−PP%` reduction glyph
  *    appears ONLY here UNLABELED. An output percent exists too but ALWAYS carries the `est.` label (its
- *    before is reconstructed, not measured) and ONLY when exact-key confirmed A/B evidence backs the rate. Never
+ *    before is reconstructed, not measured) and ONLY when exact or compatible-family calibration backs the rate. Never
  *    synthesized. Open shows `observed input N` (a plain count, no reduction). Provider prompt-cache is
  *    NOT surfaced on this line: it is a provider fact, not a Compaction reduction, and carrying it here
  *    invites the "Compaction reduced my tokens" misread.
@@ -32,9 +29,9 @@
  *        hardcoded; OMITTED when pricing/model/usage is missing, and when the amount would round below
  *        one cent (never `−$0.00`). Labeled `(list price)` because the basis is the PUBLISHED rate — not
  *        an invoice, and not net of the provider's prompt cache.
- *  - OUTPUT carries the saving: `output 652→512 (−21%, est.)`. The AFTER is real
+ *  - OUTPUT carries the saving: `output 652→512 (−21.5%, est.)`. The AFTER is real
  *    provider-reported output; the BEFORE is DERIVED from the reduction rate, which is why it carries an
- *    estimate label and the input arrow does not. THE ARROW REQUIRES EXACT CONFIRMED MEASUREMENT. Any
+ *    estimate label and the input arrow does not. THE ARROW REQUIRES CALIBRATED EVIDENCE. Any
  *    proven-shaped turn without applicable evidence renders `output N/A→N (N/A%, est.)`; only a turn
  *    not proven shaped stays plain. The percent is dropped when integer rounding would reach `−0%`
  *    or `−100%`, since either would contradict the pair shown.
@@ -88,24 +85,25 @@ export const RECEIPT_LINE_ENV = "COMPACTION_RECEIPT_LINE";
  * counted, which is the whole failure: a disclosure printed next to a specific per-run number does not
  * withdraw it. So the rule is now enforced by the ARROW and not by a label. A default-prior basis renders
  * NO arrow (see `outputClause`), the second marker is gone, and this one means what it says — an estimate
- * built on an exact-key rate confirmed by empirical evidence.
+ * built on exact measured or strictly compatible family-calibrated evidence.
  */
 export const CALIBRATED_ESTIMATE_MARKER = "est." as const;
 
 /**
  * Whose evidence backs the estimate. It gates the arrow rather than choosing its label: `"measured"` (this
- * shared/local exact confirmed A/B) may render one; `"default-prior"` (the internal starting rate) may not.
+ * shared/local exact confirmed A/B or `"family-calibrated"` evidence may render one;
+ * `"default-prior"` (the internal generic starting rate) may not.
  */
-export type OutputEstimateBasis = "measured" | "default-prior";
+export type OutputEstimateBasis = "measured" | "family-calibrated" | "default-prior";
 
 /**
- * WHAT THE EXACT APPLICABILITY KEY RESOLVES about its shaping rate — the second half of the estimate's provenance, and
+ * WHAT THE APPLICABILITY KEY RESOLVES about its shaping rate — the second half of the estimate's provenance, and
  * the half that decides whether an UNMEASURED axis is shown as unknown or not shown at all. Mirrors
  * `CalibrationState` in `output-shaping-calibration-store.ts` (declared here rather than imported, the
  * same way `OutputEstimateBasis` mirrors `CalibrationBasis`, so the formatter keeps no dependency on the
  * store).
  *
- * `unseeded` / `calibrating` ⇒ we have no exact rate yet. `measured-no-effect` ⇒ evidence measured and the
+ * `unseeded` / `calibrating` ⇒ we have no compatible rate yet. `measured-no-effect` ⇒ exact evidence measured and the
  * answer was "shaping did not reduce output here". Those are opposite epistemic positions that happen to
  * share an empty percentage, and `outputClause` renders them differently for exactly that reason.
  */
@@ -178,16 +176,12 @@ function compactTokens(n: number): string {
 }
 
 /**
- * The open-core tier/apply-posture label the line carries:
- *  - `observe`   → `apply off`      (Open, no model-visible mutation)
- *  - `basic`     → `basic shaping`  (Open, the one public deterministic output-shaping method)
- *  - `full`      → `full apply`     (Community private-engine adaptive apply; DEFINED now, emitted only
- *                                    from a successful stored-policy private LCM receipt — never on an Open line)
- * The label is content-free (a fixed enum string, never a count or content).
+ * The open-core tier/apply posture retained by line builders and settled events. `observe` renders
+ * `apply off`; `basic` and `full` keep their internal values without adding posture words to the line.
  */
 export type ReceiptTier = "observe" | "basic" | "full";
 
-/** The exact, content-free label rendered for each tier. Frozen strings (the binding-doc grammar). */
+/** Frozen content-free tier labels retained for internal compatibility. Only `observe` renders here. */
 export const RECEIPT_TIER_LABELS: Record<ReceiptTier, string> = {
   observe: "apply off",
   basic: "basic shaping",
@@ -195,13 +189,11 @@ export const RECEIPT_TIER_LABELS: Record<ReceiptTier, string> = {
 };
 
 /**
- * How an OPEN line is rendered: always the Open input vocabulary (`observed input N`, never a
- * reduction), with a tier label that is either named or DELIBERATELY ABSENT.
+ * How an OPEN line is classified: every value selects the Open input vocabulary (`observed input N`,
+ * never a reduction). `observe` also renders `apply off`; `basic` and `unlabeled` add no posture text.
  *
- * `"unlabeled"` exists so a caller can drop the label WITHOUT changing anything else on the line.
- * The label and the input vocabulary used to be one argument, so a surface that could not prove a
- * tier had to choose between asserting one and silently re-wording its input clause. They are
- * separate decisions and are now separate values.
+ * `"unlabeled"` remains distinct from a proven `basic` classification so callers retain the evidence
+ * decision without changing the visible input vocabulary.
  */
 export type OpenLineRendering = "observe" | "basic" | "unlabeled";
 
@@ -225,12 +217,12 @@ export type OpenLineRendering = "observe" | "basic" | "unlabeled";
  * truthful `absent` onto a turn that really was shaped, and this function then reports `false` for it.
  * That is the correct trade for the callers here — silence on a turn we cannot attribute beats an arrow
  * on a turn that had no saving — but it is a real false negative, not a neutral one, and it costs the
- * Stop hook (`capture-claude-code.ts`) a label on a prompt-shaped turn it could once claim. Accepted:
+ * Stop hook (`capture-claude-code.ts`) a shaped-output axis on a prompt-shaped turn. Accepted:
  * `absent` is the engine measuring the bytes it forwarded, and no surface should print over that.
  * The live statusline deliberately does NOT share this rule (`statusline.ts`, `shapedThisTurn`): it
  * pairs a per-turn hook record with the receipt in one place and can prefer the stronger of the two.
  *
- * One rule for the arrow and the label, so the two can never disagree about the same receipt.
+ * One rule for the shaped-output axis and the internal Open classification.
  */
 export function outputShapingActiveForTurn(receipt: GatewayReceipt, liveShapedTurn: boolean): boolean {
   const state = receipt.output_shaping_state;
@@ -239,7 +231,7 @@ export function outputShapingActiveForTurn(receipt: GatewayReceipt, liveShapedTu
 }
 
 /**
- * The tier label THIS RECEIPT proves, or undefined when it proves none.
+ * The internal Open classification THIS RECEIPT proves, or undefined when it proves none.
  *
  * The one Open posture a gateway receipt can establish is that output shaping was ACTIVE on the
  * final model-visible request: `output_shaping_state` of `attached-this-pass` (the gateway attached
@@ -249,8 +241,8 @@ export function outputShapingActiveForTurn(receipt: GatewayReceipt, liveShapedTu
  * statement about THAT turn, so it stays true however the device is configured later.
  *
  * This used to read `request_mutated` + an `output-shaping` entry in `applied_components`, which
- * answers "did THIS PASS mutate", and withheld the label on the ordinary `already-active` turn while
- * the adjacent arrow — a stronger claim — rode the state. The state is the stronger evidence of the
+ * answers "did THIS PASS mutate", and withheld the shaping classification on the ordinary
+ * `already-active` turn while the adjacent arrow — a stronger claim — rode the state. The state is the stronger evidence of the
  * two: it is measured against the full current policy at instruction-level carriers only, whereas a
  * mutation record says nothing about what the model finally read.
  *
@@ -258,7 +250,7 @@ export function outputShapingActiveForTurn(receipt: GatewayReceipt, liveShapedTu
  * establishes nothing and licenses nothing — the final request is not retained anywhere, so it cannot
  * be classified after the fact; fail closed. And an explicit `absent` establishes only that the policy
  * was not on the request, which is not the same as "no model-visible mutation": stamping `apply off`
- * there would convert an unverified label into a false one. Callers omit instead.
+ * there would convert unverified evidence into a false visible posture. Callers omit instead.
  */
 export function receiptProvenOpenLabel(receipt: GatewayReceipt): "basic" | undefined {
   return outputShapingActiveForTurn(receipt, false) && receipt.estimated_input_tokens_before === undefined
@@ -267,30 +259,30 @@ export function receiptProvenOpenLabel(receipt: GatewayReceipt): "basic" | undef
 }
 
 /**
- * The Open rendering for ONE turn: the label the receipt proves, else — only when the receipt records
- * no state at all — the label the LIVE turn's own shaped-evidence supports, else no label at all.
+ * The Open classification for ONE turn: use receipt proof first, then — only when the receipt records
+ * no state at all — the LIVE turn's own shaped evidence, else `unlabeled`.
  *
  * THE RECEIPT'S STATE IS AUTHORITATIVE WHEN PRESENT (see `outputShapingActiveForTurn`): a receipt that
- * says `absent` is never relabelled `basic shaping` from session state, however the session recorded
+ * says `absent` is never reclassified as `basic` from session state, however the session recorded
  * the turn. The fallback exists for the legacy receipt with no state.
  *
  * `liveShapedTurn` may be true ONLY for a turn that just happened, where the prompt hook's own record
  * of what it decided describes THIS turn (`lastTurnWasShaped`). It is the same evidence the adjacent
- * output arrow uses, so label and arrow cannot disagree. Every historical/replayed receipt passes
+ * output arrow uses, so attribution and the arrow cannot disagree. Every historical/replayed receipt passes
  * false — the current shaping decision says nothing about a turn from three days ago.
  *
- * THE LIVE FALLBACK NEVER LABELS AN INPUT-APPLY RECEIPT. A receipt carrying an input before→after is
- * a full apply, which is the community builder's line and not an Open one; the prompt hook having
- * also shaped that turn does not make `basic shaping` a true description of it, and the Open
+ * THE LIVE FALLBACK NEVER CLASSIFIES AN INPUT-APPLY RECEIPT AS OPEN BASIC. A receipt carrying an input
+ * before→after is a full apply, which is the community builder's line and not an Open one; the prompt hook having
+ * also shaped that turn does not make it an Open basic turn, and the Open
  * rendering would suppress the measured reduction the receipt actually carries. So an input-apply
- * receipt can only ever take a label the RECEIPT proves — which, by `receiptProvenOpenLabel`, is
+ * receipt can only ever take a classification the RECEIPT proves — which, by `receiptProvenOpenLabel`, is
  * none.
  *
  * CALLERS, and one that is NOT a caller: `watch` (replay + live) and the Claude Code Stop hook route
- * every label through here. `compaction statusline` does NOT — it derives its own label from the
+ * their Open classification through here. `compaction statusline` does NOT — it derives its own tier from the
  * device's product mode, and deliberately renders `apply off` for an observe device, which this
  * function never emits. So this is one rule for the surfaces that call it, not a repo-wide one; do
- * not read it as a guarantee that no surface can label the same receipt differently.
+ * not read it as a guarantee that no surface can classify the same receipt differently.
  */
 export function openLineForTurn(receipt: GatewayReceipt, liveShapedTurn: boolean): OpenLineRendering {
   // ROUTED THROUGH `receiptProvenOpenLabel`, not a second copy of its predicate. The gateway's own
@@ -299,9 +291,9 @@ export function openLineForTurn(receipt: GatewayReceipt, liveShapedTurn: boolean
   // this module exists to prevent.
   const proven = receiptProvenOpenLabel(receipt);
   if (proven !== undefined) return proven;
-  // THE FALLBACK IS GUARDED ON ABSENCE OF STATE, not merely on the label being unproven: `absent` is a
+  // THE FALLBACK IS GUARDED ON ABSENCE OF STATE, not merely on the classification being unproven: `absent` is a
   // measurement, and reaching past it to the session flag is how an explicit "not shaped" turn gets
-  // relabelled `basic shaping`.
+  // reclassified as `basic`.
   if (receipt.output_shaping_state !== undefined) return "unlabeled";
   if (liveShapedTurn && receipt.estimated_input_tokens_before === undefined) return "basic";
   return "unlabeled";
@@ -334,9 +326,8 @@ export interface ReceiptLineFields {
    */
   inputAxisOwned?: boolean;
   /**
-   * The open-core tier/apply-posture label to render (`apply off` / `basic shaping` / `full apply`).
-   * Content-free fixed enum string. `full` renders `full apply` and is EMITTED ONLY from a real
-   * full-apply receipt (the community builder); it must never ride an Open line. Omitted → no label.
+   * The open-core tier/apply posture. `observe` renders `apply off`; `basic` and `full` remain available
+   * to callers without adding a posture label to the receipt line. Omitted → no label.
    */
   tier?: ReceiptTier;
   /**
@@ -373,8 +364,8 @@ export interface ReceiptLineFields {
   estimatedActiveMinutesSaved?: number;
   /**
    * Estimated OUTPUT tokens saved on THIS shaped turn. Turns the output clause into a before→after:
-   * `output 652→512 (−21%, est.)`, where BEFORE = this count + the real output. Derived by the caller from
-   * the shared exact calibration rate applied to THIS line's own output (never a session-wide sum); this
+   * `output 652→512 (−21.5%, est.)`, where BEFORE = this count + the real output. Derived by the caller from
+   * the exact-first compatible calibration rate applied to THIS line's own output (never a session-wide sum); this
    * module only renders it. Supply it on any surface that knows the turn was shaped — hook-only AND
    * gateway/apply lines. When `estimatedOutputSavedCalibrated` is false, explicit unseeded state renders
    * `output N/A→N`; no numeric arrow or fabricated before is possible.
@@ -394,8 +385,8 @@ export interface ReceiptLineFields {
   estimatedOutputSavedRequested?: boolean;
   /**
    * PROVENANCE of the estimated-saved rate. `"default-prior"` SUPPRESSES the arrow entirely — the shipped
-   * starting rate may back an internal estimate but never a rendered per-run figure — and `"measured"` (or
-   * absent, the pre-existing default for callers that only ever pass their own measurement) allows it.
+   * starting rate may back an internal estimate but never a rendered per-run figure — while `"measured"`,
+   * `"family-calibrated"`, or absent (legacy callers with their own measurement) allows it.
    * It used to choose between two labels on an arrow that rendered either way.
    */
   estimatedOutputSavedBasis?: OutputEstimateBasis;
@@ -415,7 +406,7 @@ export interface ReceiptLineFields {
    *
    * BOTH A PAUSE SIGNAL AND THE RENDERED DATE. `inputPaused` treats this field as sufficient evidence
    * that the turn was refused for allowance, which is what turns the input axis into `input paused`,
-   * suppresses a `full apply` label, and raises the ceiling clause — and the clause it raises PRINTS
+   * prevents a full-apply rendering, and raises the ceiling clause — and the clause it raises PRINTS
    * this value (`Community limit resets 2026-09-01`, see `ceilingClause`). It is the one fact the
    * rest of the line cannot express: `input paused` says the capability is gone, and only the date
    * says it comes back. The detail surfaces still state it in a sentence ("It resumes 2026-09-01." on
@@ -599,8 +590,8 @@ function applyCeiling(fields: ReceiptLineFields, ceiling: ReceiptLineCeiling | u
 /**
  * Was THIS turn's input optimization paused for allowance? Either field is sufficient: the receipt-borne
  * `allowancePauseReason` (set per-turn by the gateway, and the only one that can express `insufficient`),
- * or the session-level `allowanceResetsOn` the Open builder resolves. One predicate, so the input axis,
- * the tier label and the ceiling clause cannot disagree about the same turn.
+ * or the session-level `allowanceResetsOn` the Open builder resolves. One predicate keeps the input
+ * axis and ceiling clause consistent for the same turn.
  */
 function inputPaused(f: ReceiptLineFields): boolean {
   return f.allowancePauseReason !== undefined || f.allowanceResetsOn !== undefined;
@@ -637,15 +628,10 @@ function inputClause(f: ReceiptLineFields): string | undefined {
   return undefined;
 }
 
-/** The tier/apply-posture label clause (`apply off` / `basic shaping` / `full apply`). Omitted when unset. */
+/** The visible apply-posture clause. Only observe mode renders `apply off`. */
 function tierClause(f: ReceiptLineFields): string | undefined {
-  if (f.tier === undefined) return undefined;
-  // A PAUSED TURN IS NOT A FULL APPLY. `isRealApply` is true here — output shaping mutated the request
-  // — so the community builder still produces the line, and it used to end `· full apply` on a turn
-  // whose input optimization had been refused for allowance. The Open labels are NOT suppressed:
-  // `apply off` is exactly what a ceiling refusal means, and the ceiling clause right after it says why.
-  if (f.tier === "full" && inputPaused(f)) return undefined;
-  return RECEIPT_TIER_LABELS[f.tier];
+  if (f.tier !== "observe") return undefined;
+  return RECEIPT_TIER_LABELS.observe;
 }
 
 /**
@@ -664,7 +650,7 @@ function tierClause(f: ReceiptLineFields): string | undefined {
  *  - THE PAUSE — `inputClause` renders `input paused` from the same `inputPaused` predicate, so
  *    `input optimization paused` was the same fact in the next breath.
  *  - THE SHAPING — a paused turn that was shaped still draws its output arrow
- *    (`output 652→512 (−21%, est.)`). That is the measurement; `output shaping continues` was the
+ *    (`output 652→512 (−21.5%, est.)`). That is the measurement; `output shaping continues` was the
  *    caption under it, and a caption is the weaker of the two.
  *
  * The date was the only one of the three the line could not otherwise express, so it is the only one
@@ -768,7 +754,7 @@ function applyAllowanceSnapshot(fields: ReceiptLineFields, receipt: GatewayRecei
 export { upgradeNoticeLines, type UpgradeNoticeInput } from "../upgrade-cta.js";
 
 /**
- * Output, as a before→after when a MEASURED saving backs it; otherwise a plain count.
+ * Output, as a before→after when calibrated exact or family evidence backs it; otherwise a plain count.
  *
  * The AFTER is this turn's real, provider-reported output. The BEFORE is DERIVED — actual + the
  * calibrated estimate of what shaping removed — because the unshaped turn was never generated. That is
@@ -825,20 +811,26 @@ function outputClause(f: ReceiptLineFields): string | undefined {
   // The percentage is derived from the SAME pair shown, so the arrow and the % can never disagree.
   // The estimate label is what separates this from the input clause's measured `−PP%` — same glyph,
   // different provenance, and the label is the only thing carrying that difference to the reader. It is
-  // unconditional now: an arrow reaching this point is backed by exact-key confirmed A/B evidence, because a prior
-  // was refused above.
+  // unconditional now: an arrow reaching this point is backed by exact measured or compatible-family
+  // calibration, because the generic prior was refused above.
   const marker = CALIBRATED_ESTIMATE_MARKER;
   //
-  // INTEGER ROUNDING MUST NOT REACH AN IMPOSSIBLE ENDPOINT. One saved
-  // token out of 1,000 rounds to `−0%`, which erases a real saving; a large ratio rounds to `−100%`,
-  // which claims the whole output was removed while the pair plainly shows tokens remaining. Both
-  // contradict the arrow beside them, so the percent is DROPPED at those endpoints and the arrow —
-  // which is exact — stands alone. Same principle as the sub-cent cost clause: omit rather than
-  // render a number that says something untrue.
-  const percent = Math.round(((saved as number) / before) * 100);
+  // ROUNDING MUST NOT REACH AN IMPOSSIBLE ENDPOINT. A saving that rounds to `−0.0%` erases a real
+  // saving; a large ratio rounding to `−100.0%` claims the whole output was removed while the pair
+  // plainly shows tokens remaining. Both contradict the arrow beside them, so the percent is DROPPED at
+  // those endpoints and the arrow — which is exact — stands alone. Same principle as the sub-cent cost
+  // clause: omit rather than render a number that says something untrue.
+  //
+  // ONE DECIMAL, not an integer. The rate is refined by run morphology, so neighbouring runs can
+  // differ by well under a point; integer rounding would collapse those distinct estimates onto the
+  // same displayed number and make a run-specific figure look like a fixed constant. The decimal is
+  // precision of DISPLAY only — it does not imply the estimate is accurate to a tenth, which is what
+  // the `est.` marker is there to say.
+  const percentExact = ((saved as number) / before) * 100;
+  const percent = Math.round(percentExact * 10) / 10;
   const arrow = `output ${group(before)}→${group(f.outputTokens)}`;
   if (percent <= 0 || percent >= 100) return `${arrow} (${marker})`;
-  return `${arrow} (−${percent}%, ${marker})`;
+  return `${arrow} (−${percent.toFixed(1)}%, ${marker})`;
 }
 
 
@@ -942,10 +934,10 @@ function activeMinutesClause(f: ReceiptLineFields): string | undefined {
  * Render the canonical per-turn receipt line from content-free fields. Joins only the clauses that are
  * available with ` · `; omits any clause whose axis is unavailable. Never fabricates a field.
  *
- * Clause order: input · output · [cost] · [tier-label] · [countdown] · [ceiling] · id. The cost clause is the apply
+ * Clause order: input · output · [cost] · [apply off] · [countdown] · [ceiling] · id. The cost clause is the apply
  * input cost reduction; the output saving rides the output clause, so the two are NOT mutually exclusive
- * and an apply turn renders both. The tier label is the open-core apply-posture (`apply off` /
- * `basic shaping` / `full apply`).
+ * and an apply turn renders both. Only observe mode renders its apply posture; basic and full remain
+ * represented by the line's evidence clauses and internal tier state.
  */
 export function formatReceiptLine(f: ReceiptLineFields): string {
   const parts: string[] = [PREFIX];
@@ -959,13 +951,13 @@ export function formatReceiptLine(f: ReceiptLineFields): string {
   if (activeMinutes) parts.push(activeMinutes);
   const tier = tierClause(f);
   if (tier) parts.push(tier);
-  // The countdown rides with the tier label it belongs to — it is a fact about the Community
-  // allowance, not about this turn's tokens — and it is mutually exclusive with the ceiling clause
-  // below, which describes the same allowance once it has stopped counting down.
+  // The countdown is a fact about the Community allowance, not about this turn's tokens, and it is
+  // mutually exclusive with the ceiling clause below, which describes the same allowance once it has
+  // stopped counting down.
   const countdown = countdownClause(f);
   if (countdown) parts.push(countdown);
-  // The ceiling explanation rides IMMEDIATELY after the tier label it explains, so `apply off` is
-  // never read as the user's chosen posture when it is actually a refusal.
+  // The ceiling explanation follows `apply off` when present, so it is never read as the user's chosen
+  // posture when it is actually a refusal.
   const ceiling = ceilingClause(f);
   if (ceiling) parts.push(ceiling);
   if (f.shortReceiptId) parts.push(`id ${f.shortReceiptId}`);
@@ -1101,20 +1093,18 @@ export function receiptProvesPrivateFullApply(receipt: GatewayReceipt): boolean 
  * real full-apply line comes from `communityFullApplyReceiptLine` (the community builder), never this
  * Open path.
  *
- * THE LABEL IS OPTIONAL WITHIN THAT (`open: "unlabeled"`): a caller that renders HISTORICAL receipts
- * cannot know which posture produced a replayed turn, and `receiptProvenOpenLabel` is the only thing
- * that may answer it. `unlabeled` renders the identical line minus the tier clause — the input
- * vocabulary does not move with the label, so dropping an unprovable claim never re-words the count.
+ * THE INTERNAL CLASSIFICATION IS OPTIONAL (`open: "unlabeled"`): a caller that renders HISTORICAL
+ * receipts may not know whether shaping was active. Every Open classification keeps the same input
+ * vocabulary; only `observe` adds the visible `apply off` posture.
  *
  * Output is the provider-reported output count, rendered as a before→after only when a calibrated saving
  * is injected (see `estimatedSaved`). Returns undefined when the receipt carries no reportable axis at all.
  */
 export function receiptLineFromGatewayReceipt(
   receipt: GatewayReceipt,
-  /** How to render this as an OPEN line: `observe` → `apply off`, `basic` → `basic shaping`, and
-   * `unlabeled` → the same Open input vocabulary with NO tier label (for a surface that cannot prove
-   * one). `full` is NOT accepted here (a real full-apply line comes from
-   * `communityFullApplyReceiptLine`), so `full apply` can never be synthesized on an Open receipt. */
+  /** How to classify this OPEN line: `observe` renders `apply off`; `basic` and `unlabeled` keep the
+   * same label-free Open input vocabulary while preserving whether shaping was proven. `full` is not
+   * accepted here; real full applies use `communityFullApplyReceiptLine`. */
   open?: OpenLineRendering,
   /** The allowance RESET date, when this `observe` line is a ceiling refusal rather than the user's
    * chosen posture (see `ReceiptLineFields.allowanceResetsOn`). */
@@ -1143,8 +1133,8 @@ export function receiptLineFromGatewayReceipt(
     shortReceiptId: receipt.receipt_id.slice(0, 8)
   };
 
-  // The Open INPUT VOCABULARY and the tier LABEL are separate decisions: `unlabeled` keeps the Open
-  // rendering (`observed input N`, no reduction) while claiming no tier at all.
+  // Every Open classification keeps the Open input vocabulary (`observed input N`, no reduction).
+  // The internal classification remains separate from whether a posture word is rendered.
   const openTier = open !== undefined;
 
   // OPEN never compacts input: the reduction before→after form is suppressed and the count renders as
@@ -1192,14 +1182,11 @@ export function receiptLineFromGatewayReceipt(
 }
 
 /**
- * The label-free fallback for a receipt that does not prove private Full posture.
+ * The fallback for a receipt that does not prove private Full posture.
  *
- * CONTRACT. A non-apply receipt renders no tier label at all: never `apply off`, never `full apply`.
- * `full apply` stays reserved for a successful stored-policy private LCM input reduction and is emitted
- * only from `communityFullApplyReceiptLine`. `apply off` is the Open OBSERVE posture, the
- * user's choice of no model-visible mutation; it is not a description of one record-mode call, and a
- * full-tier device must never emit it. Omitting the label is the honest middle: the line says what the
- * turn had and claims nothing about what the device is entitled to.
+ * CONTRACT. A non-apply receipt renders no posture word. `apply off` is the Open OBSERVE posture, the
+ * user's choice of no model-visible mutation; it is not a description of one record-mode call. The
+ * line reports the turn's evidence without making an entitlement or posture claim.
  *
  * Record-mode and other non-Full receipts can interleave with private applies inside one user task, so
  * a hardcoded fallback posture would let an auxiliary call take over the visible result. This builder
@@ -1211,7 +1198,7 @@ export function receiptLineFromGatewayReceipt(
  *
  * NO APPLY AXIS, EVER. This builder is used only when the caller wants a plain-count fallback;
  * deterministic or otherwise valid non-Full input reductions must use `receiptLineFromGatewayReceipt`
- * to retain their measured axis without a posture label.
+ * to retain their measured axis.
  * `inputAxisOwned` stays true: the gateway saw the request, so `input paused` remains sayable, and the
  * ceiling / allowance / pause clauses ride the line exactly as on the other gateway builders.
  *
@@ -1231,7 +1218,7 @@ export function nonApplyReceiptLine(
   const output = receiptTokenCount(receipt, "output");
   const fields: ReceiptLineFields = {
     // A GATEWAY RECEIPT: we saw this request, so `input paused` stays sayable even with no number.
-    // No `tier`: a non-apply receipt carries no posture label (see the contract above).
+    // No `tier`: a non-apply receipt carries no visible posture (see the contract above).
     inputAxisOwned: true,
     shortReceiptId: receipt.receipt_id.slice(0, 8)
   };
@@ -1250,8 +1237,8 @@ export function nonApplyReceiptLine(
  * THE RUN LINE — one user request, not one provider call.
  *
  * This is the PRIMARY user-facing surface. A single prompt sends Claude Code through many provider
- * calls, and rendering whichever receipt landed last made the persistent line flicker
- * `full apply → apply off → full apply` mid-task, because Claude Code's own auxiliary record-mode
+ * calls, and rendering whichever receipt landed last once made the persistent posture flicker
+ * between apply and record states mid-task, because Claude Code's own auxiliary record-mode
  * calls mutate nothing. Those are micro-events inside one piece of work. The receipts stay exactly as
  * they are — they are the evidence ledger — and this renders the derived total over them.
  *
@@ -1310,7 +1297,7 @@ export function runAggregateLine(params: {
   const input = aggregate.input;
   if (input !== undefined) {
     // THE INPUT GRAMMAR HOLDS ON THE RUN LINE. Any exact real reduction keeps its measured arrow,
-    // including public explicit deterministic apply; posture changes only the label, never the input
+    // including public explicit deterministic apply; posture classification never changes the input
     // evidence. A non-reducing observe/basic run uses the Open `observed input N` vocabulary.
     if (rateAllowed && input.after < input.before) {
       // A real reduction gets the before→after arrow; no reduction gets the plain total it earned.
@@ -1388,9 +1375,9 @@ export function runAggregateLine(params: {
  * The Community FULL-APPLY line builder — emitted ONLY when this successful receipt proves a private
  * Hybrid/LCM input application under stored policy authorization.
  *
- * Format: `compaction · input 41,210→21,876 (−47%) · output 286 · full apply · id ...` — the existing
- * apply before→after form + the `full apply` tier label. It requires `lcm-compaction`, a net measured
- * input reduction, stored-policy authorization, request mutation, and a 2xx upstream result. Returns
+ * Format: `compaction · input 41,210→21,876 (−47%) · output 286 · id ...`. It requires
+ * `lcm-compaction`, a net measured input reduction, stored-policy authorization, request mutation,
+ * and a 2xx upstream result. Returns
  * undefined for deterministic-only, shaping-only, failed, Open, and record receipts.
  */
 export function communityFullApplyReceiptLine(
@@ -1408,7 +1395,7 @@ export function communityFullApplyReceiptLine(
   if (!receiptProvesPrivateFullApply(receipt)) return undefined;
   const promptInput = receiptTokenCount(receipt, "prompt_input");
   const output = receiptTokenCount(receipt, "output");
-  // THE LABEL AND AXIS COME FROM THIS EXACT RECEIPT. The predicate above has already established a
+  // THE APPLY CLASSIFICATION AND AXIS COME FROM THIS EXACT RECEIPT. The predicate above established a
   // successful private input apply with a strict net reduction. Entitlement or output shaping alone is
   // deliberately insufficient.
   const compactedInput = receiptCompactedInput(receipt);
@@ -1448,9 +1435,9 @@ export function communityFullApplyReceiptLine(
  *
  * When the caller opts into the estimated-output-saved clause (`estimatedSaved`), the output clause
  * becomes a before→after whose BEFORE is reconstructed from the calibrated rate:
- *   `compaction · output 652→512 (−21%, est.)` (an exact-key confirmed rate)
- *   `compaction · output N/A→512 (N/A%, est.)` (known exact miss)
- * The caller derives `tokensSaved` from the shared exact calibration rate applied to this turn's output;
+ *   `compaction · output 652→512 (−21.5%, est.)` (a calibrated rate)
+ *   `compaction · output N/A→512 (N/A%, est.)` (no compatible evidence)
+ * The caller derives `tokensSaved` from the exact-first compatible rate applied to this turn's output;
  * passing `calibrated: false` preserves its explicit state, so every proven-shaped miss renders N/A.
  * The arrow is emitted ONLY when shaping was ACTIVE this turn (a stopped/killed turn was not shaped).
  *
@@ -1466,8 +1453,8 @@ export function receiptLineOutputOnly(params: {
   shapingActive: boolean;
   /** Opt-in estimated-output-saved clause (only honored when `shapingActive`). */
   estimatedSaved?: InjectedOutputEstimate;
-  /** Open tier label (`observe` → `apply off`, `basic` → `basic shaping`). Omitted → no label. `full`
-   * is not accepted on the hook-only path (a real full-apply line comes from the gateway apply route). */
+  /** Open tier classification. `observe` renders `apply off`; `basic` adds no posture word. Omitted
+   * keeps the line unclassified. `full` is not accepted on this hook-only path. */
   tier?: "observe" | "basic";
   /** The allowance RESET date, when this `observe` line is a ceiling refusal rather than the user's
    * chosen posture (see `ReceiptLineFields.allowanceResetsOn`). */

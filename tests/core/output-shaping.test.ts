@@ -3,6 +3,7 @@ import {
   buildHookOutputShapingTreatment,
   buildOutputShapingPolicy,
   outputShapingPolicyVersion,
+  outputShapingTreatmentFamilyForPolicyVersion,
   OUTPUT_SHAPING_POLICIES,
   OUTPUT_SHAPING_HONESTY_NOTE
 } from "../../src/core/output-shaping.js";
@@ -85,6 +86,23 @@ describe("output-shaping policy family (deterministic)", () => {
     expect(hook.policyVersion).toBe(
       "output-shaping.v1.sha256.18ed526481a63fc7d7c596b3622b22d106ea906a33b58125e2a36233f25b8775"
     );
+    expect(hook.treatmentFamilyVersion).toBe(core.treatmentFamilyVersion);
+    expect(outputShapingTreatmentFamilyForPolicyVersion(core.policyVersion)).toBe(
+      core.treatmentFamilyVersion
+    );
+    expect(outputShapingTreatmentFamilyForPolicyVersion(hook.policyVersion)).toBe(
+      core.treatmentFamilyVersion
+    );
+  });
+
+  it("changes the family identity for substantive shaping changes and never assigns unknown carriers", () => {
+    const current = buildOutputShapingPolicy();
+    const budgeted = buildOutputShapingPolicy({ verbosityBudgetTokens: 300 });
+    expect(budgeted.treatmentFamilyVersion).not.toBe(current.treatmentFamilyVersion);
+    expect(outputShapingTreatmentFamilyForPolicyVersion(budgeted.policyVersion)).toBeUndefined();
+    expect(outputShapingTreatmentFamilyForPolicyVersion(
+      `output-shaping.v1.sha256.${"f".repeat(64)}`
+    )).toBeUndefined();
   });
 
   it("ignores unknown policy names (never invents a policy)", () => {

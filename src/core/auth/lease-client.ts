@@ -11,7 +11,7 @@
  * The signed lease is verified by the store on read; this client only fetches and persists it. The
  * device token is used as a Bearer credential and never logged.
  */
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { credentialedFetchInit, describeCredentialedFetchFailure } from "../net/credentialed-fetch.js";
 import { parseSignedLease, type SignedLease } from "../entitlement/lease.js";
@@ -106,8 +106,18 @@ export async function acquireLease(
 export function writeStoredLease(lease: SignedLease, env: ConfigDirEnv = process.env): string {
   const path = leasePath(env);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  writeFileSync(path, `${JSON.stringify(lease, null, 2)}\n`, { mode: 0o600 });
-  chmodSync(path, 0o600);
+  // TEMP + RENAME, so a concurrent reader (another gateway, status) never sees a half-written lease.
+  // A truncated read verifies as `lease-invalid`, and a reader that then treats the device as holding
+  // no valid lease takes decisions (an immediate reconcile watermark) that a valid lease forbids.
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tmp, `${JSON.stringify(lease, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, path);
+  } catch (error) {
+    rmSync(tmp, { force: true });
+    throw error;
+  }
   return path;
 }
 

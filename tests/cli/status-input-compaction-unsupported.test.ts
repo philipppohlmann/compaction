@@ -86,7 +86,7 @@ async function status(json = false): Promise<string> {
   try {
     await runStatus({
       env: statusEnv(), version: "0.0.0-test", projectsDir: join(configDir, "none"),
-      ...(json ? { json: true } : {})
+      ...(json ? { json: true } : { verbose: true })
     });
   } finally {
     vi.restoreAllMocks();

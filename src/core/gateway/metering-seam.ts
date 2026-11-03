@@ -93,6 +93,8 @@ export interface ApplyDebitContext {
   provider: string;
   periodId: string;
   allowanceTokens: number;
+  /** The current valid lease's allowance for this period, re-read under the append lock. */
+  currentAllowanceTokens?: () => number | undefined;
   /** The RECOVERY id of the retained original this debit belongs to (never a gateway receipt id). */
   recoveryId: string;
   meterVersion?: string;

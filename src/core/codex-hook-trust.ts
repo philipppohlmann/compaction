@@ -340,6 +340,16 @@ export const CODEX_TRUST_ACTION_CONTROL = "Trust all and continue";
 /** The Codex-side heading that prompt appears under, so the instruction matches what is on screen. */
 export const CODEX_TRUST_ACTION_HEADING = "Hooks need review";
 
+/**
+ * The one line a surface prints after it REWROTE Compaction's Codex hook commands. Codex trusts hooks per
+ * command hash, so the rewritten hooks are a new decision: they do not run until the user reviews them
+ * once inside Codex.
+ */
+export function codexHookReviewNotice(): string {
+  return `Codex: Compaction's hook commands changed, so they stay off until reviewed once - run \`${CODEX_TRUST_ACTION_COMMAND}\`, ` +
+    `and at "${CODEX_TRUST_ACTION_HEADING}" choose "${CODEX_TRUST_ACTION_CONTROL}". \`compaction status --check-codex\` confirms it.`;
+}
+
 /** The hook command whose trust is at stake, for a surface that wants to name it. */
 export const CODEX_SHAPING_HOOK_COMMAND = shapingHookCommand("codex");
 

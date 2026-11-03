@@ -170,7 +170,7 @@ describe("compaction upgrade - fail-closed matrix, no key leak, no live-endpoint
 
 describe("compaction status - honest, masked, capabilities only when reachable", () => {
   it("unconfigured: Account & access shows not connected, NO local-only / connect copy, no key leak", async () => {
-    const r = await runCli(["status", "--projects-dir", join(dir, "none")]);
+    const r = await runCli(["status", "--verbose", "--projects-dir", join(dir, "none")]);
     expect(r.code).toBe(0);
     // F52/F55: an unconfigured device reads through the Account & access section, not the old
     // misleading "Hosted endpoint / Mode: local-only / Connect a private-beta …" block.
@@ -188,7 +188,7 @@ describe("compaction status - honest, masked, capabilities only when reachable",
     try {
       // Persist via upgrade first, then re-check live via status (server still up).
       expect((await runCli(["upgrade", "--key", FAKE_KEY, "--api-url", mock.url])).code).toBe(0);
-      const r = await runCli(["status", "--projects-dir", join(dir, "none")]);
+      const r = await runCli(["status", "--verbose", "--projects-dir", join(dir, "none")]);
       expect(r.code).toBe(0);
       expect(r.out).toMatch(/Hosted API: configured/);
       expect(r.out).toContain("ck_test_…0000");
@@ -206,7 +206,7 @@ describe("compaction status - honest, masked, capabilities only when reachable",
     expect((await runCli(["upgrade", "--key", FAKE_KEY, "--api-url", mock.url])).code).toBe(0);
     await mock.close(); // now the persisted endpoint is down
 
-    const r = await runCli(["status", "--projects-dir", join(dir, "none")]);
+    const r = await runCli(["status", "--verbose", "--projects-dir", join(dir, "none")]);
     expect(r.code).toBe(0);
     expect(r.out).toMatch(/Hosted API: configured/);
     expect(r.out).toMatch(/Reachability: unreachable/);
@@ -224,7 +224,7 @@ describe("compaction status - 'Last turns' section (last 3 per-turn receipt line
         runCwd,
         [1, 2, 3, 4, 5].map((n) => recordReceipt(`cccccc${n}0000000000000000000000000000`, 1000 * n, 10 * n))
       );
-      const r = await runCli(["status", "--projects-dir", join(dir, "none")], {}, runCwd);
+      const r = await runCli(["status", "--verbose", "--projects-dir", join(dir, "none")], {}, runCwd);
       expect(r.code).toBe(0);
       expect(r.out).toMatch(/Last turns \(most recent 3/);
       // The last three (3000/4000/5000 input) are shown; the first two (1000/2000) are not.
@@ -240,7 +240,7 @@ describe("compaction status - 'Last turns' section (last 3 per-turn receipt line
   it("empty store: honest 'no turns recorded yet', never an error (exit 0)", async () => {
     const runCwd = mkdtempSync(join(tmpdir(), "compaction-status-cwd-"));
     try {
-      const r = await runCli(["status", "--projects-dir", join(dir, "none")], {}, runCwd);
+      const r = await runCli(["status", "--verbose", "--projects-dir", join(dir, "none")], {}, runCwd);
       expect(r.code).toBe(0);
       expect(r.out).toMatch(/Last turns/);
       expect(r.out).toMatch(/no turns recorded yet/);
@@ -253,7 +253,7 @@ describe("compaction status - 'Last turns' section (last 3 per-turn receipt line
     const runCwd = mkdtempSync(join(tmpdir(), "compaction-status-cwd-"));
     try {
       seedReceipts(runCwd, [recordReceipt("dddddddd0000000000000000000000000000", 1000, 10)]);
-      const r = await runCli(["status", "--projects-dir", join(dir, "none")], { COMPACTION_RECEIPT_LINE: "0" }, runCwd);
+      const r = await runCli(["status", "--verbose", "--projects-dir", join(dir, "none")], { COMPACTION_RECEIPT_LINE: "0" }, runCwd);
       expect(r.code).toBe(0);
       expect(r.out).not.toMatch(/Last turns/); // omitted when the user chose silence
     } finally {

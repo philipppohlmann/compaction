@@ -109,14 +109,15 @@ describe("statusline posture on a full-tier device", () => {
     }
   });
 
-  it("renders `full apply` on the apply frames only, and no posture label on the record frame", async () => {
+  it("renders the measured reduction on apply frames and a plain count on the record frame", async () => {
     const env = communityDevice();
-    expect(await render(applyFrame(), env)).toContain("full apply");
+    expect(await render(applyFrame(), env)).toContain("input 1,200→900 (−25%)");
     const record = await render(interleavedRecordFrame(), env);
-    expect(record).not.toContain("full apply");
+    expect(record).toContain("input 600");
+    expect(record).toContain("output 10");
+    expect(record).not.toContain("→");
     expect(record).not.toContain("apply off");
-    expect(record).not.toContain("basic shaping");
-    expect(await render(applyFrame(), env)).toContain("full apply");
+    expect(await render(applyFrame(), env)).toContain("id aaaaaaaa");
   });
 
   it("renders the record frame with a plain input count and NO apply axis", async () => {
@@ -157,10 +158,8 @@ describe("statusline posture on a full-tier device", () => {
   });
 
   it("announces no apply posture at all on a record turn from that device", async () => {
-    // The property, alone: whatever tier the device reports, `full apply` rides RECEIPT EVIDENCE of a
-    // real apply - never `product_mode`. A weaker predicate here would announce full apply to exactly
-    // the users the gate refuses.
     const line = await render(interleavedRecordFrame(), communityDevice());
+    expect(line).toBe("compaction · input 600 · output 10 · id bbbbbbbb");
     expect(line).not.toContain("full apply");
     expect(line).not.toContain("apply off");
     expect(line).not.toContain("basic shaping");
@@ -175,7 +174,7 @@ describe("statusline posture on a full-tier device", () => {
 
   it("pins the apply frame's exact line", async () => {
     const line = await render(applyFrame(), communityDevice());
-    expect(line).toBe("compaction · input 1,200→900 (−25%) · output 300 · full apply · id aaaaaaaa");
+    expect(line).toBe("compaction · input 1,200→900 (−25%) · output 300 · id aaaaaaaa");
   });
 
   it("does not borrow a prior session's receipt before this session has a run boundary", async () => {

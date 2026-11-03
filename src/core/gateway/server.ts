@@ -66,8 +66,11 @@ import { saveOriginalForRecovery, discardRecoveryRecord, GATEWAY_RECOVERY_DIR } 
 // must name the SAME policy, and two literals is how they drift apart.
 import { buildApplyReceipt, OPEN_BASIC_OUTPUT_POLICY } from "./apply-receipt.js";
 import {
-  gatewaySessionCorrelation
+  gatewaySessionCorrelation,
+  toolSessionIdFromRequestBody
 } from "./session-correlation.js";
+import { buildHookOutputShapingTreatment } from "../output-shaping.js";
+import { lastTurnShapingOutcome } from "../output-shaping-turn-state.js";
 // OPEN `basic` gateway shaping: the engine-free public planner, its
 // double-shaping guard, and the SAME activation switch the tool-hook path reads.
 import {
@@ -77,9 +80,9 @@ import {
   outputShapingPolicyVersionOnRequest
 } from "./output-shaping-policy.js";
 import { isShapingHooksActivated } from "../output-shaping-hook-activation.js";
-import { effectiveOpenTier, readOptimizationMode, resolveOpenTier } from "../onboarding-preferences.js";
+import { effectiveOpenTier, readOptimizationMode, readProductMode, resolveOpenTier } from "../onboarding-preferences.js";
 import type { OptimizationModePreference } from "../onboarding-preferences.js";
-import { readLeaseVerdict } from "../entitlement/lease-store.js";
+import { leaseNeedsRenewal, readLeaseVerdict } from "../entitlement/lease-store.js";
 import { periodEndUtc } from "../entitlement/lease.js";
 import type { AllowancePauseScope } from "../onboarding-preferences.js";
 import type { AllowancePauseReason } from "../upgrade-cta.js";
@@ -116,6 +119,7 @@ import { assembleHeadTail, createUsageTee } from "./usage-response-tee.js";
 import { attachBookkeepingDrain, PendingBookkeeping } from "./pending-bookkeeping.js";
 import { gatewayControlHandler, type GatewayReleaseIdentity } from "./update-identity.js";
 import { readGatewaySettlementState } from "./run-boundary.js";
+import { classifyEngineDecline } from "./lcm-outcome.js";
 /** The engine decision narrowed to the applied branch (the only branch this path carries forward). */
 type AppliedEngineDecision = Extract<EngineApplyDecision, { decision: "apply" }>;
 
@@ -400,6 +404,47 @@ function readRequestBody(req: http.IncomingMessage): Promise<Buffer> {
  * can bind an ephemeral port. Every request is forwarded byte-for-byte; the receipt append is
  * best-effort and NEVER alters or delays the client's response bytes.
  */
+/**
+ * Gateways that have already printed the no-workflow diagnostic.
+ *
+ * ONCE PER GATEWAY, not once per request. Measured on the first attempt: three POSTs produced three copies
+ * of a three-sentence paragraph against ONE receipt line — the diagnostic outnumbered the product's actual
+ * per-turn signal 3:1, on the surface this repo protects hardest (whole clauses were deleted from the
+ * per-turn line to keep it readable in a glance), and it wrote an unbounded per-request line into a 0600
+ * routing-slot log whose own guard documents "nothing per-request".
+ *
+ * Keyed on the options object because `handleProxy` is top-level: one options object exists per gateway
+ * instance, so this is instance scope without threading a parameter through every call site. A WeakSet so a
+ * finished gateway's entry is collectable.
+ */
+const noWorkflowDiagnosticLogged = new WeakSet<object>();
+
+/**
+ * Did this device ever plausibly expect INPUT compaction?
+ *
+ * Only used to decide whether the no-workflow diagnostic is worth printing. An Open device — no API key,
+ * no verified lease — never had input compaction and should not be handed a diagnosis of a non-problem on
+ * every gateway it starts.
+ *
+ * THE ARMS ARE THE APPLY GUARD'S OWN, deliberately. An earlier version keyed on `readStoredCredentials`,
+ * which looks equivalent and is not: `compaction logout` deletes the credentials but NOT the lease, and the
+ * apply-routing guard's credential condition can still pass on the lease alone. A logged-out device holding
+ * a valid lease would therefore have been silenced about the very state it was in. These are the same two
+ * arms that guard checks — answer the gateway's question, not a subset of it, which is the rule this change
+ * argues for everywhere else.
+ *
+ * Presence only: the API key is checked for non-emptiness and the lease for a VALID verdict; no credential
+ * value is read and nothing is logged about either. Never throws.
+ */
+function deviceCouldHaveExpectedInputCompaction(env: NodeJS.ProcessEnv = process.env): boolean {
+  try {
+    if (env.ANTHROPIC_API_KEY && env.ANTHROPIC_API_KEY.trim() !== "") return true;
+    return readLeaseVerdict(env).label === "lease-valid";
+  } catch {
+    return false;
+  }
+}
+
 export function createGatewayServer(options: GatewayServerOptions): http.Server {
   if (options.mode !== "record" && options.mode !== "apply" && options.mode !== "dry-run") {
     // The server refuses to pretend to support a mode it does not implement.
@@ -796,18 +841,52 @@ async function handleProxy(
   // record (original forwarded unchanged), but the outcome is a fact about it and rides the record
   // receipt — the did-not-contribute turns are the ones the outcome exists to explain.
   let declinedLcmOutcome: { kind: string; reason: string } | undefined;
+  let declinedAllowancePause: GatewayReceipt["allowance_pause"];
   let declinedOutputShapingState: "attached-this-pass" | "already-active" | "absent" | undefined;
+  let leaseDegraded = false;
   let declinedOutputShapingPolicyVersion: string | undefined;
+  let storedApplied = false;
   const explicitPerCallMode = headerValue(req.headers["x-compaction-mode"]) !== undefined;
+  if (
+    !activation.requested &&
+    !explicitPerCallMode &&
+    req.method === "POST" &&
+    !options.workflow &&
+    !noWorkflowDiagnosticLogged.has(options) &&
+    // AND ONLY FOR A DEVICE THAT PLAUSIBLY EXPECTED INPUT COMPACTION. An Open device has no account and
+    // no API key; telling it "this session is record-only for input" diagnoses a non-problem it never
+    // asked about. Presence only — no credential value is read.
+    deviceCouldHaveExpectedInputCompaction(options.entitlementEnv ?? process.env)
+  ) {
+    // THE COMMONEST REASON A SESSION NEVER COMPACTS INPUT, and it used to leave no trace anywhere.
+    //
+    // A gateway spawned WITHOUT a workflow identity (`--workflow none`, which `gateway ensure` chooses
+    // whenever any apply-routing condition was unmet at launch — a lapsed lease being the measured case)
+    // skips the stored-authorization path entirely, by this very condition. No log line was emitted, so
+    // the receipts, the lease and the status screen all read healthy while every turn was record-only,
+    // and diagnosing it took a process-level investigation instead of reading a log.
+    //
+    // Scoped honestly: INPUT compaction is what cannot run here. Output shaping still can (the Open
+    // `basic` path below needs no workflow identity). Content-free — no identifier, no content.
+    log(
+      "compaction gateway: no routable workflow identity on this gateway (started --workflow none), so " +
+        "the stored-policy input-compaction path is never consulted - this session is record-only for " +
+        "input. Output shaping is unaffected. A new tool session re-evaluates routing."
+    );
+    noWorkflowDiagnosticLogged.add(options);
+  }
   if (!activation.requested && !explicitPerCallMode && req.method === "POST" && options.workflow) {
     const stored = await resolveStoredAuthorizationApply(endpoint, requestBody, options, log, supervisor, upstreamRouteType);
     if (stored && "outcome" in stored) {
       effectiveActivation = stored.activation;
       apply = stored.outcome;
+      storedApplied = true;
     } else if (stored) {
       declinedLcmOutcome = stored.lcmOutcome;
+      declinedAllowancePause = stored.allowancePause;
       declinedOutputShapingState = stored.outputShapingState;
       declinedOutputShapingPolicyVersion = stored.outputShapingPolicyVersion;
+      leaseDegraded = stored.leaseDegraded === true;
     }
   }
   // OPEN `basic` output shaping — the THIRD and last apply path.
@@ -817,7 +896,7 @@ async function handleProxy(
   // Open basic is account-free, engine-free and tool-agnostic — the mode preference is the whole
   // authorization. Synchronous and local: a plan, a file write, no engine and no network.
   if (!activation.requested && !explicitPerCallMode && req.method === "POST" && !apply?.applied) {
-    const openBasic = resolveOpenBasicOutputShaping(endpoint, requestBody, options, log);
+    const openBasic = resolveOpenBasicOutputShaping(endpoint, requestBody, options, log, leaseDegraded);
     if (openBasic) {
       effectiveActivation = openBasic.activation;
       apply = openBasic.outcome;
@@ -841,6 +920,20 @@ async function handleProxy(
     activation.mode === "apply" &&
     (activation.activation === "explicit-mode" || activation.activation === "explicit-header")
   ) {
+    const detectedPolicyVersion = outputShapingPolicyVersionOnRequest(bodyToForward.toString("utf8"));
+    if (detectedPolicyVersion) {
+      apply.outputShapingState = "already-active";
+      apply.outputShapingPolicyVersion = detectedPolicyVersion;
+    }
+  }
+
+  // STORED-APPLY: THE ENGINE'S `absent` MAY BE A STALE NEGATIVE. The installed engine carries its own
+  // copy of the carrier predicate, so an engine built before a carrier was recognised (Codex's
+  // Responses `input[]` developer message) reports `absent` on bytes that do carry the policy. The
+  // gateway re-measures the SAME final forwarded bytes with the same strict predicate and may only
+  // upgrade `absent` to `already-active`: it never downgrades, never overrides `attached-this-pass`,
+  // and a miss leaves the engine's statement untouched.
+  if (storedApplied && apply?.outputShapingState === "absent") {
     const detectedPolicyVersion = outputShapingPolicyVersionOnRequest(bodyToForward.toString("utf8"));
     if (detectedPolicyVersion) {
       apply.outputShapingState = "already-active";
@@ -1005,17 +1098,29 @@ async function handleProxy(
             // documented instruction-level false negative, which this change preserves rather than
             // papers over. The engine path states `absent` positively because it did inspect the bytes.
             const detectedPolicyVersion = outputShapingPolicyVersionOnRequest(bodyToForward.toString("utf8"));
-            const recordShapingState = declinedOutputShapingState ??
-              (detectedPolicyVersion ? ("already-active" as const) : undefined);
-            pendingBookkeeping.track(recordReceipt({
-              options,
-              log,
-              ...shared,
-              ...(recordShapingState ? { outputShapingState: recordShapingState } : {}),
-              ...(declinedOutputShapingPolicyVersion || detectedPolicyVersion
-                ? { outputShapingPolicyVersion: declinedOutputShapingPolicyVersion ?? detectedPolicyVersion }
-                : {})
-            }));
+            // A declined engine's `absent` is upgraded by a positive gateway measurement of the same
+            // bytes (see STORED-APPLY above: the engine's predicate copy may predate a carrier).
+            const engineStaleAbsent = declinedOutputShapingState === "absent" && detectedPolicyVersion !== undefined;
+            const recordShapingState = engineStaleAbsent
+              ? ("already-active" as const)
+              : declinedOutputShapingState ?? (detectedPolicyVersion ? ("already-active" as const) : undefined);
+            const recordPolicyVersion = engineStaleAbsent
+              ? detectedPolicyVersion
+              : declinedOutputShapingPolicyVersion ?? detectedPolicyVersion;
+            pendingBookkeeping.track((async () => {
+              const outputShapingRegime = recordShapingState === "already-active"
+                ? await hookShapedRegime(options, requestBody.toString("utf8"), recordPolicyVersion, correlationEnv, requestStartedAt)
+                : undefined;
+              await recordReceipt({
+                options,
+                log,
+                ...shared,
+                ...(declinedAllowancePause ? { allowancePause: declinedAllowancePause } : {}),
+                ...(recordShapingState ? { outputShapingState: recordShapingState } : {}),
+                ...(recordPolicyVersion ? { outputShapingPolicyVersion: recordPolicyVersion } : {}),
+                ...(outputShapingRegime ? { outputShapingRegime } : {})
+              });
+            })());
           }
           // LCM SHADOW (explicit opt-in, default OFF): starts only AFTER the upstream response has
           // reached EOF or authoritative Codex terminal evidence, on a DETACHED promise this handler
@@ -1328,15 +1433,16 @@ export async function perTurnLineFromReceipt(
  *     there is no account and no lease to consult. `observe` never shapes: it is defined as "no
  *     model-visible mutation" in three binding places, and a shaping instruction is model-visible text.
  *
- *     KNOWN, DELIBERATE GAP. `clampTier` sends a
- *     `full` mode with NO valid lease to `observe`, not `basic`, so a lease-less Community device gets
- *     no shaping here — even though the degradation order ("1. Open basic shaping if enabled + safe
- *     → else 2. forward the original unchanged") says a `full` request that cannot be honoured should
- *     land on step 1. Widening the gate to the raw persisted mode WOULD close that hole; it would also
- *     turn 27 currently-green tests red, because they encode a `full`-mode device receiving an
- *     unmutated request under `optimization_mode: cache` and with no stored authorization. Silently
- *     changing what Community devices send upstream is a bigger change than the one authorized here
- *     (wiring the PUBLISHED Open-basic path), so the narrow gate ships and the gap is recorded here.
+ *     LEASE-DEGRADED FULL. `clampTier` sends a `full` mode with NO valid lease to `observe`, so a
+ *     Community device whose lease lapsed used to lose output shaping along with input compaction —
+ *     even though the degradation order ("1. Open basic shaping if enabled + safe → else 2. forward
+ *     the original unchanged") says a `full` request that cannot be honoured lands on step 1. The
+ *     stored-authorization path now reports exactly that case (`leaseDegraded`: not stopped, Cache +
+ *     context optimize, a matching stored authorization, eligible gates, and ONLY the lease failing),
+ *     and this gate admits it. The gate is NOT widened to the raw persisted mode in general: a
+ *     `full`-mode device under `optimization_mode: cache` or with no stored authorization still sends
+ *     its request unmutated. The turn is recorded as Open basic shaping — never as a Full apply — so
+ *     its receipt carries output-shaping evidence and no input estimate.
  *
  *     BE PRECISE ABOUT WHAT THIS GATE DOES AND DOES NOT PROTECT. For a `basic`-mode device
  *     it consults NEITHER `optimization_mode` NOR any stored authorization — it mutates without either.
@@ -1367,11 +1473,15 @@ function resolveOpenBasicOutputShaping(
   endpoint: string,
   originalBody: Buffer,
   options: GatewayServerOptions,
-  log: (line: string) => void
+  log: (line: string) => void,
+  leaseDegraded = false
 ): { activation: ApplyActivation; outcome: ApplyOutcome } | null {
   try {
     const env = options.entitlementEnv ?? process.env;
-    if (effectiveOpenTier(env) !== "basic") return null;
+    const tier = effectiveOpenTier(env);
+    // A lease-degraded Full turn reaches here as `observe` (the clamp), and is let through only with
+    // the persisted mode still `full`: the user asked for more than basic shaping, not for none.
+    if (tier !== "basic" && !(leaseDegraded && tier === "observe" && readProductMode(env) === "full")) return null;
     if (!isShapingHooksActivated(env)) return null;
 
     const originalText = originalBody.toString("utf8");
@@ -1423,6 +1533,16 @@ function resolveOpenBasicOutputShaping(
 }
 
 /**
+ * The allowance a debit is measured against under the journal append lock: that of the lease stored
+ * NOW, only while it is valid for the debit's period (`undefined` refuses the debit). Exported so the
+ * test that pins the renewal-coherent ceiling drives the SAME function the gateway uses.
+ */
+export function currentLeaseAllowanceTokens(env: NodeJS.ProcessEnv, periodId: string): number | undefined {
+  const now = readLeaseVerdict(env);
+  return now.label === "lease-valid" && now.periodId === periodId ? now.allowanceTokens : undefined;
+}
+
+/**
  * What the stored-authorization path resolved to. `null` is the plain decline (nothing ran, or an
  * early gate refused). `declined` is the engine having run the pipeline and applied nothing: the
  * turn is still a plain record, but the engine's LCM outcome is a fact about it that the record
@@ -1433,8 +1553,16 @@ type StoredAuthorizationResolution =
   | {
       declined: true;
       lcmOutcome?: { kind: string; reason: string };
+      /** Input compaction was declined for want of allowance and nothing was applied in its place. */
+      allowancePause?: GatewayReceipt["allowance_pause"];
       outputShapingState?: "attached-this-pass" | "already-active" | "absent";
       outputShapingPolicyVersion?: string;
+      /**
+       * Set ONLY by the entitlement decline: every user-side Full condition held (not stopped,
+       * Cache + context optimize, a matching stored authorization whose gates pass) and the lease
+       * alone was not valid. It lets the Open basic path keep output shaping running for that turn.
+       */
+      leaseDegraded?: true;
     };
 
 /**
@@ -1462,7 +1590,22 @@ async function resolveStoredAuthorizationApply(
     // Apply is enabled for the tools that route recognized request shapes through the gateway.
     // Cursor participates via its OpenAI-compatible traffic (custom base URL); its reduction is shown
     // as a LOCAL estimate. Only these narrow tool identities are ever model-visible-applied.
-    if (options.workflow !== "codex" && options.workflow !== "claude-code" && options.workflow !== "cursor") return null;
+    if (options.workflow !== "codex" && options.workflow !== "claude-code" && options.workflow !== "cursor") {
+      // An UNRECOGNIZED workflow identity. Reachable only from an explicit `gateway start --workflow <x>`
+      // with a value outside the routable set; the `--workflow none` case never gets here at all, because
+      // the caller gates this whole call on `options.workflow` being present (see the dispatch site, where
+      // the absence is logged instead).
+      //
+      // Scoped precisely: INPUT compaction cannot run on this route. Output shaping still can — the Open
+      // `basic` path downstream deliberately requires no workflow identity — so this must not claim the
+      // request cannot be applied at all. An earlier draft of this line did, which is the same stale
+      // refusal-string defect already recorded for `dev.ts`.
+      log(
+        `compaction gateway: workflow '${String(options.workflow)}' is not a routable apply workflow - ` +
+          "the stored-policy input-compaction path is not consulted for it; output shaping is unaffected."
+      );
+      return null;
+    }
     // UNIFIED STOP (defense-in-depth): `compaction stop` disables the WHOLE optimization - output shaping
     // AND apply routing. The transparent-routing ensure already declines to spawn a workflow-scoped gateway
     // while stopped, but an already-running workflow gateway must ALSO honor a stop taken mid-session: a
@@ -1511,51 +1654,40 @@ async function resolveStoredAuthorizationApply(
     let leaseVerdict = readLeaseVerdict(entitlementEnv);
     if (leaseVerdict.label !== "lease-valid") {
       // REQUEST-TIME RECOVERY. A long-lived gateway can outlive the 24h lease TTL, and start-time
-      // repair is fire-and-forget — so a signed-in, still-entitled device can hit this gate with an
+      // repair runs once per process — so a signed-in, still-entitled device can hit this gate with an
       // expired lease while Community is still valid server-side. Lease-only silent renew (no engine
       // download) restores authorization when the service still grants it; authoritative denials
-      // fail closed below. Open devices (no credentials) are a no-op inside the repair.
+      // fail closed inside the repair. Open devices (no credentials) are a no-op inside the repair.
       //
-      // BOUNDED. An unbounded await would stall provider traffic for the network stack's full timeout
-      // when the entitlement endpoint hangs. After the deadline the current request fails open to
-      // record-only; the next request can retry.
+      // BOUNDED WAIT, DETACHED REPAIR. This request waits at most REQUEST_TIME_LEASE_RENEW_MS and then
+      // fails open to record-only for input. The repair itself is NOT tied to this request: it used to
+      // receive this request's AbortSignal, so a renewal that needed longer than the bound (a reconcile
+      // backlog ahead of the lease call) was killed on every request and never completed. It now runs to
+      // its own deadline, and a later request finds the renewed lease on disk.
       try {
-        const { ensureCommunityRuntime, REQUEST_TIME_LEASE_RENEW_MS } = await import(
-          "../entitlement/community-runtime.js"
-        );
-        const controller = new AbortController();
-        // CALLER-LOCAL DEADLINE. Aborting the signal is not enough by itself: if this request joined
-        // an in-flight lease repair started without its signal (gateway start / status), the shared
-        // promise ignores the abort. Promise.race guarantees this request stops waiting at the bound
-        // and fails open to record-only; the shared repair continues for later retries.
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const deadline = new Promise<"timeout">((resolve) => {
-          timer = setTimeout(() => {
-            controller.abort();
-            resolve("timeout");
-          }, REQUEST_TIME_LEASE_RENEW_MS);
-        });
-        try {
-          await Promise.race([
-            ensureCommunityRuntime(entitlementEnv, () => {}, {
-              leaseOnly: true,
-              signal: controller.signal
-            }).then(() => "done" as const),
-            deadline
-          ]);
-        } finally {
-          if (timer !== undefined) clearTimeout(timer);
-        }
+        const { recoverLeaseForRequest } = await import("../entitlement/community-runtime.js");
+        await recoverLeaseForRequest(entitlementEnv);
       } catch {
-        // Repair never throws by contract; this catch only protects the apply path.
+        // Recovery never throws by contract; this catch only protects the apply path.
       }
       leaseVerdict = readLeaseVerdict(entitlementEnv);
+    } else if (leaseNeedsRenewal(entitlementEnv)) {
+      // PROACTIVE REFRESH inside the renewal window. The lease is still valid, so this request waits for
+      // nothing; the renewal runs in the background and lands before expiry. Without it a gateway that
+      // outlived its start-time repair renewed only AFTER expiry, with a full day's unreconciled usage
+      // ahead of the lease call.
+      try {
+        const { recoverLeaseForRequest } = await import("../entitlement/community-runtime.js");
+        void recoverLeaseForRequest(entitlementEnv, 0, "request-refresh");
+      } catch {
+        // Best-effort.
+      }
     }
     if (leaseVerdict.label !== "lease-valid") {
       log(
-        `compaction gateway: stored authorization ${authorization.id} did not apply - entitlement ${leaseVerdict.label} (record mode, original forwarded unchanged).`
+        `compaction gateway: stored authorization ${authorization.id} did not apply - entitlement ${leaseVerdict.label} (input compaction paused; account-free output shaping may still apply).`
       );
-      return null;
+      return { declined: true, leaseDegraded: true };
     }
 
     // PRODUCT MODE — the THIRD independent condition (each alone sufficient to decline). The user's
@@ -1662,13 +1794,20 @@ async function resolveStoredAuthorizationApply(
     // credential, no network endpoint). Any engine degrade/refusal/no-op → forward the original.
     // Dispatched through a closure because the overshoot ceiling below re-dispatches the SAME request
     // with a zero remainder to obtain the output-shaping-only degradation, rather than refusing it.
+    // NO SECOND POLICY COPY. When this turn's instructions already carry the current policy (Codex's
+    // prompt hook puts it in a Responses `input[]` developer item), the engine is asked for input
+    // optimization only. Engine 0.6.18 carries an older copy of the carrier predicate that does not
+    // see that item, so asking it to shape attached the block a second time on every applied request.
+    // The strict current-turn predicate is used, not the broad guard: a policy that appears only in
+    // history, a user message or tool output still lets the engine shape this turn as before.
+    const policyAlreadyOnTurn = outputShapingPolicyVersionOnRequest(originalText) !== undefined;
     const dispatchEngine = (remainingTokens: number) => decideEngineApply(supervisor, {
       operation: "plan_and_apply",
       workflow: scope.tool,
       provider: options.provider,
       route_type: routeType,
       endpoint,
-      output_shaping_enabled: true,
+      output_shaping_enabled: !policyAlreadyOnTurn,
       // HYBRID/LCM INPUT COMPACTION, activated by ENTITLEMENT, not by environment. Reaching this
       // line already means the lease verified (`leaseVerdict`) and the route/scope gates passed —
       // i.e. this is a Community-or-better request — which is exactly the product boundary: output
@@ -1719,9 +1858,10 @@ async function resolveStoredAuthorizationApply(
     // engine version happens to be installed.
     const planShapingOnlyFallback = (): { body: string; policyVersion?: string; regime?: "default-shapeable" } | undefined => {
       // The user's own shaping off-switch (`compaction stop` / `COMPACTION_SHAPING_HOOKS=0`) wins here,
-      // exactly as it does on the Open-basic path. The primary engine dispatch above still sends
-      // `output_shaping_enabled: true` unconditionally, which is a separate defect on a different path;
-      // it is tracked rather than folded into this change, and the asymmetry only ever shapes LESS.
+      // exactly as it does on the Open-basic path. The primary engine dispatch above does not consult
+      // that switch (it only withholds shaping when the turn already carries the policy), which is a
+      // separate defect on a different path; it is tracked rather than folded into this change, and
+      // the asymmetry only ever shapes LESS.
       if (!isShapingHooksActivated(options.entitlementEnv ?? process.env)) return undefined;
       // The tool's own prompt hook may already have attached the identical block upstream.
       if (bodyAlreadyCarriesOutputShaping(originalText)) return undefined;
@@ -1808,18 +1948,22 @@ async function resolveStoredAuthorizationApply(
         return shapingOnlyFallbackOutcome(fallbackBody, allowancePause, first.lcmOutcome);
       }
       log(`compaction gateway: stored authorization ${authorization.id} did not apply - ${first.reason} (fail-open, original forwarded unchanged).`);
-      // A no-op the engine PRODUCED still says why LCM did not contribute; a bare `null` would drop
-      // that from the receipt on exactly the did-not-contribute turns.
-      return first.lcmOutcome !== undefined || first.outputShapingState !== undefined
-        ? {
-            declined: true,
-            ...(first.lcmOutcome !== undefined ? { lcmOutcome: first.lcmOutcome } : {}),
-            ...(first.outputShapingState !== undefined ? { outputShapingState: first.outputShapingState } : {}),
-            ...(first.outputShapingPolicyVersion !== undefined
-              ? { outputShapingPolicyVersion: first.outputShapingPolicyVersion }
-              : {})
-          }
-        : null;
+      // Every engine decline records why input compaction did not apply: the engine's own LCM outcome
+      // when it produced one, otherwise the decline class (degraded / allowance / refused). A bare
+      // `null` here made an engine refusal look like a request the engine never saw.
+      // A refusal at the allowance still pauses input compaction for this turn. Before the no-duplicate
+      // change the shaping-only fallback carried that pause; on a turn whose hook already shaped it
+      // there is nothing to fall back to, so the pause travels on the declined record instead.
+      const declinePause = allowancePause ?? (first.refusal === "quota-exhausted" ? pauseFor("insufficient") : undefined);
+      return {
+        declined: true,
+        lcmOutcome: first.lcmOutcome ?? classifyEngineDecline(first),
+        ...(declinePause ? { allowancePause: declinePause } : {}),
+        ...(first.outputShapingState !== undefined ? { outputShapingState: first.outputShapingState } : {}),
+        ...(first.outputShapingPolicyVersion !== undefined
+          ? { outputShapingPolicyVersion: first.outputShapingPolicyVersion }
+          : {})
+      };
     }
 
     let decision: AppliedEngineDecision = first;
@@ -1922,7 +2066,11 @@ async function resolveStoredAuthorizationApply(
           const fallbackBody = planShapingOnlyFallback();
           if (fallbackBody === undefined) {
             log(`compaction gateway: stored authorization ${authorization.id} did not apply - no output-shaping-only treatment available for this request (original forwarded unchanged).`);
-            return null;
+            return {
+              declined: true,
+              lcmOutcome: { kind: "rejected", reason: "allowance-insufficient" },
+              allowancePause: pauseFor("insufficient")
+            };
           }
           log(`compaction gateway: stored authorization ${authorization.id} - the engine returned no output-shaping-only treatment; applying the public baseline shaping instead (nothing debited).`);
           return shapingOnlyFallbackOutcome(fallbackBody, pauseFor("insufficient"));
@@ -2028,6 +2176,9 @@ async function resolveStoredAuthorizationApply(
             // The lease's allowance travels with the debit so the AUTHORITATIVE remaining-allowance
             // test can be re-evaluated against a fresh tally inside the journal append lock.
             allowanceTokens,
+            // Re-read under the journal lock: a renewal that landed while this request was in the
+            // engine also moved the reconcile watermark, and only the lease stored NOW pairs with it.
+            currentAllowanceTokens: () => currentLeaseAllowanceTokens(meteringEnv, periodId),
             recoveryId,
             ...(decision.meterVersion !== undefined ? { meterVersion: decision.meterVersion } : {}),
             ...(decision.meteredOptimizedInputTokens !== undefined
@@ -2393,6 +2544,41 @@ async function recordApplyReceiptFor(params: {
 }
 
 /** Build + append the content-free receipt. Best-effort: a failure here never affects the client. */
+/**
+ * The regime of a record turn whose forwarded body already carries the Claude Code HOOK treatment.
+ *
+ * The gateway attached nothing on such a turn, so it has no classification of its own; the hook does,
+ * and records it per session (`shape` = its task gate classified the turn default-shapeable). Without
+ * this, every record receipt carrying the hook carrier had no regime, the calibration query for it
+ * resolved `unavailable`, and ONE such call — e.g. an auxiliary call inside a run whose other calls
+ * all resolved — made the whole settled run render `output N/A`.
+ *
+ * Exact hook carrier only, Claude Code only, `shape` only. `shape-basic` (no classifier) and every
+ * hold or unreadable record leave the regime unset, exactly as `claude-stop-activity.ts` does, and so
+ * does a record written after this request started. Reads one metadata field of the body and the local
+ * turn file; never throws.
+ */
+async function hookShapedRegime(
+  options: GatewayServerOptions,
+  bodyText: string,
+  policyVersion: string | undefined,
+  env: NodeJS.ProcessEnv,
+  requestStartedAt: string
+): Promise<"default-shapeable" | undefined> {
+  try {
+    if (options.workflow !== "claude-code") return undefined;
+    if (policyVersion === undefined || policyVersion !== buildHookOutputShapingTreatment().policyVersion) return undefined;
+    const sessionId = toolSessionIdFromRequestBody(bodyText);
+    if (sessionId === undefined) return undefined;
+    // Judged AS OF the request's start, not the response's end: a record the NEXT prompt wrote while
+    // this call was still streaming is future-dated from here and reads as no decision.
+    const outcome = await lastTurnShapingOutcome({ tool: "claude-code", sessionId }, env, () => new Date(requestStartedAt));
+    return outcome === "shape" ? "default-shapeable" : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function recordReceipt(params: {
   options: GatewayServerOptions;
   adapter: ProviderAdapter;
@@ -2408,9 +2594,13 @@ async function recordReceipt(params: {
   requestStartedAt?: string;
   /** Fixed-vocabulary LCM outcome when the engine ran for this turn and applied nothing. */
   lcmOutcome?: { kind: string; reason: string };
+  /** The allowance pause of a declined turn that applied nothing; see `buildGatewayReceipt`. */
+  allowancePause?: GatewayReceipt["allowance_pause"];
   /** Output-shaping provenance for the forwarded bytes; see `buildGatewayReceipt`. */
   outputShapingState?: "attached-this-pass" | "already-active" | "absent";
   outputShapingPolicyVersion?: string;
+  /** Set only when the hook's own task gate classified this turn; see `hookShapedRegime`. */
+  outputShapingRegime?: "default-shapeable";
   proofRunId?: string;
   proofVariant?: "baseline" | "compacted";
   log: (line: string) => void;
@@ -2431,10 +2621,12 @@ async function recordReceipt(params: {
       ...(params.sessionCorrelationId ? { sessionCorrelationId: params.sessionCorrelationId } : {}),
       ...(params.requestStartedAt ? { requestStartedAt: params.requestStartedAt } : {}),
       ...(params.lcmOutcome ? { lcmOutcome: params.lcmOutcome } : {}),
+      ...(params.allowancePause ? { allowancePause: params.allowancePause } : {}),
       ...(params.outputShapingState ? { outputShapingState: params.outputShapingState } : {}),
       ...(params.outputShapingPolicyVersion
         ? { outputShapingPolicyVersion: params.outputShapingPolicyVersion }
         : {}),
+      ...(params.outputShapingRegime ? { outputShapingRegime: params.outputShapingRegime } : {}),
       ...(params.proofRunId ? { proofRunId: params.proofRunId } : {}),
       ...(params.proofVariant ? { proofVariant: params.proofVariant } : {})
     });

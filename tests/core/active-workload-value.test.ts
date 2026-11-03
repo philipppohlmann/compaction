@@ -81,7 +81,7 @@ describe("equivalent active-workload minutes", () => {
       endedAt: "2026-09-12T15:24:31.000Z"
     };
     expect(runAggregateLine({ aggregate, tier: "full", outputBasis: "measured", activeWindow })).toBe(
-      "compaction · input 5,094,469→4,703,745 (−8%) · output 16,056→12,042 (−25%, est.) · +~1m · full apply"
+      "compaction · input 5,094,469→4,703,745 (−8%) · output 16,056→12,042 (−25.0%, est.) · +~1m"
     );
     expect(runAggregateLine({ aggregate, tier: "basic", outputBasis: "measured", activeWindow })).not.toContain("+~");
     expect(runAggregateLine({ aggregate, tier: "full", outputBasis: "measured" })).not.toContain("+~");
@@ -103,7 +103,7 @@ describe("equivalent active-workload minutes", () => {
       }
     });
     expect(line).toBe(
-      "compaction · input 332,983→332,521 (−0%) · output 4,161→3,121 (−25%, est.) · +~0.01m · full apply"
+      "compaction · input 332,983→332,521 (−0%) · output 4,161→3,121 (−25.0%, est.) · +~0.01m"
     );
 
     expect(runAggregateLine({
@@ -120,7 +120,7 @@ describe("equivalent active-workload minutes", () => {
         endedAt: "2026-09-12T21:58:21.000Z"
       }
     })).toBe(
-      "compaction · input 220,021→219,714 (−0%) · output 880→660 (−25%, est.) · +~0.001m · full apply"
+      "compaction · input 220,021→219,714 (−0%) · output 880→660 (−25.0%, est.) · +~0.001m"
     );
   });
 });

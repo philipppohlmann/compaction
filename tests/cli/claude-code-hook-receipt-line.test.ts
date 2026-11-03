@@ -8,12 +8,22 @@ import { createUsageMetadata } from "../../src/core/usage-metadata.js";
 import { buildGatewayReceipt, type GatewayReceipt } from "../../src/core/gateway/receipt.js";
 import { RECEIPT_LINE_ENV } from "../../src/core/gateway/receipt-line.js";
 import { stopShaping } from "../../src/core/subscription-shaping-state.js";
+import {
+  buildHookOutputShapingTreatment,
+  buildOutputShapingPolicy
+} from "../../src/core/output-shaping.js";
 import { seedOutputCalibration } from "../helpers/output-calibration-fixture.js";
 import type { OpenAiUsageBreakdown } from "../../src/core/gateway/openai-usage.js";
 
 /** Seed one exact engine-confirmed cohort in a temp config dir. */
-async function writeCalibration(configDir: string, controlOut: number, treatmentOut: number): Promise<void> {
+async function writeCalibration(
+  configDir: string,
+  controlOut: number,
+  treatmentOut: number,
+  policyVersion = buildHookOutputShapingTreatment().policyVersion
+): Promise<void> {
   await seedOutputCalibration({ COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv, {
+    policyVersion,
     provider: "anthropic",
     model: "claude-x",
     regime: "default-shapeable",
@@ -46,7 +56,7 @@ const providerUsage = createUsageMetadata({
 const stopPayload = (sessionId: string) =>
   JSON.stringify({ session_id: sessionId, transcript_path: "/x/y.jsonl", hook_event_name: "Stop" });
 
-function gatewayReceiptWithCache(): GatewayReceipt {
+function gatewayReceiptWithCache(options: { shaped?: boolean } = {}): GatewayReceipt {
   const usage: OpenAiUsageBreakdown = {
     present: true,
     promptInputTokens: 100,
@@ -61,6 +71,13 @@ function gatewayReceiptWithCache(): GatewayReceipt {
     mode: "record",
     upstreamStatus: 200,
     usage,
+    ...(options.shaped
+      ? {
+        outputShapingState: "attached-this-pass" as const,
+        outputShapingPolicyVersion: buildOutputShapingPolicy().policyVersion,
+        outputShapingRegime: "default-shapeable" as const
+      }
+      : {}),
     id: () => "8f4c2f6e-1111-1111-1111-111111111111",
     now: NOW
   });
@@ -99,6 +116,38 @@ describe("Claude Code Stop hook - per-turn receipt line", () => {
     expect(canonical[0]).not.toContain("provider-cached");
     expect(canonical[0]).not.toContain("−");
     expect(canonical[0]).not.toContain("→");
+  });
+
+  it("continues to resolve exact core calibration from gateway receipt provenance", async () => {
+    const cwd = await tempCwd();
+    const configDir = await mkdtemp(path.join(tmpdir(), "cc-gateway-core-cal-"));
+    await seedOutputCalibration({ COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv, {
+      policyVersion: buildOutputShapingPolicy().policyVersion,
+      provider: "openai",
+      model: "gpt-5",
+      regime: "default-shapeable",
+      control: [1000, 1000, 1000],
+      treatment: [600, 600, 600]
+    });
+    const lines: string[] = [];
+    await captureClaudeCodeFromHook(
+      {},
+      {
+        cwd,
+        now: NOW,
+        hostedConfigured: noHosted,
+        readStdin: async () => stopPayload("s-gateway-core"),
+        normalize: async () => ({ usage: providerUsage, messageCount: 5, fingerprint: "fp-gateway-core" }),
+        readLatestGatewayReceipt: async () => gatewayReceiptWithCache({ shaped: true }),
+        printReceiptLine: (line) => lines.push(line),
+        env: { COMPACTION_CONFIG_DIR: configDir }
+      }
+    );
+
+    const canonical = lines.filter((line) => line.startsWith("compaction · "));
+    expect(canonical).toHaveLength(1);
+    expect(canonical[0]).toContain("observed input 100");
+    expect(canonical[0]).toContain("output 687→412 (−40.0%, est.)");
   });
 
   it("without a gateway receipt, shaping OFF → the plain OUTPUT-ONLY hook line (no input clause, no %, no saved clause)", async () => {
@@ -171,7 +220,7 @@ describe("Claude Code Stop hook - per-turn receipt line", () => {
     expect(lines.filter((l) => l.startsWith("compaction · "))).toHaveLength(0);
   });
 
-  it("shaping ACTIVE + a real calibration artifact → output before→after with a labeled percent", async () => {
+  it("shaping ACTIVE + exact hook calibration → output before→after with a labeled percent", async () => {
     const cwd = await tempCwd();
     const configDir = await mkdtemp(path.join(tmpdir(), "cc-hook-cal-"));
     // control 1000 / treatment 600 → r=0.4; this turn's output is 412 → saved = round(412*0.4/0.6)=275.
@@ -200,11 +249,45 @@ describe("Claude Code Stop hook - per-turn receipt line", () => {
     );
     const canonical = lines.filter((l) => l.startsWith("compaction · "));
     expect(canonical).toHaveLength(1);
-    // Shaping active this turn ⇒ the honest per-turn label is `basic shaping`, after the est-saved clause.
-    // 412 real output + 275 estimated saved = a 687 derived before, on the OUTPUT clause.
+    // Shaping active this turn, so the calibrated output arrow is eligible.
     // 412 real output + 275 estimated saved = a 687 derived before; 275/687 = 40%.
-    expect(canonical[0]).toBe("compaction · output 687→412 (−40%, est.) · basic shaping");
-    expect(canonical[0], "an output percent must always carry `est`").not.toMatch(/−\d+%(?!, est)/);
+    expect(canonical[0]).toBe("compaction · output 687→412 (−40.0%, est.)");
+    expect(canonical[0], "an output percent must always carry `est`").not.toMatch(/−\d+(?:\.\d+)?%(?!, est)/);
+  });
+
+  it("does not borrow exact core calibration for a shaped hook-only turn", async () => {
+    const cwd = await tempCwd();
+    const configDir = await mkdtemp(path.join(tmpdir(), "cc-hook-core-cal-"));
+    await writeCalibration(configDir, 1000, 600, buildOutputShapingPolicy().policyVersion);
+    await recordShapingOutcome(
+      { tool: "claude-code", sessionId: "s-core-only" },
+      "shape",
+      { COMPACTION_CONFIG_DIR: configDir } as NodeJS.ProcessEnv
+    );
+    const lines: string[] = [];
+    await captureClaudeCodeFromHook(
+      {},
+      {
+        cwd,
+        now: NOW,
+        hostedConfigured: noHosted,
+        readStdin: async () => stopPayload("s-core-only"),
+        normalize: async () => ({ usage: providerUsage, messageCount: 5, fingerprint: "fp-core-only" }),
+        readLatestGatewayReceipt: async () => undefined,
+        printReceiptLine: (line) => lines.push(line),
+        env: { COMPACTION_CONFIG_DIR: configDir }
+      }
+    );
+
+    const canonical = lines.filter((line) => line.startsWith("compaction · "));
+    expect(canonical).toHaveLength(1);
+    // The guard is UNCHANGED and is the point of this case: the device's exact 40% calibration belongs to
+    // the CORE carrier, and a hook-carrier turn must not borrow it. What changed is the fallback — instead
+    // of a permanent `N/A`, the turn now resolves the HOOK family's own posterior. So assert both halves:
+    // a figure renders, and it is demonstrably NOT the core cohort's 40% (which would read 687→412).
+    expect(canonical[0]).toMatch(/output [\d,]+→412 \(−\d+\.\d%, est\.\)/);
+    expect(canonical[0], "the core cohort's exact rate must not be borrowed").not.toContain("687→412");
+    expect(canonical[0], "nor its percent").not.toContain("−40.0%");
   });
 
   /**
@@ -237,7 +320,7 @@ describe("Claude Code Stop hook - per-turn receipt line", () => {
       }
     );
     const canonical = lines.filter((l) => l.startsWith("compaction · "));
-    expect(canonical[0], "a held turn must not claim a saving").toBe("compaction · output 412 · basic shaping");
+    expect(canonical[0], "a held turn must not claim a saving").toBe("compaction · output 412");
     expect(canonical[0]).not.toContain("→");
   });
 
@@ -260,7 +343,7 @@ describe("Claude Code Stop hook - per-turn receipt line", () => {
       }
     );
     const canonical = lines.filter((l) => l.startsWith("compaction · "));
-    expect(canonical[0]).toBe("compaction · output 412 · basic shaping");
+    expect(canonical[0]).toBe("compaction · output 412");
   });
 
   it("shaping ACTIVE + NO calibration artifact → a plain count, never a fabricated before", async () => {
@@ -282,7 +365,7 @@ describe("Claude Code Stop hook - per-turn receipt line", () => {
     );
     const canonical = lines.filter((l) => l.startsWith("compaction · "));
     expect(canonical).toHaveLength(1);
-    expect(canonical[0]).toBe("compaction · output 412 · basic shaping");
+    expect(canonical[0]).toBe("compaction · output 412");
     expect(canonical[0]).not.toMatch(/~\d/); // no bare number when uncalibrated
   });
 

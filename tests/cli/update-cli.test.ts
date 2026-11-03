@@ -8,6 +8,7 @@ import { loadExecutingManagedInstallation } from "../../src/core/update/ownershi
 import { discoverVersion } from "../../src/core/update/registry.js";
 import { stageLatestUpdate } from "../../src/core/update/worker.js";
 import { rollbackPair } from "../../src/core/update/activation.js";
+import { codexHookReviewNotice } from "../../src/core/codex-hook-trust.js";
 vi.mock("../../src/core/update/ownership.js", async original => ({ ...await original<typeof import("../../src/core/update/ownership.js")>(), loadExecutingManagedInstallation: vi.fn() }));
 vi.mock("../../src/core/update/registry.js", async original => ({ ...await original<typeof import("../../src/core/update/registry.js")>(), discoverVersion: vi.fn() }));
 vi.mock("../../src/core/update/worker.js", () => ({ stageLatestUpdate: vi.fn() }));
@@ -23,7 +24,7 @@ beforeEach(() => {
 });
 afterEach(() => { process.exitCode = undefined; vi.clearAllMocks(); vi.unstubAllEnvs(); rmSync(root, { recursive: true, force: true }); });
 async function command(...args: string[]) { const program = new Command().name("compaction").version("0.6.8"); registerUpdateCommand(program); await program.parseAsync(["node", "compaction", "update", ...args]); }
-function managed() { vi.mocked(loadExecutingManagedInstallation).mockReturnValue({ root, pair: { cli: { version: "0.6.8" } } } as ReturnType<typeof loadExecutingManagedInstallation>); }
+function managed() { vi.mocked(loadExecutingManagedInstallation).mockReturnValue({ root, receipt: { launcherPath: path.join(root, "bin/compaction") }, pair: { cli: { version: "0.6.8" } } } as ReturnType<typeof loadExecutingManagedInstallation>); }
 describe("compaction update command boundary", () => {
   it("checks public stable/preview releases without configuration or installation writes", async () => {
     await command("--check", "--channel", "preview");
@@ -53,6 +54,32 @@ describe("compaction update command boundary", () => {
     managed(); vi.mocked(rollbackPair).mockResolvedValue({ status: "deferred", reason: "active-session" } as Awaited<ReturnType<typeof rollbackPair>>);
     await command("--rollback"); expect(rollbackPair).toHaveBeenCalledWith(root, { gatewayBarrier: expect.any(Function) });
     expect(log).toHaveBeenCalledWith("Rollback: deferred (active-session)."); expect(stageLatestUpdate).not.toHaveBeenCalled();
+  });
+  it("pins owned hooks to the managed launcher before staging, leaving foreign entries alone", async () => {
+    const settings = path.join(process.env.HOME!, ".claude/settings.json");
+    mkdirSync(path.dirname(settings), { recursive: true });
+    writeFileSync(settings, JSON.stringify({ statusLine: { type: "command", command: "compaction statusline" },
+      hooks: { Stop: [{ hooks: [{ type: "command", command: "echo compaction capture claude-code --from-hook" }] }] } }));
+    managed(); vi.mocked(stageLatestUpdate).mockRejectedValue(new Error("offline"));
+    await command();
+    expect(JSON.parse(readFileSync(settings, "utf8"))).toEqual({ statusLine: { type: "command", command: `${path.join(root, "bin/compaction")} statusline` },
+      hooks: { Stop: [{ hooks: [{ type: "command", command: "echo compaction capture claude-code --from-hook" }] }] } });
+    expect(log.mock.calls.flat().join("\n")).not.toContain("Codex");
+    rmSync(path.dirname(settings), { recursive: true, force: true });
+  });
+  it("pins Codex hooks on an explicit update and says once that Codex will ask to review them", async () => {
+    const hooks = path.join(process.env.HOME!, ".codex/hooks.json");
+    mkdirSync(path.dirname(hooks), { recursive: true });
+    writeFileSync(hooks, JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "compaction hooks shape codex", timeout: 10 }] }] } }));
+    managed(); vi.mocked(stageLatestUpdate).mockResolvedValue({ status: "unchanged", version: "0.6.8" });
+    await command();
+    expect(JSON.parse(readFileSync(hooks, "utf8")).hooks.UserPromptSubmit[0].hooks[0].command).toBe(`${path.join(root, "bin/compaction")} hooks shape codex`);
+    const notices = log.mock.calls.flat().filter((line) => String(line).includes("Hooks need review"));
+    expect(notices).toEqual([codexHookReviewNotice()]);
+    expect(notices[0]).toContain("compaction status --check-codex");
+    log.mockClear(); await command();
+    expect(log.mock.calls.flat().join("\n")).not.toContain("Hooks need review");
+    rmSync(path.dirname(hooks), { recursive: true, force: true });
   });
   it("does not call an already staged candidate the current installed version", async () => {
     managed(); vi.mocked(stageLatestUpdate).mockResolvedValue({ status: "already-staged", version: "0.6.9" });

@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import { atomicWrite, readState, syncDirectory, withManagedLock, writeState } from "./state.js";
 import type { InstallationReceipt, ManagedState, PairDescriptor } from "./types.js";
 import { parseReleaseCompatibility } from "./compatibility.js";
+import { isWritableLauncher } from "../compaction-command.js";
 import { resolveSessionPin, SESSION_PIN_ENV } from "./sessions.js";
 import { classifyOfficialNpmGlobalEntry, type OfficialNpmGlobalInstallation } from "./npm-global-ownership.js";
 
@@ -16,14 +17,60 @@ export function defaultManagedRoot(env: NodeJS.ProcessEnv = process.env): string
 
 export function sha256(bytes: string | Buffer): string { return createHash("sha256").update(bytes).digest("hex"); }
 
+/** POSIX single-quoting, so a printed remedy stays one argument for any path a user can create. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 /** Validate only owned anchors, not OS-managed ancestors such as macOS /var or /tmp aliases. */
 export function assertOwnedDirectory(directory: string): void {
   const stat = lstatSync(directory);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o022) !== 0
-    || (process.getuid && stat.uid !== process.getuid())) throw new Error("Managed storage directory ownership or permissions cannot be verified");
+  const problem = stat.isSymbolicLink() ? `${directory} is a symbolic link; use the real directory as the prefix.`
+    : !stat.isDirectory() ? `${directory} is not a directory.`
+    : process.getuid && stat.uid !== process.getuid() ? `${directory} is owned by another user (uid ${stat.uid}); choose an install prefix you own.`
+    : (stat.mode & 0o022) !== 0 ? `${directory} is writable by group or others (mode ${(stat.mode & 0o777).toString(8).padStart(4, "0")}). `
+      + `Remove that access with \`chmod go-w ${shellQuote(directory)}\`, or install into a prefix only you can write (COMPACTION_PREFIX).`
+    : undefined;
+  // The invariant is unchanged: anything another account could write is refused. The message only says
+  // which directory failed and why, so the operator can fix it instead of guessing.
+  if (problem) throw new Error(`Managed storage directory ownership or permissions cannot be verified: ${problem}`);
 }
 
-/** An external Gateway may leave its empty private registry before installation is claimed. */
+const GATEWAY_RECORD_NAME = /^([0-9a-f]{48})\.json$/;
+
+/**
+ * Remove only Compaction's own Gateway records whose process the OS reports as gone (ESRCH): a private,
+ * owned regular file with the registry's exact name and shape (see `registerGatewayInstance`). A live,
+ * reused, foreign-owned, unreadable or malformed record is left in place, so the caller stays fail-closed.
+ */
+function pruneDeadGatewayRecords(directory: string): void {
+  for (const name of readdirSync(directory)) {
+    const instanceId = GATEWAY_RECORD_NAME.exec(name)?.[1];
+    if (!instanceId) continue;
+    const target = path.join(directory, name);
+    try {
+      const stat = lstatSync(target);
+      if (!stat.isFile() || (stat.mode & 0o077) !== 0 || !process.getuid || stat.uid !== process.getuid()) continue;
+      const record = JSON.parse(readFileSync(target, "utf8")) as { pid?: unknown; host?: unknown; port?: unknown; release?: Record<string, unknown> };
+      const release = record.release;
+      // The complete shape `registerGatewayInstance` writes (and `isGatewayReleaseIdentity` accepts), with
+      // exactly its keys; anything less or more is not provably ours and stays.
+      if (!record || typeof record !== "object" || Object.keys(record).sort().join() !== "host,pid,port,release"
+        || typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 0
+        || typeof record.host !== "string" || record.host.length === 0
+        || typeof record.port !== "number" || !Number.isSafeInteger(record.port) || record.port <= 0 || record.port > 65535
+        || !release || typeof release !== "object" || release.instanceId !== instanceId
+        || typeof release.controlCapability !== "string" || !/^[0-9a-f]{64}$/.test(release.controlCapability)
+        || typeof release.cliVersion !== "string" || !Number.isSafeInteger(release.protocolVersion)
+        || typeof release.pairId !== "string" || release.pairId.length === 0) continue;
+      try { process.kill(record.pid, 0); continue; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") continue; }
+      unlinkSync(target);
+    } catch { /* Ambiguous: keep it. */ }
+  }
+}
+
+/** An external Gateway may leave its private registry before installation is claimed; it must hold no live record. */
 export function assertEmptyUnclaimedGatewayRegistry(root: string): void {
   const directory = path.join(root, "gateways");
   let stat: ReturnType<typeof lstatSync>;
@@ -33,8 +80,14 @@ export function assertEmptyUnclaimedGatewayRegistry(root: string): void {
     throw error;
   }
   if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o7777) !== 0o700
-    || !process.getuid || stat.uid !== process.getuid() || readdirSync(directory).length !== 0) {
+    || !process.getuid || stat.uid !== process.getuid()) {
     throw new Error("Unclaimed Gateway registry must be an empty private owned directory");
+  }
+  pruneDeadGatewayRecords(directory);
+  const remaining = readdirSync(directory).length;
+  if (remaining !== 0) {
+    throw new Error(`Unclaimed Gateway registry must be an empty private owned directory: ${directory} still holds `
+      + `${remaining} record(s) for a live, unverifiable, or unrecognized Gateway. Stop any running Compaction Gateway and retry.`);
   }
 }
 
@@ -133,6 +186,17 @@ export function loadManagedInstallation(root = defaultManagedRoot(), verifyFiles
   const state = readState(root);
   validatePair(root, state.current, verifyFiles);
   return { receipt, state };
+}
+
+/**
+ * The launcher a native integration written by THIS invocation should name, or undefined when this
+ * invocation is not a verified managed runtime (npm-global, source, npx). Never throws.
+ */
+export function owningManagedLauncher(env: NodeJS.ProcessEnv = process.env, entry = process.argv[1]): string | undefined {
+  try {
+    const launcher = loadExecutingManagedInstallation(env, entry)?.receipt.launcherPath;
+    return isWritableLauncher(launcher) ? launcher : undefined;
+  } catch { return undefined; }
 }
 
 export function isManagedInstallation(root = defaultManagedRoot()): boolean {

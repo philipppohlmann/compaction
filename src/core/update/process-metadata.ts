@@ -113,7 +113,7 @@ ObjC.bindFunction('proc_pidpath',['int',['int','unsigned long','unsigned int']])
 ObjC.bindFunction('realpath',['unsigned long',['char *','unsigned long']]);
 function run(args) {
   var allocations=[], parser=PARSER(), results=[],stage='request';
-  var ABI={bsd:136,pid:12,uid:20,ruid:28,seconds:120,micros:128,vnode:2352,cwd:152,path:1024,exe:4096,args:262144};
+  var ABI={bsd:136,pid:12,uid:20,ruid:28,seconds:120,micros:128,vnode:2352,cwd:152,path:1024,exe:4096,args:262144,kinfo:648};
   function allocate(length) {
     var address=Number($.calloc(length,1));
     if(!Number.isSafeInteger(address)||address<=0)throw Error('allocation');
@@ -128,8 +128,23 @@ function run(args) {
   function base(value){return value.slice(value.lastIndexOf('/')+1);}
   try {
     var request=JSON.parse(args[0]),uid=$.getuid();
-    if(!Array.isArray(request.pids)||request.pids.length>4096||!Array.isArray(request.known)||request.known.length>16)throw Error('request');
-    stage='allocate';var info=allocate(ABI.bsd),vnode=allocate(ABI.vnode),exe=allocate(ABI.exe),canonical=allocate(ABI.exe),raw=allocate(ABI.args),mib=allocate(12),size=allocate(8);
+    if(!Array.isArray(request.pids)||request.pids.length>4096||!Array.isArray(request.known)||request.known.length>16
+      ||!Array.isArray(request.zombies)||request.zombies.length>4096)throw Error('request');
+    stage='allocate';var info=allocate(ABI.bsd),vnode=allocate(ABI.vnode),exe=allocate(ABI.exe),canonical=allocate(ABI.exe),raw=allocate(ABI.args),mib=allocate(16),size=allocate(8),kinfo=allocate(ABI.kinfo);
+    // A zombie has exited: no threads, no executable, nothing that can run a tool session. ps reported
+    // it as Z; the kernel must independently agree, twice and identically: the PID exists and has no BSD
+    // info, and KERN_PROC_PID either has no entry or reports this PID, this user, and state SZOMB (5)
+    // (struct extern_proc: p_starttime@0, p_stat@36, p_pid@40; eproc p_ruid@392, cr_uid@420). Any
+    // other answer falls through to the ordinary closed checks.
+    function terminal(pid){
+      if($.kill(pid,0)!==0||$.proc_pidinfo(pid,3,0,info.address,ABI.bsd)===ABI.bsd)return null;
+      $.memset(kinfo.address,0,ABI.kinfo);put32(mib.bytes,0,1);put32(mib.bytes,4,14);put32(mib.bytes,8,1);put32(mib.bytes,12,pid);put32(size.bytes,0,ABI.kinfo);put32(size.bytes,4,0);
+      if($.sysctl(mib.address,4,kinfo.address,size.address,0,0)!==0)return null;
+      var length=u64(size.bytes,0);
+      if(length===0)return 'absent';
+      if(length!==ABI.kinfo||kinfo.bytes[36]!==5||u32(kinfo.bytes,40)!==pid||u32(kinfo.bytes,392)!==uid||u32(kinfo.bytes,420)!==uid)return null;
+      return 'zombie:'+u64(kinfo.bytes,0)+':'+u32(kinfo.bytes,8);
+    }
     function identity(pid){
       if($.proc_pidinfo(pid,3,0,info.address,ABI.bsd)!==ABI.bsd)throw Error('identity');
       var seconds=u64(info.bytes,ABI.seconds),micros=u64(info.bytes,ABI.micros);
@@ -137,6 +152,27 @@ function run(args) {
       return pid+':'+uid+':'+seconds+':'+micros;
     }
     function executable(pid){$.memset(exe.address,0,ABI.exe);var n=$.proc_pidpath(pid,exe.address,ABI.exe);if(n<=0||n>=ABI.exe)throw Error('executable');var value=text(exe,0,n+1);if(!absolute(value))throw Error('executable');return value;}
+    function resolves(pid){try{executable(pid);return true;}catch(error){return false;}}
+    // proc_pidpath fails once a running image's file is unlinked: an app updated under a still-running
+    // helper (bundle swapped in, old one deleted). Such a process may be skipped only when its kernel-saved
+    // exec path positively names a non-candidate: a regular file now sits there, so the final component
+    // was not a link and its name is the image's own; that name is no tool or interpreter; and it is not in
+    // a known tool/shim file's directory (a superseded version-named binary). A link, a missing entry, or
+    // any doubt means the image could have been anything and stays closed. The regular file is the updated
+    // occupant of that path, so it identifies the image by name only: a renamed copy of an interpreter later
+    // replaced in place by an unrelated file outside every known tool directory is not distinguished.
+    function unrelatedImage(invoked){
+      var entry=$.NSFileManager.defaultManager.attributesOfItemAtPathError(invoked,null);
+      if(entry.isNil()||ObjC.unwrap(entry.objectForKey($.NSFileType))!=='NSFileTypeRegular')return false;
+      var name=base(invoked),parent=invoked.slice(0,invoked.lastIndexOf('/'))||'/',directories=[parent,physical(parent,'/')];
+      if(['codex','claude','cursor-agent'].indexOf(name)!==-1)return false;
+      if(request.known.length>0&&['node','nodejs','bash','sh','zsh','python','python3'].indexOf(name)!==-1)return false;
+      for(var k=0;k<request.known.length;k++){
+        var knownPath=request.known[k].path;
+        if(directories.indexOf(knownPath.slice(0,knownPath.lastIndexOf('/'))||'/')!==-1)return false;
+      }
+      return true;
+    }
     function directory(pid){$.memset(vnode.address,0,ABI.vnode);if($.proc_pidinfo(pid,9,0,vnode.address,ABI.vnode)!==ABI.vnode)throw Error('cwd');var value=text(vnode,ABI.cwd,ABI.cwd+ABI.path);if(!absolute(value))throw Error('cwd');return value;}
     function argumentsFor(pid){
       $.memset(raw.address,0,ABI.args);put32(mib.bytes,0,1);put32(mib.bytes,4,49);put32(mib.bytes,8,pid);put32(size.bytes,0,ABI.args);put32(size.bytes,4,0);
@@ -146,12 +182,21 @@ function run(args) {
     for(var index=0;index<request.pids.length;index++){
       var pid=request.pids[index];if(!Number.isSafeInteger(pid)||pid<=0)throw Error('pid');
       if($.kill(pid,0)!==0&&$.__error()[0]===3)continue;
+      stage='zombie';if(request.zombies.indexOf(pid)!==-1){var first=terminal(pid);if(first!==null&&first===terminal(pid))continue;}
       stage='identity';var before=identity(pid),cwd=null,loaded=null,fallback=false,tool=null,recorded=false,executablePath,name;
       stage='executable';
       try{executablePath=executable(pid);name=base(executablePath);}
       catch(error){
-        stage='cwd';cwd=directory(pid);stage='arguments';loaded=argumentsFor(pid);
-        stage='native-host';if(!absolute(loaded.parsed.invoked))throw Error('executable');var invokedName=base(loaded.parsed.invoked);executablePath=physical(loaded.parsed.invoked,cwd);name=base(executablePath);
+        stage='arguments';loaded=argumentsFor(pid);
+        stage='unresolved';if(!absolute(loaded.parsed.invoked))throw Error('executable');
+        if(unrelatedImage(loaded.parsed.invoked)){
+          $.memset(raw.address,0,ABI.args);
+          stage='recheck';var reread=argumentsFor(pid).parsed.invoked;$.memset(raw.address,0,ABI.args);
+          if(before!==identity(pid)||reread!==loaded.parsed.invoked||resolves(pid))throw Error('race');
+          continue;
+        }
+        stage='cwd';cwd=directory(pid);
+        stage='native-host';var invokedName=base(loaded.parsed.invoked);executablePath=physical(loaded.parsed.invoked,cwd);name=base(executablePath);
         for(var f=0;f<request.known.length;f++)if(request.known[f].path===executablePath&&request.known[f].tool==='claude'){tool='claude';recorded=true;}
         if(!tool&&invokedName==='claude')tool='claude';
         if(tool!=='claude'||loaded.parsed.dispatch(1)!=='chrome-native-host')throw Error('executable');fallback=true;
@@ -255,22 +300,37 @@ function linuxProcesses(pids: number[], known: ToolExecutable[]): ToolProcessMet
 }
 
 /** Undefined is a closed/unknown result, never permission to activate. No raw stderr is exposed. */
-export function readToolProcessMetadata(pids: number[], known: ToolExecutable[]): ToolProcessMetadata[] | undefined {
+export function readToolProcessMetadata(pids: number[], known: ToolExecutable[], zombies: number[] = []): ToolProcessMetadata[] | undefined {
+  const result = inspectToolProcesses(pids, known, zombies);
+  return result.ok ? result.processes : undefined;
+}
+
+/**
+ * `readToolProcessMetadata`, keeping the one content-free fact a closed result can carry: the PID the
+ * inventory could not inspect, when the platform helper named one. `zombies` are the PIDs `ps` reported
+ * in state Z; on macOS each is skipped only after the kernel confirms it twice (Linux applies its own
+ * equivalent rule from /proc).
+ */
+export function inspectToolProcesses(pids: number[], known: ToolExecutable[], zombies: number[] = []):
+  { ok: true; processes: ToolProcessMetadata[] } | { ok: false; pid?: number } {
+  let failedPid: number | undefined;
   try {
-    if (!process.getuid || pids.length > 4096 || pids.some((pid) => !Number.isSafeInteger(pid) || pid <= 0) || new Set(pids).size !== pids.length) return undefined;
-    if (known.length > 16 || known.some((item) => !path.isAbsolute(item.path) || !["codex", "claude", "cursor-agent"].includes(item.tool))) return undefined;
+    if (!process.getuid || pids.length > 4096 || pids.some((pid) => !Number.isSafeInteger(pid) || pid <= 0) || new Set(pids).size !== pids.length) return { ok: false };
+    if (known.length > 16 || known.some((item) => !path.isAbsolute(item.path) || !["codex", "claude", "cursor-agent"].includes(item.tool))) return { ok: false };
     known = known.map((item) => ({ ...item, path: realpathSync(item.path) }));
+    zombies = zombies.filter((pid) => pids.includes(pid));
     let result;
     if (process.platform === "linux") result = { ok: true, processes: linuxProcesses(pids, known) };
     else {
-      if (process.platform !== "darwin" || !["arm64", "x64"].includes(process.arch)) return undefined;
+      if (process.platform !== "darwin" || !["arm64", "x64"].includes(process.arch)) return { ok: false };
       const program = darwinProgram.replace("PARSER()", `(${processMetadataParser.toString()})()`);
-      const output = childProcess.execFileSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", program, JSON.stringify({ pids, known })], {
+      const output = childProcess.execFileSync("/usr/bin/osascript", ["-l", "JavaScript", "-e", program, JSON.stringify({ pids, known, zombies })], {
         encoding: "utf8", timeout: 8_000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], env: { PATH: "/usr/bin:/bin", LC_ALL: "C" }
       });
       result = JSON.parse(output);
+      if (result.ok === false && Number.isSafeInteger(result.pid) && pids.includes(result.pid)) failedPid = result.pid;
     }
-    if (result.ok !== true || !Array.isArray(result.processes) || result.processes.length > pids.length) return undefined;
+    if (result.ok !== true || !Array.isArray(result.processes) || result.processes.length > pids.length) return { ok: false, ...(failedPid ? { pid: failedPid } : {}) };
     const seen = new Set<number>();
     for (const item of result.processes) {
       if (!pids.includes(item.pid) || seen.has(item.pid) || item.uid !== process.getuid() || typeof item.birth !== "string"
@@ -280,12 +340,12 @@ export function readToolProcessMetadata(pids: number[], known: ToolExecutable[])
         || typeof item.cwd !== "string" || !path.isAbsolute(item.cwd) || typeof item.executable !== "string" || !path.isAbsolute(item.executable)
         || !item.environment || typeof item.environment !== "object" || Array.isArray(item.environment)
         || Object.keys(item).some((key) => !["pid", "uid", "birth", "executable", "cwd", "tool", "recorded", "dispatch", "environment"].includes(key))
-        || [item.cwd, item.executable].some((value) => value.length >= 4096 || /[\0\r\n]/.test(value))) return undefined;
+        || [item.cwd, item.executable].some((value) => value.length >= 4096 || /[\0\r\n]/.test(value))) return { ok: false };
       seen.add(item.pid);
       for (const [key, value] of Object.entries(item.environment)) {
-        if (!["HOME", "PATH", "CODEX_HOME", "CLAUDE_CONFIG_DIR"].includes(key) || typeof value !== "string" || value.length > 16384 || /[\0\r\n]/.test(value)) return undefined;
+        if (!["HOME", "PATH", "CODEX_HOME", "CLAUDE_CONFIG_DIR"].includes(key) || typeof value !== "string" || value.length > 16384 || /[\0\r\n]/.test(value)) return { ok: false };
       }
     }
-    return result.processes;
-  } catch { return undefined; }
+    return { ok: true, processes: result.processes };
+  } catch { return { ok: false }; }
 }

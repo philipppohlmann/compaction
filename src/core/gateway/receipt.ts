@@ -364,6 +364,12 @@ export function buildGatewayReceipt(params: {
    */
   lcmOutcome?: { kind: string; reason: string };
   /**
+   * The allowance pause, when input compaction was declined for want of allowance and nothing was
+   * applied (the turn already carried the shaping policy, so there was no shaping-only treatment to
+   * apply). Same object the apply receipt carries.
+   */
+  allowancePause?: GatewayReceipt["allowance_pause"];
+  /**
    * Output-shaping provenance for the bytes this turn FORWARDED. A record-mode turn mutates nothing,
    * which is NOT the same as a turn on which output shaping did not run: the tool's own
    * `UserPromptSubmit` hook routinely attaches the policy upstream, so the request arrives already
@@ -435,6 +441,7 @@ export function buildGatewayReceipt(params: {
     content_uploaded: false,
     ...(params.sessionCorrelationId ? { session_correlation_id: params.sessionCorrelationId } : {}),
     ...(params.lcmOutcome ? { lcm_outcome: params.lcmOutcome } : {}),
+    ...(params.allowancePause ? { allowance_pause: params.allowancePause } : {}),
     ...(params.outputShapingState ? { output_shaping_state: params.outputShapingState } : {}),
     ...(shapingActive && params.outputShapingPolicyVersion
       ? { output_shaping_policy_version: params.outputShapingPolicyVersion }

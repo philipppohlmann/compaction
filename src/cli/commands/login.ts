@@ -26,12 +26,18 @@ import {
   type StoredCredentials
 } from "../../core/auth/credentials.js";
 import { listAccountDevices, revokeAccountDevice } from "../../core/auth/device-flow.js";
+import { effectiveOpenTier, readConnectedWorkflows, readProductMode } from "../../core/onboarding-preferences.js";
+import { engineInputCompaction } from "../../core/engine-availability.js";
+import { INPUT_COMPACTION_UNSUPPORTED, REFRESH_COMMUNITY_REMEDY } from "./upgrade-status.js";
+import { resolveApplyRoutingActivation } from "../../core/gateway/apply-routing-activation.js";
+import { pendingFullApplyGate } from "./full-apply-gate.js";
 import {
   communityRuntimeReady,
   describeRepairActions,
   engineBlockedReason,
   ensureCommunityRuntime,
-  leaseBlockedReason
+  leaseBlockedReason,
+  type CommunityRuntimeOutcome
 } from "../../core/entitlement/community-runtime.js";
 import {
   performDeviceLogin,
@@ -182,13 +188,78 @@ async function runLogin(
     printLoggedIn(credentials);
     console.log(chalk.dim(`  Credentials written to ${credentialsPath(env)} (mode 0600).`));
   }
-  await printCommunitySetup(env);
-  console.log(
-    chalk.dim(
-      "  Note: being connected does not enable full apply by itself — the per-tool apply " +
-        "authorization is a separate step."
-    )
-  );
+  const runtime = await printCommunitySetup(env);
+  await printRemainingFullApplySteps(env, runtime);
+}
+
+/**
+ * The steps still standing between this device and a routed turn that actually compacts input.
+ *
+ * WHY THIS EXISTS. `login` is the command that COMPLETES browser activation, and it was the one
+ * surface that never asked what else was missing. It printed a single note naming the per-tool
+ * authorization — one of three gates — so a user who activated Community outside the Ink onboarding was
+ * told they were set up, left on `product_mode: basic` (which means "no input compaction"), and given
+ * an incomplete remedy. Measured consequence: a device with a valid lease, a verified engine, a
+ * connected workflow and a stored authorization still applied nothing on every turn, and nothing it
+ * printed said why.
+ *
+ * It reuses the SAME predicates the gateway will answer with — `resolveApplyRoutingActivation` for the
+ * routing decision, `pendingFullApplyGate` for the mode and authorization, `effectiveOpenTier` for the
+ * per-request product-mode gate, `engineInputCompaction` for the engine's metering contract — rather
+ * than re-deriving them, so this screen and the first request cannot disagree. Content-free, local
+ * reads only.
+ */
+export async function printRemainingFullApplySteps(
+  env: NodeJS.ProcessEnv,
+  runtime?: CommunityRuntimeOutcome
+): Promise<void> {
+  let decision: Awaited<ReturnType<typeof resolveApplyRoutingActivation>>;
+  let pendingReason: string | undefined;
+  let tier: ReturnType<typeof effectiveOpenTier>;
+  let inputCompaction: Awaited<ReturnType<typeof engineInputCompaction>>;
+  try {
+    // ASK THE QUESTIONS THE GATEWAY ANSWERS, not a subset of them. The routing guard decides whether a
+    // routed `claude` run engages the apply path at all (engine, stop, credential, mode, connect,
+    // authorization); the gateway then declines every request whose effective tier is not `full`
+    // (`resolveStoredAuthorizationApply`) and every request an engine with an unsupported metering
+    // contract would receive. The guard alone is not the whole answer: after a reverted activation the
+    // device holds a valid lease and every opt-in while `product_mode` is `basic`, so the guard engages
+    // and every turn is still declined.
+    decision = await resolveApplyRoutingActivation({ provider: "anthropic", cwd: process.cwd(), env });
+    pendingReason = await pendingFullApplyGate(readConnectedWorkflows(env), env);
+    tier = effectiveOpenTier(env);
+    inputCompaction = await engineInputCompaction(env);
+  } catch {
+    return; // Diagnostics must never fail a successful login.
+  }
+  if (decision.engage && tier === "full" && inputCompaction !== "unsupported") {
+    console.log(chalk.green("  Input compaction is armed: the next tool session applies on eligible turns."));
+    return;
+  }
+  console.log(chalk.yellow("  Connected, but input compaction is not armed yet."));
+  // THE REASON THE GATEWAY WOULD GIVE. Never a fixed remedy: a device blocked on the optimization mode
+  // must not be handed the authorize step (a command that changes nothing for it).
+  if (!decision.engage && decision.cause === "workflow-not-connected") {
+    // `pendingFullApplyGate` only looks at CONNECTED workflows, so with none connected it reports a
+    // missing authorization even when one is stored. The guard names the real blocker.
+    console.log(chalk.yellow(`    ${decision.reason}`));
+  } else if (pendingReason !== undefined) {
+    console.log(chalk.yellow(`    ${pendingReason}`));
+  } else if (!decision.engage) {
+    console.log(chalk.yellow(`    ${decision.reason}`));
+  } else if (inputCompaction === "unsupported") {
+    console.log(chalk.yellow(`    ${INPUT_COMPACTION_UNSUPPORTED}`));
+  } else if (readProductMode(env) !== "full") {
+    console.log(chalk.yellow(`    the product mode is ${tier} (\`compaction mode full\` enables input compaction)`));
+  } else if (runtime !== undefined && runtime.lease === "unavailable") {
+    // The product mode IS full; the clamp reads `observe` because the lease is not valid (the guard can
+    // still engage on an API key). Naming the clamped tier would state a mode the user never chose and
+    // offer a command that changes nothing — name the lease state instead, with the setup line's copy.
+    console.log(chalk.yellow(`    Community access is not active on this device yet — ${leaseBlockedReason(runtime)}.`));
+  } else {
+    console.log(chalk.yellow(`    ${REFRESH_COMMUNITY_REMEDY}`));
+  }
+  console.log(chalk.dim("  `compaction status` lists the remaining steps for this device."));
 }
 
 /**
@@ -203,9 +274,9 @@ async function runLogin(
  * importantly, a PARTIAL SUCCESS is not reported as nothing. What changed is named before what did
  * not, so a user whose access was renewed but whose engine download failed reads both halves.
  */
-async function printCommunitySetup(env: NodeJS.ProcessEnv): Promise<void> {
+async function printCommunitySetup(env: NodeJS.ProcessEnv): Promise<CommunityRuntimeOutcome | undefined> {
   const runtime = await ensureCommunityRuntime(env, undefined, { engineIntent: "explicit" });
-  if (runtime.account === "absent") return; // nothing to set up, and nothing was attempted
+  if (runtime.account === "absent") return undefined; // nothing to set up, and nothing was attempted
 
   // WHAT THIS CALL ACTUALLY DID, one line each, and empty when it did nothing. Printed FIRST and on
   // every path: a renewed access or an installed engine is the news the user came for, whether or not
@@ -217,7 +288,7 @@ async function printCommunitySetup(env: NodeJS.ProcessEnv): Promise<void> {
     // The lines above already say what completed just now, so this is the state, not the event. It
     // used to carry a "(completed just now)" suffix that named the moment without naming the thing.
     console.log(chalk.green("  Community access is set up on this device."));
-    return;
+    return runtime;
   }
 
   if (runtime.lease === "unavailable") {
@@ -239,6 +310,7 @@ async function printCommunitySetup(env: NodeJS.ProcessEnv): Promise<void> {
         : "  Running `compaction login` again retries what is still missing."
     )
   );
+  return runtime;
 }
 
 async function runLogout(env: NodeJS.ProcessEnv = process.env): Promise<void> {

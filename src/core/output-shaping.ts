@@ -96,6 +96,8 @@ export interface OutputShapingResult {
   instructions: string;
   /** Stable identity of the exact UTF-8 instruction bytes emitted for this policy selection. */
   policyVersion: string;
+  /** Stable identity of the substantive shaping bytes, excluding carrier-only honesty/wrapper bytes. */
+  treatmentFamilyVersion: string;
   /** Attribution for the applied policies (content-free; for recording / reporting). */
   applied: OutputShapingAttribution[];
 }
@@ -107,6 +109,16 @@ export interface OutputShapingResult {
 export function outputShapingPolicyVersion(instructions: string): string {
   const digest = createHash("sha256").update(instructions, "utf8").digest("hex");
   return `output-shaping.v1.sha256.${digest}`;
+}
+
+/**
+ * Version the substantive shaping treatment independently from its transport carrier. Hook-only
+ * honesty text does not change what the model is asked to do, while any change to the core shaping
+ * instructions produces a new family identity and therefore cannot borrow older family evidence.
+ */
+export function outputShapingTreatmentFamilyVersion(coreInstructions: string): string {
+  const digest = createHash("sha256").update(coreInstructions, "utf8").digest("hex");
+  return `output-shaping.family.v1.sha256.${digest}`;
 }
 
 export interface BuildOutputShapingOptions {
@@ -143,6 +155,7 @@ export function buildOutputShapingPolicy(opts: BuildOutputShapingOptions = {}): 
   return {
     instructions,
     policyVersion: outputShapingPolicyVersion(instructions),
+    treatmentFamilyVersion: outputShapingTreatmentFamilyVersion(instructions),
     applied: selected.map((p) => ({ policy_name: p.policy_name, policy_family: p.policy_family, risk_level: p.risk_level }))
   };
 }
@@ -156,4 +169,18 @@ export function buildHookOutputShapingTreatment(): OutputShapingResult {
     instructions,
     policyVersion: outputShapingPolicyVersion(instructions)
   };
+}
+
+/**
+ * Resolve a family only for exact carriers emitted by this build. Arbitrary hash-shaped policy
+ * versions remain incompatible rather than being assigned to the current family by assumption.
+ */
+export function outputShapingTreatmentFamilyForPolicyVersion(
+  policyVersion: string
+): string | undefined {
+  const core = buildOutputShapingPolicy();
+  const hook = buildHookOutputShapingTreatment();
+  return policyVersion === core.policyVersion || policyVersion === hook.policyVersion
+    ? core.treatmentFamilyVersion
+    : undefined;
 }

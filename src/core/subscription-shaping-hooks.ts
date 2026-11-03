@@ -21,9 +21,20 @@
  *   [ { command } ] } }` - FLAT entries (no inner `hooks` array, no `type`).
  */
 
-/** The runtime command each installed shaping hook runs. `<tool>` distinguishes the stdin/stdout schema. */
-export function shapingHookCommand(tool: SubscriptionHookTool): string {
-  return `compaction hooks shape ${tool}`;
+import { compactionCommand, isCompactionCommand, type LauncherOwnership } from "./compaction-command.js";
+import { ownsLauncher } from "./update/launcher-ownership.js";
+
+/** The arguments after `compaction` in a shaping hook command. */
+export function shapingHookArgs(tool: SubscriptionHookTool): string {
+  return `hooks shape ${tool}`;
+}
+
+/**
+ * The runtime command each installed shaping hook runs. `<tool>` distinguishes the stdin/stdout schema.
+ * With a managed `launcher`, the command names it (see `compaction-command.ts`).
+ */
+export function shapingHookCommand(tool: SubscriptionHookTool, launcher?: string): string {
+  return compactionCommand(shapingHookArgs(tool), launcher);
 }
 
 export type SubscriptionHookTool = "codex" | "cursor";
@@ -43,9 +54,12 @@ export const CODEX_SHAPING_HOOK_TIMEOUT_SECONDS = 10;
  * itself, so an exact comparison is both sufficient and the only safe rule. Surrounding whitespace is
  * tolerated because a hand-edited config often carries it.
  */
-export function isCompactionShapingHookCommand(command: string | undefined, tool: SubscriptionHookTool): boolean {
-  if (typeof command !== "string") return false;
-  return command.trim() === shapingHookCommand(tool);
+export function isCompactionShapingHookCommand(
+  command: string | undefined,
+  tool: SubscriptionHookTool,
+  owns: LauncherOwnership = ownsLauncher
+): boolean {
+  return isCompactionCommand(command, shapingHookArgs(tool), owns);
 }
 
 /* ------------------------------------------------------------------------------------------------
@@ -107,7 +121,7 @@ export interface SubscriptionUninstallResult<C> {
  * keys, hooks, and other entries. Idempotent: if our hook is already present, returns the config
  * unchanged. Refuses (throws) rather than clobber a malformed `hooks` / `hooks.UserPromptSubmit`.
  */
-export function installCodexShapingHook(input: CodexHooksConfig): SubscriptionInstallResult<CodexHooksConfig> {
+export function installCodexShapingHook(input: CodexHooksConfig, launcher?: string): SubscriptionInstallResult<CodexHooksConfig> {
   const config = clone(input);
   if (config.hooks !== undefined && (typeof config.hooks !== "object" || config.hooks === null || Array.isArray(config.hooks))) {
     throw new Error("existing hooks is malformed (not an object) - refusing to modify; fix the config file manually.");
@@ -123,7 +137,7 @@ export function installCodexShapingHook(input: CodexHooksConfig): SubscriptionIn
     return { config: input, changed: false, alreadyPresent: true };
   }
 
-  groups.push({ hooks: [{ type: "command", command: shapingHookCommand("codex"), timeout: CODEX_SHAPING_HOOK_TIMEOUT_SECONDS }] });
+  groups.push({ hooks: [{ type: "command", command: shapingHookCommand("codex", launcher), timeout: CODEX_SHAPING_HOOK_TIMEOUT_SECONDS }] });
   return { config, changed: true, alreadyPresent: false };
 }
 
@@ -195,7 +209,7 @@ export const CURSOR_HOOKS_SCHEMA_VERSION = 1;
  * per-turn task-aware hold in this shipped Cursor path. A per-prompt refinement requires separate
  * end-to-end acceptance; it is not blocked by an absent vendor hook.
  */
-export function installCursorShapingHook(input: CursorHooksConfig): SubscriptionInstallResult<CursorHooksConfig> {
+export function installCursorShapingHook(input: CursorHooksConfig, launcher?: string): SubscriptionInstallResult<CursorHooksConfig> {
   const config = clone(input);
   if (config.hooks !== undefined && (typeof config.hooks !== "object" || config.hooks === null || Array.isArray(config.hooks))) {
     throw new Error("existing hooks is malformed (not an object) - refusing to modify; fix the config file manually.");
@@ -212,7 +226,7 @@ export function installCursorShapingHook(input: CursorHooksConfig): Subscription
   }
 
   if (config.version === undefined) config.version = CURSOR_HOOKS_SCHEMA_VERSION;
-  entries.push({ command: shapingHookCommand("cursor") });
+  entries.push({ command: shapingHookCommand("cursor", launcher) });
   return { config, changed: true, alreadyPresent: false };
 }
 
